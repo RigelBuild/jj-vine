@@ -62,6 +62,13 @@ jobs:
     name: Build - ${{ matrix.platform.target }}
     runs-on: ${{ matrix.platform.os }}
     needs: test
+    # Only build/publish Codeberg release artifacts on an explicit release
+    # dispatch, never on push/PR. Mirrors the `release` job's guard below. The
+    # unguarded build ran on every PR and broke on `refs/pull/N/merge`
+    # (VERSION="N/merge" → `cp` into a nonexistent dir); we consume jj-vine only
+    # as a Nix flake input built from source, so the release matrix is dead
+    # weight on automatic triggers. Test stays on push/PR as the real CI.
+    if: github.event_name == 'workflow_dispatch'
     permissions:
       id-token: write
       contents: read
