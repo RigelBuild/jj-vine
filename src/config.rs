@@ -2096,7 +2096,11 @@ mod tests {
             token_command: vec![
                 "sh".to_owned(),
                 "-c".to_owned(),
-                "printf '\\xff\\xfe'".to_owned(),
+                // Octal escapes, not hex `\xHH`: POSIX printf guarantees `\NNN`
+                // but not `\xHH`, so a dash `/bin/sh` (GitHub ubuntu runners)
+                // passes `\xff` through literally as valid UTF-8. `\377\376`
+                // emits the raw bytes on every printf.
+                "printf '\\377\\376'".to_owned(),
             ],
             ..GitHubConfig::default()
         };
