@@ -1,0 +1,11 @@
+# Pins the Rust toolchain for jj-vine. A dated nightly (not the rolling
+# `nightly` channel) so the flake's fenix build is reproducible and CI caches
+# survive between runs. Kept in step with RigelBuild/orion's root pin so the
+# binary the Rigel fleet consumes matches the one its dev shell builds; bumping
+# is a deliberate, reviewed change.
+#
+# Nightly is required for rustfmt/clippy; upstream keeps the crate itself
+# building on stable (see codeberg.org/abrenneke/jj-vine).
+[toolchain]
+channel = "nightly-2026-08-14"
+components = ["rustfmt", "clippy"]

@@ -1,0 +1,1349 @@
+use std::{borrow::Cow, collections::HashMap, path::Path};
+
+use bon::bon;
+use futures::{future::OptionFuture, try_join};
+use reqwest::Method;
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use tokio::sync::OnceCell;
+
+use crate::{
+    bookmark::BookmarkRef,
+    config::Config,
+    description::FormatMergeRequest,
+    error::{AzureDevOpsApiSnafu, ConfigSnafu, Error, Result, make_whatever},
+    forge::{
+        ApprovalSatisfaction,
+        ApprovalStatus,
+        CheckStatus,
+        CreateMergeRequestOptions,
+        DiscussionCount,
+        Forge,
+        MergeRequestLike,
+        MergeRequestState,
+        MergeRequestStatus,
+        UpdateMergeRequestInfoOptions,
+        UserLike,
+        UserName,
+    },
+    utils::ResultWithWarnings,
+};
+
+#[expect(clippy::module_name_repetitions, reason = "important")]
+pub struct AzureDevOpsForge {
+    /// The base URL of the Azure DevOps instance, e.g. <https://dev.azure.com>.
+    base_url: String,
+
+    /// The base URL of the Azure DevOps Security (VSSP) instance, e.g. <https://vssps.dev.azure.com>.
+    vssps_base_url: Option<String>,
+
+    /// The organization and project name in the format "organization/project".
+    /// This is the project where branches are pushed.
+    source_project_id: String,
+
+    /// The organization and project name in the format "organization/project".
+    /// This is the project where MRs/PRs are created.
+    target_project_id: String,
+
+    /// The personal access token for the Azure DevOps instance.
+    token: String,
+
+    /// The name of the organization in the source project.
+    source_org: String,
+
+    /// The name of the project in the source organization.
+    #[expect(dead_code, reason = "keep around for now")]
+    source_project: String,
+
+    /// The name of the organization in the target project.
+    #[expect(dead_code, reason = "keep around for now")]
+    target_org: String,
+
+    /// The name of the project in the target organization.
+    #[expect(dead_code, reason = "keep around for now")]
+    target_project: String,
+
+    /// The config id of the repository where branches are pushed (source/fork
+    /// project).
+    source_repository_id: Option<String>,
+
+    /// The config id of the repository where MRs/PRs are created
+    /// (target/upstream project).
+    target_repository_id: Option<String>,
+
+    /// The config name of the repository where branches are pushed (source/fork
+    /// project).
+    source_repository_name: Option<String>,
+
+    /// The config name of the repository where MRs/PRs are created
+    /// (target/upstream project).
+    target_repository_name: Option<String>,
+
+    /// The repository where branches are pushed (source/fork project).
+    source_repository: OnceCell<GitRepository>,
+
+    /// The repository where MRs/PRs are created (target/upstream project).
+    target_repository: OnceCell<GitRepository>,
+
+    client: reqwest::Client,
+}
+
+pub fn validate_config(config: &Config) -> Result<()> {
+    if config.azure.host.is_empty() {
+        return ConfigSnafu {
+            message: "azure.host is required when forge is azure".to_owned(),
+        }
+        .fail();
+    }
+    if config.azure.project.is_empty() {
+        return ConfigSnafu {
+            message: "azure.project is required when forge is azure".to_owned(),
+        }
+        .fail();
+    }
+    if config.azure.token.is_empty() {
+        return ConfigSnafu {
+            message: "azure.token is required when forge is azure".to_owned(),
+        }
+        .fail();
+    }
+    if config.azure.source_repository_name.is_none() && config.azure.source_repository_id.is_none()
+    {
+        return ConfigSnafu {
+            message: "azure.source_repository_name or azure.source_repository_id is required when forge is azure".to_owned(),
+        }
+        .fail();
+    }
+
+    Ok(())
+}
+
+#[bon]
+impl AzureDevOpsForge {
+    pub fn new_from_config(config: &Config) -> Result<Self> {
+        Self::builder()
+            .base_url(config.azure.host.clone())
+            .vssps_base_url(config.azure.vssps_host.clone())
+            .source_project_id(config.azure.source_project_id())
+            .target_project_id(config.azure.target_project_id())
+            .token(config.azure.token.clone())
+            .maybe_source_repository_name(config.azure.source_repository_name.clone())
+            .maybe_target_repository_name(
+                config.azure.target_repository_name().map(ToOwned::to_owned),
+            )
+            .maybe_source_repository_id(config.azure.source_repository_id.clone())
+            .maybe_target_repository_id(config.azure.target_repository_id().map(ToOwned::to_owned))
+            .accept_non_compliant_certs(config.tls_accept_non_compliant_certs)
+            .maybe_ca_bundle(config.ca_bundle.clone())
+            .build()
+    }
+
+    #[builder]
+    #[expect(clippy::single_call_fn, reason = "necessary")]
+    pub fn new(
+        base_url: impl Into<String>,
+        vssps_base_url: Option<impl Into<String>>,
+        source_project_id: impl Into<String>,
+        target_project_id: impl Into<String>,
+        token: impl Into<String>,
+        source_repository_name: Option<String>,
+        target_repository_name: Option<String>,
+        source_repository_id: Option<String>,
+        target_repository_id: Option<String>,
+        ca_bundle: Option<impl AsRef<Path>>,
+        accept_non_compliant_certs: bool,
+    ) -> Result<Self> {
+        let mut client_builder = reqwest::Client::builder();
+
+        if accept_non_compliant_certs {
+            client_builder = client_builder.tls_danger_accept_invalid_certs(true);
+        }
+
+        if let Some(ca_path) = ca_bundle {
+            let ca_cert = std::fs::read(ca_path.as_ref()).map_err(|e| {
+                ConfigSnafu {
+                    message: format!(
+                        "Failed to read CA bundle at {}: {}",
+                        ca_path.as_ref().to_string_lossy(),
+                        e
+                    ),
+                }
+                .build()
+            })?;
+
+            let certs = reqwest::Certificate::from_pem_bundle(&ca_cert).map_err(|e| {
+                ConfigSnafu {
+                    message: format!("Failed to parse CA bundle: {e}"),
+                }
+                .build()
+            })?;
+
+            for cert in certs {
+                client_builder = client_builder.add_root_certificate(cert);
+            }
+        }
+
+        let client = client_builder.build().map_err(|e| {
+            ConfigSnafu {
+                message: format!("Failed to build HTTP client: {e:?}"),
+            }
+            .build()
+        })?;
+
+        let base_url = base_url.into().trim_end_matches('/').to_owned();
+        let vssps_base_url = vssps_base_url.map(|url| url.into().trim_end_matches('/').to_owned());
+
+        let source_project_id = source_project_id.into();
+        let target_project_id = target_project_id.into();
+
+        let source_project_id_clone = source_project_id.clone();
+        let (source_org, source_repo) = source_project_id_clone.split_once('/').ok_or(
+            ConfigSnafu {
+                message: format!("Invalid source project ID: {source_project_id}"),
+            }
+            .build(),
+        )?;
+
+        let target_project_id_clone = target_project_id.clone();
+        let (target_org, target_repo) = target_project_id_clone.split_once('/').ok_or(
+            ConfigSnafu {
+                message: format!("Invalid target project ID: {target_project_id}"),
+            }
+            .build(),
+        )?;
+
+        Ok(Self {
+            base_url,
+            vssps_base_url,
+            source_project_id,
+            target_project_id,
+            token: token.into(),
+            source_org: source_org.into(),
+            source_project: source_repo.into(),
+            target_org: target_org.into(),
+            target_project: target_repo.into(),
+            source_repository_name,
+            target_repository_name,
+            source_repository_id,
+            target_repository_id,
+            source_repository: OnceCell::new(),
+            target_repository: OnceCell::new(),
+            client,
+        })
+    }
+
+    async fn request_git<T>(
+        &self,
+        method: Method,
+        project_id: impl AsRef<str>,
+        path: impl AsRef<str>,
+        payload: Option<impl Serialize>,
+    ) -> Result<T>
+    where
+        T: DeserializeOwned,
+    {
+        self.request(
+            method,
+            &self.base_url,
+            format!("/{}/_apis/git{}", project_id.as_ref(), path.as_ref()),
+            payload,
+        )
+        .await
+    }
+
+    async fn request<T>(
+        &self,
+        method: Method,
+        base_url: impl AsRef<str>,
+        path: impl AsRef<str>,
+        payload: Option<impl Serialize>,
+    ) -> Result<T>
+    where
+        T: DeserializeOwned,
+    {
+        let url = format!("{}{}", base_url.as_ref(), path.as_ref());
+
+        let mut req = self
+            .client
+            .request(method, url)
+            .header("Authorization", format!("Bearer {}", self.token))
+            .header("Accept", "application/json")
+            .header("User-Agent", "jj-vine");
+
+        if let Some(payload) = payload.as_ref() {
+            req = req.json(payload);
+        }
+
+        let response = req.send().await?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let text = response.text().await?;
+            return Err(AzureDevOpsApiSnafu {
+                message: format!("Failed request: {status} - {text}"),
+            }
+            .build());
+        }
+
+        let body = response.text().await?;
+        let data: T = serde_json::from_str(&body).map_err(|e| {
+            AzureDevOpsApiSnafu {
+                message: format!(
+                    "Failed to parse response to {}: {e}, response: {body}",
+                    path.as_ref(),
+                ),
+            }
+            .build()
+        })?;
+        Ok(data)
+    }
+
+    async fn source_repository(&self) -> Result<&GitRepository> {
+        if self.source_repository_id.is_none() && self.source_repository_name.is_none() {
+            return ConfigSnafu {
+                message: "Must provide either source repository name or source repository ID"
+                    .to_owned(),
+            }
+            .fail();
+        }
+
+        self.source_repository
+            .get_or_try_init(async || {
+                let repositories: ListResponse<GitRepository> = self
+                    .request_git(
+                        Method::GET,
+                        &self.source_project_id,
+                        "/repositories?api-version=7.1",
+                        None::<()>,
+                    )
+                    .await?;
+
+                repositories
+                    .value
+                    .into_iter()
+                    .find(|repository| {
+                        match (&self.source_repository_id, &self.source_repository_name) {
+                            (Some(id), _) => repository.id == *id,
+                            (_, Some(name)) => repository.name == *name,
+                            (None, None) => unreachable!(),
+                        }
+                    })
+                    .ok_or(
+                        ConfigSnafu {
+                            message: format!(
+                                "Source repository not found: {}",
+                                self.source_repository_name.as_ref().unwrap()
+                            ),
+                        }
+                        .build(),
+                    )
+            })
+            .await
+    }
+
+    async fn target_repository(&self) -> Result<&GitRepository> {
+        if self.target_repository_id.is_none() && self.target_repository_name.is_none() {
+            return ConfigSnafu {
+                message: "Must provide either target repository name or target repository ID"
+                    .to_owned(),
+            }
+            .fail();
+        }
+
+        self.target_repository
+            .get_or_try_init(async || {
+                let repositories: ListResponse<GitRepository> = self
+                    .request_git(
+                        Method::GET,
+                        &self.target_project_id,
+                        "/repositories?api-version=7.1",
+                        None::<()>,
+                    )
+                    .await?;
+
+                repositories
+                    .value
+                    .into_iter()
+                    .find(|repository| {
+                        match (&self.target_repository_id, &self.target_repository_name) {
+                            (Some(id), _) => repository.id == *id,
+                            (_, Some(name)) => repository.name == *name,
+                            (None, None) => unreachable!(),
+                        }
+                    })
+                    .ok_or(
+                        ConfigSnafu {
+                            message: format!(
+                                "Target repository not found: {}",
+                                self.target_repository_name.as_ref().unwrap()
+                            ),
+                        }
+                        .build(),
+                    )
+            })
+            .await
+    }
+
+    fn to_merge_request(&self, pull_request: GitPullRequest) -> MergeRequest {
+        MergeRequest {
+            target_project_id: self.target_project_id().to_owned(),
+            base_url: self.base_url.clone(),
+            pull_request,
+        }
+    }
+}
+
+impl Forge for AzureDevOpsForge {
+    type User = IdentityRef;
+
+    type MergeRequest = MergeRequest;
+
+    type UserId = UserName<String>;
+
+    fn source_project_id(&self) -> &str {
+        &self.source_project_id
+    }
+
+    fn target_project_id(&self) -> &str {
+        &self.target_project_id
+    }
+
+    fn is_fork(&self) -> bool {
+        self.source_project_id != self.target_project_id
+            || self.source_repository_id != self.target_repository_id
+            || self.source_repository_name != self.target_repository_name
+    }
+
+    fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
+    async fn current_user(&self) -> Result<Self::User> {
+        let user: IdentityRef = self
+            .request(
+                Method::GET,
+                &self.base_url,
+                format!("/{}/_apis/ConnectionData?api-version=7.1", self.source_org),
+                None::<()>,
+            )
+            .await?;
+        Ok(user)
+    }
+
+    async fn user_by_username(&self, username: &str) -> Result<Option<Self::User>> {
+        let user_descriptor = username;
+        if let Some(vssps_base_url) = &self.vssps_base_url {
+            let user: IdentityRef = self
+                .request(
+                    Method::GET,
+                    vssps_base_url,
+                    format!(
+                        "/{}/_apis/graph/users/{}?api-version=7.1-preview.1",
+                        self.source_org, user_descriptor
+                    ),
+                    None::<()>,
+                )
+                .await?;
+            Ok(Some(user))
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn find_merge_request_by_source_branch(
+        &self,
+        branch: &str,
+    ) -> Result<Option<Self::MergeRequest>> {
+        let target_repository_id = &self.target_repository().await?.id;
+
+        let mr_match = if self.is_fork() {
+            const COUNT: u32 = 1000;
+
+            let source_repository_id = &self.source_repository().await?.id;
+
+            let mut page = 0_u32;
+            loop {
+                let all_mrs_from_fork: ListResponse<GitPullRequest> = self
+                    .request_git(
+                        Method::GET,
+                        &self.target_project_id,
+                        // I cannot figure out a way to even filter by source repo,
+                        // `sourceRepositoryId` only works in the same project!
+                        format!(
+                            "/repositories/{}/pullRequests?api-version=7.1&$top={COUNT}&$skip={}",
+                            target_repository_id,
+                            COUNT.strict_mul(page)
+                        ),
+                        None::<()>,
+                    )
+                    .await?;
+
+                if all_mrs_from_fork.value.is_empty() {
+                    break None;
+                }
+
+                // sourceRefName doesn't work for forks because the ref is something dumb like
+                // `refs/pull/1/source`. So for forks, iterate all the PRs from the
+                // fork to find it manually, because azure doesn't seem to support filtering by
+                // fork ref name...
+                if let Some(pr) = all_mrs_from_fork.value.into_iter().find(|pr| {
+                    pr.fork_source.as_ref().is_some_and(|fork| {
+                        fork.name == format!("refs/heads/{branch}")
+                            && fork.repository.id == *source_repository_id
+                    })
+                }) {
+                    break Some(pr);
+                }
+
+                page = page.strict_add(1);
+            }
+        } else {
+            self
+            .request_git::<ListResponse<GitPullRequest>>(
+                Method::GET,
+                &self.target_project_id,
+                format!(
+                    "/repositories/{target_repository_id}/pullRequests?api-version=7.1&searchCriteria.sourceRefName=refs/heads/{branch}"
+                ),
+                None::<()>,
+            )
+            .await?
+            .value
+            .into_iter()
+            .next()
+        };
+
+        // The list API truncates descriptions! yay!
+        Ok(OptionFuture::from(mr_match.map(|pr| {
+            self.request_git(
+                Method::GET,
+                &self.target_project_id,
+                format!(
+                    "/repositories/{target_repository_id}/pullRequests/{}",
+                    pr.pull_request_id
+                ),
+                None::<()>,
+            )
+        }))
+        .await
+        .transpose()?
+        .map(|pr| self.to_merge_request(pr)))
+    }
+
+    async fn create_merge_request(
+        &self,
+        CreateMergeRequestOptions {
+            description,
+            open_as_draft,
+            remove_source_branch,
+            reviewers,
+            source_branch,
+            squash,
+            target_branch,
+            title,
+            // Azure DevOps has no concept of "assignees", only "reviewers".
+            assignees: _assignees,
+        }: CreateMergeRequestOptions<Self::UserId>,
+    ) -> Result<Self::MergeRequest> {
+        let body = CreatePullRequestBody {
+            completion_options: RequestGitPullRequestCompletionOptions {
+                delete_source_branch: remove_source_branch.then_some(true),
+                merge_strategy: squash.then_some(GitPullRequestMergeStrategy::Squash),
+            },
+            description: description.unwrap_or_default(),
+            fork_source: if self.source_project_id == self.target_project_id {
+                None
+            } else {
+                Some(RequestGitForkRef {
+                    repository: RequestGitRepository {
+                        id: self.source_repository().await?.id.clone(),
+                    },
+                })
+            },
+            is_draft: open_as_draft,
+            labels: Vec::new(),
+            reviewers: reviewers
+                .into_iter()
+                .map(|user| RequestIdentityRefWithVote::Descriptor { descriptor: user.0 })
+                .collect(),
+            source_ref_name: format!("refs/heads/{source_branch}"),
+            target_ref_name: format!("refs/heads/{target_branch}"),
+            title,
+        };
+
+        let pr: GitPullRequest = self
+            .request_git(
+                Method::POST,
+                &self.target_project_id,
+                format!(
+                    "/repositories/{}/pullrequests?api-version=7.1",
+                    self.target_repository().await?.id
+                ),
+                Some(body),
+            )
+            .await?;
+
+        Ok(self.to_merge_request(pr))
+    }
+
+    async fn update_merge_request_base(
+        &self,
+        merge_request_iid: i32,
+        new_base: &str,
+    ) -> Result<Self::MergeRequest> {
+        let body = UpdatePullRequestBody {
+            description: None,
+            title: None,
+            target_ref_name: Some(format!("refs/heads/{new_base}")),
+            is_draft: None,
+        };
+
+        let pr: GitPullRequest = self
+            .request_git(
+                Method::PATCH,
+                &self.target_project_id,
+                format!(
+                    "/repositories/{}/pullrequests/{}?api-version=7.1",
+                    self.target_repository().await?.id,
+                    merge_request_iid
+                ),
+                Some(body),
+            )
+            .await?;
+
+        Ok(self.to_merge_request(pr))
+    }
+
+    async fn update_merge_request_info(
+        &self,
+        merge_request_iid: i32,
+        UpdateMergeRequestInfoOptions {
+            title,
+            description,
+            draft,
+            current_title: _current_title,       // Unneeded for azure
+            current_is_draft: _current_is_draft, // Unneeded for azure
+        }: UpdateMergeRequestInfoOptions,
+    ) -> Result<Self::MergeRequest> {
+        let body = UpdatePullRequestBody {
+            title,
+            description,
+            target_ref_name: None,
+            is_draft: draft,
+        };
+
+        let pr: GitPullRequest = self
+            .request_git(
+                Method::PATCH,
+                &self.target_project_id,
+                format!(
+                    "/repositories/{}/pullrequests/{}?api-version=7.1",
+                    self.target_repository().await?.id,
+                    merge_request_iid
+                ),
+                Some(body),
+            )
+            .await?;
+
+        Ok(self.to_merge_request(pr))
+    }
+
+    async fn get_merge_request(&self, merge_request_iid: i32) -> Result<Self::MergeRequest> {
+        let pr: GitPullRequest = self
+            .request_git(
+                Method::GET,
+                &self.target_project_id,
+                format!(
+                    "/repositories/{}/pullrequests/{}?api-version=7.1",
+                    self.target_repository().await?.id,
+                    merge_request_iid
+                ),
+                None::<()>,
+            )
+            .await?;
+
+        Ok(self.to_merge_request(pr))
+    }
+
+    async fn get_approval_status(&self, merge_request_iid: i32) -> Result<ApprovalStatus> {
+        let pr: GitPullRequest = self
+            .request_git(
+                Method::GET,
+                &self.target_project_id,
+                format!(
+                    "/repositories/{}/pullrequests/{}?api-version=7.1",
+                    self.target_repository().await?.id,
+                    merge_request_iid
+                ),
+                None::<()>,
+            )
+            .await?;
+
+        Ok(ApprovalStatus {
+            approved_count: pr
+                .reviewers
+                .iter()
+                .filter(|reviewer| reviewer.vote == Vote::Approved)
+                .count()
+                .try_into()
+                .expect("too large"),
+            required_count: pr
+                .reviewers
+                .iter()
+                .filter(|reviewer| reviewer.is_required)
+                .count()
+                .try_into()
+                .expect("too large"),
+            blocking_count: pr
+                .reviewers
+                .iter()
+                .filter(|reviewer| {
+                    reviewer.vote == Vote::Rejected || reviewer.vote == Vote::WaitingForAuthor
+                })
+                .count()
+                .try_into()
+                .expect("too large"),
+            satisfaction: if pr.merge_status == PullRequestAsyncStatus::RejectedByPolicy {
+                ApprovalSatisfaction::Unsatisfied
+            } else {
+                ApprovalSatisfaction::Satisfied
+            },
+        })
+    }
+
+    async fn get_check_status(&self, merge_request_iid: i32) -> Result<CheckStatus> {
+        let pr: GitPullRequest = self
+            .request_git(
+                Method::GET,
+                &self.target_project_id,
+                format!(
+                    "/repositories/{}/pullrequests/{}?api-version=7.1",
+                    self.target_repository().await?.id,
+                    merge_request_iid
+                ),
+                None::<()>,
+            )
+            .await?;
+
+        match pr.merge_status {
+            PullRequestAsyncStatus::Succeeded => Ok(CheckStatus::Success),
+            PullRequestAsyncStatus::Queued => Ok(CheckStatus::Pending),
+            PullRequestAsyncStatus::Conflicts
+            | PullRequestAsyncStatus::RejectedByPolicy
+            | PullRequestAsyncStatus::NotSet => Ok(CheckStatus::None),
+            PullRequestAsyncStatus::Failure => Ok(CheckStatus::Failed),
+        }
+    }
+
+    async fn get_merge_request_status(&self, merge_request_iid: i32) -> Result<MergeRequestStatus> {
+        let (approval_status, check_status) = try_join!(
+            self.get_approval_status(merge_request_iid),
+            self.get_check_status(merge_request_iid),
+        )?;
+
+        Ok(MergeRequestStatus {
+            iid: merge_request_iid.to_string(),
+            approval_status,
+            check_status,
+        })
+    }
+
+    async fn num_open_discussions(&self, merge_request_iid: i32) -> Result<DiscussionCount> {
+        let threads: ListResponse<GitPullRequestCommentThread> = self
+            .request_git(
+                Method::GET,
+                &self.target_project_id,
+                format!(
+                    "/repositories/{}/pullrequests/{}/threads?api-version=7.1",
+                    self.target_repository().await?.id,
+                    merge_request_iid
+                ),
+                None::<()>,
+            )
+            .await?;
+
+        let mut unresolved: u32 = 0;
+        let mut resolved: u32 = 0;
+        for thread in threads.value {
+            match thread.status {
+                CommentThreadStatus::Active
+                | CommentThreadStatus::Pending
+                | CommentThreadStatus::Unknown => unresolved = unresolved.strict_add(1),
+
+                CommentThreadStatus::Fixed
+                | CommentThreadStatus::Closed
+                | CommentThreadStatus::ByDesign
+                | CommentThreadStatus::WontFix => resolved = resolved.strict_add(1),
+            }
+        }
+
+        Ok(DiscussionCount {
+            all: unresolved.strict_add(resolved),
+            unresolved,
+            resolved,
+        })
+    }
+
+    fn project_id(&self) -> &str {
+        &self.target_project_id
+    }
+
+    async fn sync_dependent_merge_requests(
+        &self,
+        _merge_request_iid: i32,
+        _dependent_merge_request_iids: &[Self::Id],
+    ) -> ResultWithWarnings<bool> {
+        // Only supported for GitLab
+        Ok(false).into()
+    }
+}
+
+impl FormatMergeRequest for AzureDevOpsForge {
+    type Id = i32;
+
+    fn format_merge_request_id(&self, mr_iid: Self::Id) -> String {
+        format!("!{mr_iid}")
+    }
+
+    fn mr_name(&self) -> &'static str {
+        "PR"
+    }
+
+    fn mr_diff_url(
+        &self,
+        from: &BookmarkRef<'_>,
+        to: &BookmarkRef<'_>,
+        default_branch: &str,
+    ) -> Result<String> {
+        // Like GitLab, Azure doesn't seem to care to specify the project/repo of the
+        // base branch for forks.
+        Ok(format!(
+            "{}/{}/_git/{}/branchCompare?baseVersion=GB{}&targetVersion=GB{}&_a=files",
+            self.base_url,
+            self.source_project_id,
+            self.source_repository
+                .get()
+                .ok_or_else::<Error, _>(|| make_whatever!("haven't loaded source_repository yet!"))?
+                .name,
+            to.name().unwrap_or(default_branch),
+            from.name().unwrap_or(default_branch)
+        ))
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitRepository {
+    pub id: String,
+
+    pub name: String,
+
+    pub url: String,
+
+    pub project: Option<TeamProjectReference>,
+
+    pub remote_url: Option<String>,
+
+    pub is_fork: Option<bool>,
+
+    pub web_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TeamProjectReference {
+    pub id: String,
+
+    pub name: String,
+
+    pub url: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitPullRequest {
+    pub artifact_id: Option<String>,
+
+    pub completion_options: Option<GitPullRequestCompletionOptions>,
+
+    pub created_by: IdentityRef,
+
+    pub creation_date: String,
+
+    #[serde(default)]
+    pub description: String,
+
+    pub fork_source: Option<GitForkRef>,
+
+    #[serde(default)]
+    pub has_multiple_merge_bases: bool,
+
+    #[serde(default)]
+    pub is_draft: bool,
+
+    pub last_merge_commit: Option<GitCommitRef>,
+
+    pub last_merge_source_commit: Option<GitCommitRef>,
+
+    pub last_merge_target_commit: Option<GitCommitRef>,
+
+    pub merge_options: Option<GitPullRequestMergeOptions>,
+
+    pub merge_status: PullRequestAsyncStatus,
+
+    pub pull_request_id: i32,
+
+    pub remote_url: Option<String>,
+
+    pub repository: GitRepository,
+
+    #[serde(default)]
+    pub reviewers: Vec<IdentityRefWithVote>,
+
+    pub source_ref_name: String,
+
+    pub status: PullRequestStatus,
+
+    pub target_ref_name: String,
+
+    pub title: String,
+
+    pub url: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct MergeRequest {
+    pub target_project_id: String,
+
+    pub base_url: String,
+
+    pub pull_request: GitPullRequest,
+}
+
+impl core::ops::Deref for MergeRequest {
+    type Target = GitPullRequest;
+
+    fn deref(&self) -> &Self::Target {
+        &self.pull_request
+    }
+}
+
+impl MergeRequestLike for MergeRequest {
+    type User = IdentityRef;
+
+    type Id = i32;
+
+    fn iid(&self) -> Self::Id {
+        self.pull_request.pull_request_id
+    }
+
+    fn title(&self) -> &str {
+        &self.pull_request.title
+    }
+
+    fn description(&self) -> &str {
+        &self.pull_request.description
+    }
+
+    fn source_branch(&self) -> &str {
+        if let Some(fork) = self.fork_source.as_ref() {
+            fork.name.trim_start_matches("refs/heads/")
+        } else {
+            self.pull_request
+                .source_ref_name
+                .trim_start_matches("refs/heads/")
+        }
+    }
+
+    fn target_branch(&self) -> &str {
+        self.pull_request
+            .target_ref_name
+            .trim_start_matches("refs/heads/")
+    }
+
+    fn state(&self) -> MergeRequestState {
+        match self.pull_request.status {
+            PullRequestStatus::Abandoned => MergeRequestState::Closed,
+            PullRequestStatus::Completed => MergeRequestState::Merged,
+            PullRequestStatus::Active | PullRequestStatus::All | PullRequestStatus::NotSet => {
+                MergeRequestState::Open
+            }
+        }
+    }
+
+    fn url(&self) -> Cow<'_, str> {
+        Cow::Owned(format!(
+            "{}/{}/_git/{}/pullrequest/{}",
+            self.base_url,
+            self.target_project_id,
+            self.pull_request.repository.name,
+            self.pull_request.pull_request_id,
+        ))
+    }
+
+    fn edit_url(&self) -> Cow<'_, str> {
+        Cow::Owned(format!(
+            "{}/{}/_git/{}/pullrequest/{}",
+            self.base_url,
+            self.target_project_id,
+            self.pull_request.repository.name,
+            self.pull_request.pull_request_id,
+        ))
+    }
+
+    fn author_username(&self) -> &str {
+        &self.pull_request.created_by.display_name
+    }
+
+    fn created_at(&self) -> jiff::Timestamp {
+        self.pull_request
+            .creation_date
+            .parse()
+            .expect("Failed to parse creation date as ISO 8601")
+    }
+
+    fn assignees(&self) -> Vec<IdentityRef> {
+        self.pull_request
+            .reviewers
+            .clone()
+            .into_iter()
+            .map(Into::into)
+            .collect()
+    }
+
+    fn reviewers(&self) -> Vec<IdentityRef> {
+        self.pull_request
+            .reviewers
+            .clone()
+            .into_iter()
+            .map(Into::into)
+            .collect()
+    }
+
+    fn is_draft(&self) -> bool {
+        self.pull_request.is_draft
+    }
+
+    fn clone_boxed(
+        &self,
+    ) -> Box<dyn MergeRequestLike<User = Self::User, Id = Self::Id> + Send + Sync> {
+        Box::new(self.clone())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitPullRequestCompletionOptions {
+    pub delete_source_branch: bool,
+
+    pub merge_strategy: GitPullRequestMergeStrategy,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum GitPullRequestMergeStrategy {
+    NoFastForward,
+    Squash,
+    Rebase,
+    RebaseMerge,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IdentityRef {
+    pub descriptor: String,
+
+    pub display_name: String,
+
+    pub id: String,
+
+    pub url: String,
+}
+
+impl UserLike for IdentityRef {
+    fn id(&self) -> Option<Cow<'_, str>> {
+        Some(Cow::Borrowed(&self.descriptor))
+    }
+
+    fn username(&self) -> Option<Cow<'_, str>> {
+        Some(Cow::Borrowed(&self.display_name))
+    }
+}
+
+impl From<IdentityRefWithVote> for IdentityRef {
+    fn from(value: IdentityRefWithVote) -> Self {
+        Self {
+            descriptor: value.descriptor,
+            display_name: value.display_name,
+            id: value.id,
+            url: value.url,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitForkRef {
+    pub creator: Option<IdentityRef>,
+
+    pub is_locked: Option<bool>,
+
+    pub is_locked_by: Option<IdentityRef>,
+
+    pub name: String,
+
+    pub object_id: Option<String>,
+
+    pub repository: GitRepository,
+
+    pub url: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RequestGitForkRef {
+    pub repository: RequestGitRepository,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RequestGitRepository {
+    pub id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum PullRequestAsyncStatus {
+    NotSet,
+    Queued,
+    Conflicts,
+    Succeeded,
+    RejectedByPolicy,
+    Failure,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitPullRequestMergeOptions {
+    pub conflict_authorship_commits: bool,
+
+    pub detect_rename_false_positives: bool,
+
+    pub disable_renames: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitCommitRef {
+    pub author: Option<GitUserDate>,
+
+    pub comment: Option<String>,
+
+    pub commit_id: String,
+
+    pub committer: Option<GitUserDate>,
+
+    #[serde(default)]
+    pub parents: Vec<String>,
+
+    pub remote_url: Option<String>,
+
+    pub url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitUserDate {
+    pub date: String,
+
+    pub email: String,
+
+    pub image_url: Option<String>,
+
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[expect(clippy::struct_excessive_bools, reason = "deserialized")]
+pub struct IdentityRefWithVote {
+    pub descriptor: String,
+
+    pub display_name: String,
+
+    pub has_declined: bool,
+
+    pub id: String,
+
+    pub is_flagged: bool,
+
+    pub is_reapprove: bool,
+
+    pub is_required: bool,
+
+    pub reviewer_url: String,
+
+    pub url: String,
+
+    pub vote: Vote,
+
+    pub voted_for: Vec<IdentityRefWithVote>,
+}
+
+impl UserLike for IdentityRefWithVote {
+    fn id(&self) -> Option<Cow<'_, str>> {
+        Some(Cow::Borrowed(&self.descriptor))
+    }
+
+    fn username(&self) -> Option<Cow<'_, str>> {
+        None
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+#[repr(i16)]
+pub enum Vote {
+    Approved = 10,
+
+    ApprovedWithSuggestions = 5,
+
+    NoVote = 0,
+
+    WaitingForAuthor = -5,
+
+    Rejected = -10,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum PullRequestStatus {
+    NotSet,
+    Active,
+    Abandoned,
+    Completed,
+    All,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListResponse<T> {
+    pub value: Vec<T>,
+    pub count: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreatePullRequestBody {
+    pub completion_options: RequestGitPullRequestCompletionOptions,
+
+    pub description: String,
+
+    pub fork_source: Option<RequestGitForkRef>,
+
+    pub is_draft: bool,
+
+    pub labels: Vec<WebApiTagDefinition>,
+
+    pub reviewers: Vec<RequestIdentityRefWithVote>,
+
+    pub source_ref_name: String,
+
+    pub target_ref_name: String,
+
+    pub title: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(untagged)]
+pub enum RequestIdentityRefWithVote {
+    Descriptor { descriptor: String },
+    Id { id: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WebApiTagDefinition {
+    pub active: bool,
+
+    pub id: String,
+
+    pub name: String,
+
+    pub url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RequestGitPullRequestCompletionOptions {
+    pub delete_source_branch: Option<bool>,
+
+    pub merge_strategy: Option<GitPullRequestMergeStrategy>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdatePullRequestBody {
+    pub target_ref_name: Option<String>,
+
+    pub title: Option<String>,
+    pub description: Option<String>,
+    pub is_draft: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitPullRequestCommentThread {
+    pub comments: Vec<Comment>,
+    pub id: i32,
+    pub identifies: HashMap<String, IdentityRef>,
+    pub is_deleted: bool,
+    pub last_updated_date: String,
+    pub published_date: String,
+    pub status: CommentThreadStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum CommentThreadStatus {
+    Unknown,
+    Active,
+    Fixed,
+    WontFix,
+    Closed,
+    ByDesign,
+    Pending,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Comment {
+    pub author: IdentityRef,
+
+    pub comment_type: CommentType,
+
+    pub content: String,
+
+    pub id: i16,
+
+    pub is_deleted: bool,
+
+    pub last_content_updated_date: String,
+
+    pub last_updated_date: String,
+
+    pub parent_comment_id: Option<i16>,
+
+    pub published_date: String,
+
+    pub users_liked: Vec<IdentityRef>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CommentType {
+    Unknown,
+    Text,
+    CodeChange,
+    System,
+}

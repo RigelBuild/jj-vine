@@ -1,0 +1,96 @@
+# yaml-language-server: $schema=https://moonrepo.dev/schemas/project.json
+#
+# jj-vine (oss/forks/jj-vine) — vendored fork of codeberg.org/abrenneke/jj-vine,
+# the fleet's stacked-PR / PR-open tool (SEA-1175 forge-migration-jj-interim).
+# A fork subtree: style-gated by upstream's own cargo fmt/clippy, not sealed's
+# biome (oss/forks/**/* is globally excluded from the sealed style sweeps —
+# biome.json, .markdownlint-cli2.jsonc — same posture as oss/seal/vendor).
+# Style exemption is not test exemption: this moon.yml registers the fork's own
+# cargo build/test/fmt/clippy as functional-CI tasks scoped to the subtree, so a
+# PR touching it runs jj-vine's suite and only it (petrel fans out the affected
+# `runInCI` tasks; moon discovers this project from the .moon/workspace.yml map).
+#
+# The first cargo-SOURCE fork: the nix-source forks (devenv/nix2container) fold
+# fmt/clippy/test into one `nix build` against the fork's own flake-pinned
+# toolchain; jj-vine is a bare cargo crate with no flake, so tasks wire as plain
+# cargo — mirroring the first-party cargo idiom (oss/seal, oss/compass/crates/*),
+# NOT the nix forks. Self-contained: its own Cargo.toml + Cargo.lock live in the
+# subtree (no root Cargo workspace), so tasks reference subtree-local manifests
+# via @group(sources), never repo-root ones, and it is NOT a cargo-deny member
+# (its MIT license + supply chain are upstream's, gated at import). It faces
+# UPSTREAM's fmt/clippy config — not sealed's /rustfmt.toml or /clippy.toml.
+#
+# Toolchain: the subtree ships its own `rust-toolchain.toml` (`channel =
+# "nightly"`, rolling), but CI's hermetic image has no rustup and vends one
+# pinned fenix toolchain (the repo-root `/rust-toolchain.toml`), so CI runs
+# clippy against that pin — the subtree file is inert in CI. (Locally, rustup
+# honors the subtree file, so the subtree resolves to rolling nightly: a known
+# CI/local toolchain skew.) clippy is a HARD gate here (`-D warnings`): the
+# vendored src is clippy-clean under the pinned toolchain after a few sealed-side
+# fixes — two dead unknown-lint refs and one stale `#[expect]` removed from
+# upstream, plus `#[must_use]` and a let-chain in sealed's own push-routing code.
+# fmt --check + build + test + clippy are all hard functional gates.
+id: 'jj-vine-fork'
+layer: 'application'
+language: 'rust'
+tags: ['oss', 'static-runner']
+
+workspace:
+  inheritedTasks:
+    # Vendored fork, not a first-party bun/sealed project: skip the global bun
+    # install + the sealed biome lint/format that tag-bun applies. The fork's
+    # own cargo fmt/clippy below are its style gate.
+    exclude: ['install', 'lint', 'format']
+
+fileGroups:
+  # The subtree is the unit (matches the nix forks): a change anywhere under
+  # oss/forks/jj-vine marks this project affected, and nothing else does.
+  sources: ['**/*']
+  # The two repo-root files cargo honors by walking up out of the subtree:
+  # `/.cargo/config.toml` (the `-Zshare-generics` build flags applied to every
+  # target) and the `/rust-toolchain.toml` pin. Tracked by build/clippy/test —
+  # whose output changes with build flags or toolchain — so a shared-config
+  # change re-triggers the fork's CI, never silently skips it. fmt omits them:
+  # it faces the fork's own subtree rustfmt.toml, and rustfmt is stable enough
+  # across nightlies that a toolchain bump needn't re-run it (same task-scoped
+  # split oss/seal uses).
+  build-config: ['/.cargo/config.toml', '/rust-toolchain.toml']
+
+tasks:
+  fmt:
+    # Upstream's own rustfmt config (its rustfmt.toml if shipped, else defaults),
+    # never sealed's /rustfmt.toml — the cargo translation of "faces upstream."
+    command: 'cargo fmt --check'
+    options:
+      cache: false
+    inputs: ['@group(sources)']
+
+  clippy:
+    # Hard gate (`-D warnings`): the vendored src is clippy-clean under the
+    # repo's pinned nightly. Upstream's own lint scope is `--tests` (justfile
+    # `clippy`), mirrored here.
+    command: 'cargo clippy --locked --tests --features no-e2e-tests -- -D warnings'
+    options:
+      cache: false
+    inputs: ['@group(sources)', '@group(build-config)']
+
+  build:
+    command: 'cargo build --locked'
+    options:
+      cache: false
+    inputs: ['@group(sources)', '@group(build-config)']
+
+  test:
+    # Upstream's own default gate is `test-unit` = `cargo test --features
+    # no-e2e-tests` (justfile): the e2e tests are opt-in, needing a live Forgejo
+    # (docker-compose) + forge credentials in a .env. Plain `cargo test` (not
+    # nextest) matches upstream and runs doctests too.
+    command: 'cargo test --locked --features no-e2e-tests'
+    options:
+      cache: false
+    inputs: ['@group(sources)', '@group(build-config)']
+
+  ci:
+    deps: ['fmt', 'clippy', 'build', 'test']
+    options:
+      cache: false
