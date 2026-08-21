@@ -15,7 +15,7 @@ use tracing::warn;
 use unicode_segmentation::UnicodeSegmentation as _;
 
 use crate::{
-    bookmark::{BookmarkGraph, BookmarkOrPending},
+    bookmark::{BookmarkGraph, BookmarkOrPending, JJName as _},
     cli::CliConfig,
     commands::{GetBookmarksOptions, StrVisualWidth as _},
     config::{Config, ForgeType},
@@ -221,6 +221,22 @@ pub async fn submit(config: &SubmitCommandConfig, cli_config: &CliConfig<'_>) ->
 
     ensure_whatever!(!bookmarks.is_empty(), "No bookmarks in revset {}", revset);
 
+    let changes = find_changes_to_submit(
+        &jj,
+        bookmarks.iter().map(BookmarkOrPending::change_id),
+        &pending_bookmarks,
+    )?;
+
+    // Backstop (RIG-2267): pass 1 resolved a non-empty bookmark set from the
+    // revset, but pass 2 (find_changes_to_submit) resolved it to nothing to
+    // submit. Never announce bookmarks and then exit 0 with "No bookmarks
+    // pushed" — fail loudly with an actionable message.
+    ensure_whatever!(
+        !changes.is_empty(),
+        "Resolved bookmark(s) {} but found no changes to submit — the named bookmark(s) may already be merged into trunk (inspect with `jj log -r <bookmark>`). For a stacked/ancestry-walked submit, also confirm `jj config get user.email` matches the change authors.",
+        bookmarks.iter().map(|b| b.raw_name()).join(", ")
+    );
+
     let forge = ForgeImpl::new(&repo_config)?;
 
     output.log_message(&format!(
@@ -234,12 +250,6 @@ pub async fn submit(config: &SubmitCommandConfig, cli_config: &CliConfig<'_>) ->
         },
         bookmarks.iter().map(|b| b.magenta().to_string()).join(", ")
     ));
-
-    let changes = find_changes_to_submit(
-        &jj,
-        bookmarks.iter().map(BookmarkOrPending::change_id),
-        &pending_bookmarks,
-    )?;
 
     let bookmark_graph = BookmarkGraph::from_changes(&jj, &changes, config.revset_options.tracked)?;
 
