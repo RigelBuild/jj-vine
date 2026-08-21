@@ -167,6 +167,34 @@ fn find_changes_to_submit_with_advanced_main() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn find_changes_to_submit_includes_foreign_authored_named_target() -> Result<()> {
+    let repo = TestRepo::with_local_remote();
+
+    repo.jj.exec(["new", "main"])?;
+    repo.create_change("f1.txt", "f1", "Feature 1")
+        .create_bookmark("feature");
+
+    // Author the bookmarked commit under a *different* identity than the one
+    // configured now — the RIG-2267 trigger (the fleet commit-author flip left
+    // pre-flip commits authored under the old identity). `mine()` would drop it.
+    repo.set_config("user.email", "seal@sealedsecurity.com");
+    repo.set_config("user.name", "seal");
+    repo.jj.exec(["metaedit", "--update-author"])?;
+    repo.set_config("user.email", "mintaka@rigel.build");
+    repo.set_config("user.name", "mintaka");
+
+    // An explicitly-named target must be submitted regardless of its author.
+    let changes = find_changes_to_submit(&repo.jj, ["feature"], &HashSet::new())?;
+    let names: Vec<_> = Bookmark::from_changes(&changes)
+        .into_iter()
+        .map(|b| b.name().to_owned())
+        .collect();
+    assert_eq!(names, vec!["feature".to_owned()]);
+
+    Ok(())
+}
+
 #[cfg(not(feature = "no-e2e-tests"))]
 mod e2e {
     use assertables::assert_contains;
