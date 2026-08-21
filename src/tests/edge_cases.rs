@@ -195,6 +195,62 @@ fn find_changes_to_submit_includes_foreign_authored_named_target() -> Result<()>
     Ok(())
 }
 
+#[test]
+fn find_changes_to_submit_excludes_foreign_authored_ancestry_companion() -> Result<()> {
+    let repo = TestRepo::with_local_remote();
+
+    // Build a stack off trunk: a (mine) -> c (foreign) -> b (mine), where the
+    // middle bookmark `c` is authored under a *different* identity (the
+    // RIG-2267 commit-author flip). Only the explicitly-named target is taken
+    // raw; ancestry-walked companions stay narrowed to `mine()`, so a foreign
+    // companion sitting in the ancestry of the target must be EXCLUDED — the
+    // other half of the fix (a stacked submit must not sweep in other people's
+    // bookmarks). Without `& mine()` on the ancestry branch, `c` would leak in.
+    repo.set_config("user.email", "mintaka@rigel.build");
+    repo.set_config("user.name", "mintaka");
+
+    repo.jj.exec(["new", "main"])?;
+    repo.create_change("a.txt", "a", "Change A")
+        .create_bookmark("a");
+
+    repo.jj.exec(["new"])?;
+    repo.create_change("c.txt", "c", "Change C")
+        .create_bookmark("c");
+    // Re-author `c` (=@) under the old identity, then restore `user.email` so
+    // `mine()` resolves to `mintaka` at query time.
+    repo.set_config("user.email", "seal@sealedsecurity.com");
+    repo.set_config("user.name", "seal");
+    repo.jj.exec(["metaedit", "--update-author"])?;
+    repo.set_config("user.email", "mintaka@rigel.build");
+    repo.set_config("user.name", "mintaka");
+
+    repo.jj.exec(["new"])?;
+    repo.create_change("b.txt", "b", "Change B")
+        .create_bookmark("b");
+
+    // Submitting `b` walks its ancestry: `a` (mine) is included, `c` (foreign)
+    // is dropped by `& mine()`.
+    let changes = find_changes_to_submit(&repo.jj, ["b"], &HashSet::new())?;
+    let mut names: Vec<_> = Bookmark::from_changes(&changes)
+        .into_iter()
+        .map(|b| b.name().to_owned())
+        .collect();
+    names.sort();
+    assert_eq!(names, vec!["a".to_owned(), "b".to_owned()]);
+
+    // Two explicit targets exercise the multi-target `join(" | ")` on both the
+    // explicit and ancestry branches; `c` stays excluded from the ancestry.
+    let changes = find_changes_to_submit(&repo.jj, ["a", "b"], &HashSet::new())?;
+    let mut names: Vec<_> = Bookmark::from_changes(&changes)
+        .into_iter()
+        .map(|b| b.name().to_owned())
+        .collect();
+    names.sort();
+    assert_eq!(names, vec!["a".to_owned(), "b".to_owned()]);
+
+    Ok(())
+}
+
 #[cfg(not(feature = "no-e2e-tests"))]
 mod e2e {
     use assertables::assert_contains;
