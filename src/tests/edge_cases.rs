@@ -251,6 +251,86 @@ fn find_changes_to_submit_excludes_foreign_authored_ancestry_companion() -> Resu
     Ok(())
 }
 
+/// Regression: a history with chained merge commits must not re-walk shared
+/// ancestors combinatorially. The old `find_nearest_bookmarked_ancestors`
+/// recursed with no visited set and spawned one `jj log` per visit, so a ladder
+/// of merges produced an exponential number of `jj` invocations and did not
+/// terminate on a moderately branchy repo. With the visited set the walk is
+/// linear: the invocation count stays a small multiple of the commit count.
+#[test]
+fn merge_ladder_does_not_rewalk_combinatorially() -> Result<()> {
+    let repo = TestRepo::new();
+
+    // Build a ladder of diamonds on top of a single bookmarked `base`. Each
+    // rung merges two children of the previous rung, so the previous rung is a
+    // shared ancestor reachable by two paths. Under the old recursion each rung
+    // doubled how many times the lower rungs were re-expanded (2^depth); the
+    // visited set collapses that to one visit each.
+    //
+    // The interior rungs must carry no bookmark, or the walk stops at the first
+    // one. We use temporary bookmarks only to navigate while building, then
+    // delete them, leaving `base` and `leaf` as the only bookmarks — so
+    // resolving `leaf` descends the whole ladder to `base`.
+    repo.create_change("base.txt", "base", "base")
+        .create_bookmark("base");
+
+    // 8 rungs: without the fix this spawns 514 jj invocations (2.5x the 200
+    // ceiling), so it separates the two regimes decisively at a third less build
+    // cost than a deeper ladder.
+    let rungs: u32 = 8;
+    for i in 0..rungs {
+        let parent = if i == 0 {
+            "base".to_owned()
+        } else {
+            format!("rung{}", i - 1)
+        };
+        repo.jj(["new", &parent])?
+            .create_change(&format!("l{i}.txt"), "l", "left")
+            .jj(["new", &parent])?
+            .create_change(&format!("r{i}.txt"), "r", "right");
+        let rung_name = format!("rung{i}");
+        repo.jj(["new", "@", "@-"])?
+            .create_change(&format!("m{i}.txt"), "m", "merge")
+            .create_bookmark(&rung_name);
+    }
+
+    repo.jj(["new", &format!("rung{}", rungs - 1)])?
+        .create_change("leaf.txt", "leaf", "leaf")
+        .create_bookmark("leaf");
+
+    // Drop the interior rung bookmarks so only `base` and `leaf` remain.
+    for i in 0..rungs {
+        repo.jj(["bookmark", "delete", &format!("rung{i}")])?;
+    }
+
+    let changes = repo.jj.log("base | leaf")?;
+    let bookmarks: Vec<_> = BookmarkOrPending::from_changes(&changes)
+        .into_iter()
+        .collect();
+
+    let before = repo.jj.exec_count();
+    let graph = BookmarkGraph::from_bookmarks(&repo.jj, bookmarks.iter().cloned(), false)?;
+    let spawned = repo.jj.exec_count() - before;
+
+    // Linear bound: without the visited set this is exponential in `rungs`
+    // (~514 invocations at 8 rungs) and the test would hang at a deeper ladder.
+    // A generous linear ceiling still separates the two regimes cleanly.
+    assert!(
+        spawned <= 200,
+        "resolving `leaf` over {rungs} merge rungs spawned {spawned} jj \
+         invocations; expected a linear count (<=200). A combinatorial blow-up \
+         means the visited-set dedup regressed."
+    );
+
+    // The fix preserves behavior: leaf resolves and its downstack reaches base
+    // through the ladder.
+    assert_some!(graph.find_bookmark_in_components("leaf"));
+    let downstack = graph.downstack_of("leaf")?;
+    assert_any!(downstack.iter(), |b: &BookmarkOrPending| b.name() == "base");
+
+    Ok(())
+}
+
 #[cfg(not(feature = "no-e2e-tests"))]
 mod e2e {
     use assertables::assert_contains;
