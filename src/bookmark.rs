@@ -685,6 +685,7 @@ impl<'a> BookmarkGraph<'a> {
                 bookmark.change(),
                 skip_untracked_local_bookmarks,
                 &pending_bookmarks,
+                &mut HashSet::new(),
             )?;
 
             adjacency_list
@@ -861,11 +862,21 @@ impl<'a> BookmarkGraph<'a> {
     }
 
     /// Find the nearest bookmarked ancestors starting from a given commit.
+    ///
+    /// `visited` records the `commit_id` of every commit whose ancestry has
+    /// already been expanded. Without it, a history with merge commits re-walks
+    /// shared ancestors once per path that reaches them — one `jj log`
+    /// subprocess each — which is exponential in the number of merges and does
+    /// not terminate on a moderately branchy repo. Deduplicating the expansion
+    /// makes the walk linear; the resulting set of boundary ancestors is
+    /// unchanged, because a boundary found on the first visit already bubbles
+    /// up to the root and the caller deduplicates.
     fn find_nearest_bookmarked_ancestors(
         jj: &Jujutsu,
         from: &Change,
         skip_untracked_local_bookmarks: bool,
         pending_bookmarks: &HashSet<String>,
+        visited: &mut HashSet<String>,
     ) -> Result<Vec<Change>> {
         let mut ancestors = Vec::new();
 
@@ -878,15 +889,16 @@ impl<'a> BookmarkGraph<'a> {
                 .filter(|bookmark| !skip_untracked_local_bookmarks || bookmark.is_tracked())
                 .collect();
 
-            if bookmarks.is_empty() && !pending_bookmarks.contains(&parent.change_id) {
+            if !bookmarks.is_empty() || pending_bookmarks.contains(&parent.change_id) {
+                ancestors.push(parent);
+            } else if visited.insert(parent.commit_id.clone()) {
                 ancestors.extend(Self::find_nearest_bookmarked_ancestors(
                     jj,
                     &parent,
                     skip_untracked_local_bookmarks,
                     pending_bookmarks,
+                    visited,
                 )?);
-            } else {
-                ancestors.push(parent);
             }
         }
 
