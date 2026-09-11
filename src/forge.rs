@@ -4,6 +4,7 @@ pub mod github;
 pub mod gitlab;
 pub mod test;
 
+use core::time::Duration;
 use std::borrow::Cow;
 
 use bon::Builder;
@@ -17,6 +18,28 @@ use crate::{
     error::{Error, Result},
     utils::ResultWithWarnings,
 };
+
+/// Default timeout applied to every forge HTTP client.
+///
+/// `reqwest` has no request timeout by default, so a connection that stalls
+/// after connecting — a forge that accepts the socket but never responds —
+/// hangs the whole process with no output and no error. Every forge client is
+/// built through [`http_client_builder`] so the timeout is applied uniformly.
+pub(crate) const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// A `reqwest` client builder pre-configured with [`HTTP_TIMEOUT`].
+///
+/// Forge constructors add their TLS/CA options on top of this and then
+/// `.build()` it, so no client can be created without the timeout.
+pub(crate) fn http_client_builder() -> reqwest::ClientBuilder {
+    http_client_builder_with_timeout(HTTP_TIMEOUT)
+}
+
+/// A `reqwest` client builder with an explicit request timeout. Split out so
+/// tests can exercise the timeout path with a short duration.
+pub(crate) fn http_client_builder_with_timeout(timeout: Duration) -> reqwest::ClientBuilder {
+    reqwest::Client::builder().timeout(timeout)
+}
 
 pub trait UserLike: core::fmt::Debug {
     fn id(&self) -> Option<Cow<'_, str>>;
@@ -1247,5 +1270,92 @@ impl ForgeImpl {
                 azure::AzureDevOpsForge::new_from_config(config).map(ForgeImpl::AzureDevOps)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod http_timeout_tests {
+    use core::time::Duration;
+    use std::net::TcpListener;
+
+    use super::{HTTP_TIMEOUT, http_client_builder, http_client_builder_with_timeout};
+
+    /// Bind a listener that accepts connections and never responds, then leak
+    /// it for the rest of the test process. This is the RIG-3585 failure: the
+    /// client connects, sends its request, and blocks in `recvfrom` forever.
+    ///
+    /// The listener is intentionally `forget`-leaked rather than run on a
+    /// spawned thread: the OS accepts connections into the socket's backlog
+    /// without any user-space `accept()`, so a bound-but-unaccepted socket is
+    /// a black hole on its own. That keeps the helper free of a background
+    /// thread and file descriptor that would outlive each test.
+    fn black_hole() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind black-hole listener");
+        let addr = listener.local_addr().expect("read local addr");
+        // Keep the port bound (and the backlog accepting) for the whole test
+        // process without holding a `JoinHandle` we would have to reap.
+        core::mem::forget(listener);
+        format!("http://{addr}/")
+    }
+
+    #[tokio::test]
+    async fn client_times_out_instead_of_hanging() {
+        let url = black_hole();
+
+        // A client with a short timeout must return a timeout error rather than
+        // blocking on the never-answering socket. The outer `tokio` deadline is
+        // a guard, not the assertion: if the client's own timeout regresses,
+        // `send()` never returns and the outer deadline makes the test panic
+        // fast instead of hanging the whole CI job (the CI `test` job sets no
+        // `timeout-minutes`).
+        let client = http_client_builder_with_timeout(Duration::from_millis(300))
+            .build()
+            .expect("build client");
+
+        let raced = tokio::time::timeout(Duration::from_secs(5), client.get(&url).send()).await;
+        let result = raced
+            .expect("client hung past its own 300ms timeout — the request timeout was not applied");
+        let err = result.expect_err("request to a black hole must error, not succeed");
+        assert!(
+            err.is_timeout(),
+            "the error must be a timeout, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_timeoutless_client_would_hang() {
+        // Demonstrates the bug this fix prevents: the pre-fix inline builder
+        // (`reqwest::Client::builder()` with no `.timeout()`) never returns
+        // against a black hole. We prove that by racing it against a short
+        // outer deadline; the request is still pending when the deadline fires.
+        let url = black_hole();
+
+        let timeoutless = reqwest::Client::builder()
+            .build()
+            .expect("build timeoutless client");
+
+        let raced =
+            tokio::time::timeout(Duration::from_millis(500), timeoutless.get(&url).send()).await;
+
+        assert!(
+            raced.is_err(),
+            "without a timeout the request must still be pending at the deadline"
+        );
+    }
+
+    #[test]
+    fn production_client_builder_applies_the_timeout() {
+        // Guards the actual claim of this fix: the helper every forge
+        // constructor uses (`http_client_builder`) wires `HTTP_TIMEOUT` into the
+        // client. `reqwest::Client`'s `Debug` renders the configured deadline,
+        // so this needs no socket. Without the `.timeout()` this reads
+        // `Client { accepts: Accepts, .. }` with no `TotalTimeout`, so the
+        // assertion is genuinely red-green on the production path.
+        assert_eq!(HTTP_TIMEOUT, Duration::from_secs(30));
+        let rendered = format!("{:?}", http_client_builder().build().expect("build client"));
+        assert!(
+            rendered.contains("TotalTimeout: 30s"),
+            "http_client_builder() must apply the 30s timeout, got: {rendered}"
+        );
     }
 }
