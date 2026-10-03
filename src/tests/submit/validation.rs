@@ -25,7 +25,7 @@ mod e2e {
 
         let result = repo.try_run(["submit"]).await;
 
-        assert_contains!(result.unwrap_err().to_string(), "Usage:");
+        assert_contains!(result.unwrap_err().to_string(), "You must specify a revset");
 
         Ok(())
     }
@@ -42,7 +42,7 @@ mod e2e {
 
         assert_contains!(
             result.unwrap_err().to_string(),
-            "No bookmarks in revset (mine() & tracked_remote_bookmarks()) ~ trunk()"
+            "No bookmarks in revset (mine() & tracked_remote_bookmarks()) ~ ::trunk()"
         );
 
         Ok(())
