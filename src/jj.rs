@@ -525,9 +525,8 @@ impl Jujutsu {
         &self.cwd
     }
 
-    /// Create a Jujutsu instance whose commands read `config_path` instead of
-    /// the default empty test config. `JJ_CONFIG` is set per command and does
-    /// not mutate process environment or race with other threads.
+    /// For a test that needs its own config file rather than the shared empty
+    /// default. `JJ_CONFIG` is set per command, so process env is untouched.
     #[cfg(test)]
     pub(crate) fn new_isolated(
         cwd: impl Into<PathBuf>,
