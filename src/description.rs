@@ -920,6 +920,18 @@ mod tests {
     }
 
     #[test]
+    fn top_placement_reflows_text_before_and_after_markers() {
+        assert_str_eq!(
+            insert_stack_into_description(
+                "New stack",
+                &format!("Notes before\n\n{START_MARKER}\nOld stack\n{END_MARKER}\n\nNotes after"),
+                StackPlacement::Top,
+            ),
+            format!("{START_MARKER}\nNew stack\n{END_MARKER}\n\nNotes before\n\nNotes after")
+        );
+    }
+
+    #[test]
     fn linear_generate_linear_component() {
         let changes = Change::mock_stack_map([
             Change::mock_from_bookmark("feature-a"),
