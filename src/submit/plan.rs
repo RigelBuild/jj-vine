@@ -1,8 +1,10 @@
 use std::{collections::HashMap, path::Path};
 
 use futures::{StreamExt as _, stream::FuturesUnordered};
+use itertools::Itertools as _;
 use owo_colors::OwoColorize as _;
 use snafu::whatever;
+use tracing::debug;
 
 use crate::{
     bookmark::{BookmarkOrPending, BookmarkRef},
@@ -387,8 +389,40 @@ pub async fn plan(ctx: PlanContext<'_>) -> Result<SubmissionPlan> {
         batches.push(sync_dependent_merge_requests_batch);
     }
 
+    warn_for_unbookmarked_descendants(&ctx);
     Ok(SubmissionPlan {
         actions: batches,
         existing_mrs,
     })
+}
+
+fn warn_for_unbookmarked_descendants(ctx: &PlanContext<'_>) {
+    let heads = ctx
+        .bookmark_graph
+        .components()
+        .iter()
+        .flat_map(|component| component.leaves.iter())
+        .map(crate::bookmark::JJName::name_for_jj)
+        .join(" | ");
+    if heads.is_empty() {
+        return;
+    }
+
+    let unbookmarked_descendants = format!(
+        "(descendants({heads}) ~ ({heads}) ~ empty()) ~ ::trunk() ~ ::(bookmarks() & descendants({heads}) ~ ({heads})) ~ (working_copies() ~ @)"
+    );
+
+    match ctx.jj.log(unbookmarked_descendants) {
+        Ok(changes) => {
+            for change in changes {
+                let warning = format!(
+                    "Warning: commit will not be pushed unless a bookmark is moved onto it: {} {}",
+                    change.change_id_short(),
+                    change.description_first_line_quoted_or_empty()
+                );
+                ctx.output.log_message(&warning.yellow().to_string());
+            }
+        }
+        Err(error) => debug!("Could not check for unbookmarked descendants: {error}"),
+    }
 }

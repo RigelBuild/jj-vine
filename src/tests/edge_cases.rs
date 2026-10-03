@@ -250,6 +250,116 @@ fn find_changes_to_submit_excludes_foreign_authored_ancestry_companion() -> Resu
 
     Ok(())
 }
+#[test]
+fn plan_warns_for_unbookmarked_descendants() -> Result<()> {
+    let repo = TestRepo::with_local_remote();
+    repo.create_change("bookmark.txt", "bookmark", "Bookmark B")
+        .create_bookmark("B")
+        .jj(["new"])?
+        .create_change("child.txt", "child", "Unbookmarked child");
+    let child = repo.jj.log("@")?.into_iter().next().unwrap();
+
+    let warning = plan_and_capture_warnings(&repo)?;
+
+    assert_contains!(warning, child.change_id_short());
+    assert_contains!(warning, child.description_first_line());
+    assert_contains!(
+        warning,
+        "will not be pushed unless a bookmark is moved onto it"
+    );
+    Ok(())
+}
+
+#[test]
+fn plan_does_not_warn_for_bookmarked_descendants() -> Result<()> {
+    let repo = TestRepo::with_local_remote();
+    repo.create_change("bookmark.txt", "bookmark", "Bookmark B")
+        .create_bookmark("B")
+        .jj(["new"])?
+        .create_change("child.txt", "child", "Bookmarked child")
+        .create_bookmark("child");
+
+    let warning = plan_and_capture_warnings(&repo)?;
+
+    assert_not_contains!(warning, "will not be pushed");
+    Ok(())
+}
+
+#[test]
+fn plan_warns_only_above_later_bookmarks() -> Result<()> {
+    let repo = TestRepo::with_local_remote();
+    repo.create_change("b.txt", "b", "Bookmark B")
+        .create_bookmark("B")
+        .jj(["new"])?
+        .create_change("x.txt", "x", "Unbookmarked X")
+        .jj(["new"])?
+        .create_change("c.txt", "c", "Bookmark C")
+        .create_bookmark("C")
+        .jj(["new"])?
+        .create_change("y.txt", "y", "Unbookmarked Y");
+
+    let middle_changes = repo.jj.log("B..C")?;
+    let x = middle_changes
+        .iter()
+        .find(|change| change.description_first_line() == "Unbookmarked X")
+        .expect("X is between the B and C bookmarks");
+    let y = repo
+        .jj
+        .log("C::")?
+        .into_iter()
+        .find(|change| change.description_first_line() == "Unbookmarked Y")
+        .expect("Y is above the C bookmark");
+    let warning = plan_and_capture_warnings(&repo)?;
+
+    assert_not_contains!(warning, x.change_id_short());
+    assert_contains!(warning, y.change_id_short());
+    Ok(())
+}
+
+#[test]
+fn plan_warns_for_unbookmarked_change_without_description() -> Result<()> {
+    let repo = TestRepo::with_local_remote();
+    repo.create_change("bookmark.txt", "bookmark", "Bookmark B")
+        .create_bookmark("B")
+        .jj(["new"])?
+        .create_change("child.txt", "child", "Unbookmarked child")
+        .jj(["describe", "-m", ""])?;
+
+    let warning = plan_and_capture_warnings(&repo)?;
+    assert_contains!(warning, "(no description set)");
+    Ok(())
+}
+
+fn plan_and_capture_warnings(repo: &TestRepo<TestRepo<()>>) -> Result<String> {
+    use crate::{
+        config::{Config, ForgeType},
+        forge::{ForgeImpl, test::TestForge},
+        output::BufferedOutput,
+        submit::{PlanContext, plan::plan},
+    };
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("test runtime");
+
+    let changes = repo.jj.log("B")?;
+    let graph = BookmarkGraph::from_changes(&repo.jj, changes.iter(), false)?;
+    let forge = ForgeImpl::Test(TestForge::default());
+    let config = Config::builder().forge(ForgeType::Forgejo).build();
+    let output = BufferedOutput::new();
+
+    runtime.block_on(plan(PlanContext {
+        jj: &repo.jj,
+        forge: &forge,
+        config: &config,
+        output: &output,
+        bookmark_graph: &graph,
+        dry_run: true,
+    }))?;
+
+    Ok(output.get_buffer())
+}
 
 #[cfg(not(feature = "no-e2e-tests"))]
 mod e2e {
