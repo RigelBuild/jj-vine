@@ -475,9 +475,9 @@ impl GitHubConfig {
             .build());
         };
 
-        let bin_path = which::which(bin).map_err(|error| {
+        let bin_path = which::which(bin).map_err(|_| {
             ConfigSnafu {
-                message: format!("github.tokenCommand binary `{bin}` not found in PATH: {error}"),
+                message: "github.tokenCommand binary not found in PATH".to_owned(),
             }
             .build()
         })?;
@@ -486,41 +486,27 @@ impl GitHubConfig {
         command.args(args);
         let Some(output) = crate::process::output_with_timeout(command, timeout)? else {
             return Err(ConfigSnafu {
-                message: format!(
-                    "github.tokenCommand `{}` timed out after {}s",
-                    self.token_command.join(" "),
-                    timeout.as_secs()
-                ),
+                message: format!("github.tokenCommand timed out after {timeout:?}"),
             }
             .build());
         };
         if !output.status.success() {
             return Err(ConfigSnafu {
-                message: format!(
-                    "github.tokenCommand `{}` failed with {}",
-                    self.token_command.join(" "),
-                    output.status
-                ),
+                message: format!("github.tokenCommand failed with {}", output.status),
             }
             .build());
         }
 
         let raw = String::from_utf8(output.stdout).map_err(|_| {
             ConfigSnafu {
-                message: format!(
-                    "github.tokenCommand `{}` produced non-UTF-8 output",
-                    self.token_command.join(" ")
-                ),
+                message: "github.tokenCommand produced non-UTF-8 output".to_owned(),
             }
             .build()
         })?;
         let token = raw.trim().to_owned();
         if token.is_empty() {
             return Err(ConfigSnafu {
-                message: format!(
-                    "github.tokenCommand `{}` produced empty output",
-                    self.token_command.join(" ")
-                ),
+                message: "github.tokenCommand produced empty output".to_owned(),
             }
             .build());
         }
@@ -1583,7 +1569,7 @@ mod tests {
             token_command: vec![
                 "sh".to_owned(),
                 "-c".to_owned(),
-                "printf '%s%s' \"$1\" \"$2\" >&2; exit 1".to_owned(),
+                "printf '%s_%s' \"$1\" \"$2\" >&2; exit 1".to_owned(),
                 "sh".to_owned(),
                 "SAFE_ARG_A".to_owned(),
                 "SAFE_ARG_B".to_owned(),
@@ -1596,6 +1582,8 @@ mod tests {
             .to_string();
         assert!(message.contains("failed"));
         assert!(!message.contains("SAFE_ARG_A_SAFE_ARG_B"));
+        assert!(!message.contains("SAFE_ARG_A"));
+        assert!(!message.contains("SAFE_ARG_B"));
     }
 
     #[test]

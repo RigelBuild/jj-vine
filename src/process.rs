@@ -21,7 +21,10 @@ pub(crate) fn output_with_timeout(
     let drain_grace = core::time::Duration::from_millis(500);
 
     // Keep buffers shared so bytes read before EOF stalls remain available.
-    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     let mut child = command.spawn()?;
     let stdout_pipe = child.stdout.take().expect("stdout was piped");
     let stderr_pipe = child.stderr.take().expect("stderr was piped");
