@@ -77,6 +77,7 @@ pub struct ExecuteContext<'a> {
     pub output: &'a dyn Output,
     pub bookmark_graph: &'a BookmarkGraph<'a>,
     pub dry_run: bool,
+    pub no_hooks: bool,
 
     pub plan: &'a SubmissionPlan,
 }
@@ -91,6 +92,7 @@ impl<'a> ExecuteContext<'a> {
             output: ctx.output,
             bookmark_graph,
             dry_run: ctx.dry_run,
+            no_hooks: ctx.no_hooks,
             plan: &ctx.plan,
         }
     }
@@ -102,6 +104,7 @@ pub struct RootExecuteContext<'a> {
     pub config: &'a Config,
     pub output: &'a dyn Output,
     pub dry_run: bool,
+    pub no_hooks: bool,
 
     pub plan: SubmissionPlan,
     pub changes: Vec<Change>,
@@ -119,6 +122,7 @@ impl<'a> RootExecuteContext<'a> {
         plan: SubmissionPlan,
         changes: Vec<Change>,
         skip_untracked_local_bookmarks: bool,
+        no_hooks: bool,
     ) -> Self {
         Self {
             jj,
@@ -128,6 +132,7 @@ impl<'a> RootExecuteContext<'a> {
             dry_run,
             plan,
             changes,
+            no_hooks,
             skip_untracked_local_bookmarks,
         }
     }
