@@ -181,7 +181,7 @@ jj config set --user aliases.vine '["util", "exec", "--", "jj-vine"]'
 
 ### `submit`{#submit}
 
-Submit a bookmark and its dependencies as pull/merge requests.
+Submit a bookmark and its dependencies as pull/merge requests. Non-empty commits after the submitted bookmark that have no bookmark of their own are not pushed; `submit` warns about them, including in `--dry-run` and `--show-plan` output. Move a bookmark onto a commit to include it in a push.
 
 ```bash
 # Submit a single bookmark or revset (and its dependencies!)
