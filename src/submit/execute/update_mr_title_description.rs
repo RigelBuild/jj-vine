@@ -144,13 +144,16 @@ impl ExecuteAction for UpdateMRTitleDescriptionAction {
         );
 
         let description_user_part = if let Some(description) = &self.description {
-            description // Stack part will be inserted after
+            description // Stack part will be inserted according to configured placement.
         } else {
             current_mr.description()
         };
 
-        let new_description =
-            insert_stack_into_description(&stack_description, description_user_part);
+        let new_description = insert_stack_into_description(
+            &stack_description,
+            description_user_part,
+            ctx.execute.config.description.placement,
+        );
 
         let description_unchanged = current_mr.description() == new_description;
 
