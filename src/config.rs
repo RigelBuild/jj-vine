@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 use bon::Builder;
 use serde::{Deserialize, de::Visitor};
+use toml::Table;
 
 use crate::{
     error::{ConfigSnafu, Error, Result},
@@ -215,7 +216,8 @@ pub struct Config {
     #[builder(default)]
     pub gitlab: GitLabConfig,
 
-    /// GitHub configuration.
+    /// GitHub configuration. Empty `host` and `project` values may be derived
+    /// from the configured Git remote when loading repository config.
     #[serde(default)]
     #[builder(default)]
     pub github: GitHubConfig,
@@ -949,6 +951,28 @@ impl Default for DescriptionDiagramConfig {
     }
 }
 
+/// Read repo-layer GitHub config values, excluding the user/global config.
+/// Failures are best-effort and leave values eligible for remote detection.
+fn repo_layer_values(jj: &Jujutsu) -> Table {
+    let Ok(output) = jj.exec(["config", "list", "--repo"]) else {
+        return Table::new();
+    };
+    toml::from_str::<Table>(&output.stdout)
+        .ok()
+        .and_then(|table| table.get("jj-vine").cloned())
+        .and_then(|jj_vine| jj_vine.get("github").cloned())
+        .and_then(|github| github.as_table().cloned())
+        .unwrap_or_default()
+}
+
+/// A non-empty repo-level value takes precedence over clone-derived values.
+fn repo_layer_nonempty(github: &Table, key: &str) -> bool {
+    github
+        .get(key)
+        .and_then(toml::Value::as_str)
+        .is_some_and(|value| !value.is_empty())
+}
+
 impl Config {
     /// Load configuration from jj config.
     pub fn load(repo_path: impl Into<PathBuf>) -> Result<Self> {
@@ -974,12 +998,31 @@ impl Config {
             .build()
         })?;
 
-        let config: Config = jj_vine_value.clone().try_into().map_err(|e| {
+        let mut config: Config = jj_vine_value.clone().try_into().map_err(|e| {
             ConfigSnafu {
                 message: format!("Failed to parse jj-vine config: {e}"),
             }
             .build()
         })?;
+
+        // Repo-explicit values win; otherwise clone-derived values supersede
+        // global config. Empty repo values collapse into the derive path.
+        if config.forge == ForgeType::GitHub {
+            let repo_layer = repo_layer_values(jj);
+            let project_set = repo_layer_nonempty(&repo_layer, "project");
+            let host_set = repo_layer_nonempty(&repo_layer, "host");
+            if (!project_set || !host_set)
+                && let Some(detected) =
+                    crate::remote::detect_project(jj, &config.remote_name, ForgeType::GitHub)
+            {
+                if !project_set {
+                    config.github.project = detected.project;
+                }
+                if !host_set {
+                    config.github.host = detected.host;
+                }
+            }
+        }
 
         config.validate()?;
 
@@ -1050,6 +1093,195 @@ mod tests {
             .expect("Failed to init jj repo");
 
         (temp_dir, repo_path)
+    }
+
+    fn set_repo_config(repo_path: &Path, key: &str, value: &str) {
+        isolated_jj(repo_path)
+            .expect("Failed to create Jujutsu instance")
+            .exec(["config", "set", "--repo", key, value])
+            .expect("Failed to set repo config");
+    }
+
+    fn add_git_remote(repo_path: &Path, name: &str, url: &str) {
+        isolated_jj(repo_path)
+            .expect("Failed to create Jujutsu instance")
+            .exec(["git", "remote", "add", name, url])
+            .expect("Failed to add git remote");
+    }
+
+    fn seed_github_config(repo_path: &Path) {
+        set_repo_config(repo_path, "jj-vine.forge", "github");
+        set_repo_config(repo_path, "jj-vine.github.token", "test-token");
+    }
+
+    #[test]
+    fn derive_project_and_host_when_unset() {
+        let (_temp, repo_path) = create_test_repo();
+        seed_github_config(&repo_path);
+        add_git_remote(&repo_path, "origin", "git@github.com:owner/repo.git");
+
+        let config = load_isolated(&repo_path).expect("load config from GitHub remote");
+
+        assert_eq!(config.github.project, "owner/repo");
+        assert_eq!(config.github.host, "https://api.github.com");
+    }
+
+    #[test]
+    fn derive_missing_field_independently() {
+        let (_temp, repo_path) = create_test_repo();
+        seed_github_config(&repo_path);
+        set_repo_config(&repo_path, "jj-vine.github.project", "configured/repo");
+        add_git_remote(&repo_path, "origin", "git@github.com:owner/repo.git");
+
+        let config = load_isolated(&repo_path).expect("load config from GitHub remote");
+
+        assert_eq!(config.github.project, "configured/repo");
+        assert_eq!(config.github.host, "https://api.github.com");
+    }
+
+    #[test]
+    fn derive_supersedes_global_project_and_host() {
+        let (temp, repo_path) = create_test_repo();
+        seed_github_config(&repo_path);
+        std::fs::write(
+            temp.path().join(ISOLATED_TEST_CONFIG),
+            "[jj-vine.github]\nproject = \"stale/global\"\nhost = \"https://stale.example/api/v3\"\n",
+        )
+        .expect("write user-level GitHub values");
+        add_git_remote(&repo_path, "origin", "git@github.com:owner/repo.git");
+
+        let config = load_isolated(&repo_path).expect("load config from GitHub remote");
+
+        assert_eq!(config.github.project, "owner/repo");
+        assert_eq!(config.github.host, "https://api.github.com");
+    }
+
+    #[test]
+    fn derive_detection_failure_falls_back_to_validate_error() {
+        let (_temp, repo_path) = create_test_repo();
+        seed_github_config(&repo_path);
+
+        let result = load_isolated(&repo_path);
+        let Err(Error::Config { message, .. }) = result else {
+            panic!("Expected Config error, got: {result:?}");
+        };
+
+        assert!(
+            message.contains("auto-detection from the 'origin' remote found no GitHub owner/repo"),
+            "validation error must explain remote detection failure: {message}"
+        );
+    }
+
+    #[test]
+    fn derive_fork_workflow_fence_errors() {
+        let (_temp, repo_path) = create_test_repo();
+        seed_github_config(&repo_path);
+        add_git_remote(&repo_path, "origin", "git@github.com:owner/fork.git");
+        add_git_remote(&repo_path, "upstream", "git@github.com:owner/canonical.git");
+
+        let result = load_isolated(&repo_path);
+        let Err(Error::Config { message, .. }) = result else {
+            panic!("Expected Config error, got: {result:?}");
+        };
+
+        assert!(
+            message.contains("auto-detection from the 'origin' remote found no GitHub owner/repo"),
+            "fork workflow must skip derivation and explain the missing project: {message}"
+        );
+    }
+
+    #[test]
+    fn derive_respects_configured_remote_name() {
+        let (_temp, repo_path) = create_test_repo();
+        seed_github_config(&repo_path);
+        set_repo_config(&repo_path, "jj-vine.remoteName", "upstream");
+        add_git_remote(&repo_path, "upstream", "git@github.com:owner/canonical.git");
+
+        let config = load_isolated(&repo_path).expect("load config from configured remote");
+
+        assert_eq!(config.github.project, "owner/canonical");
+    }
+
+    #[test]
+    fn derive_does_not_fill_non_github_config() {
+        let (_temp, repo_path) = create_test_repo();
+        set_repo_config(&repo_path, "jj-vine.forge", "gitlab");
+        set_repo_config(&repo_path, "jj-vine.gitlab.host", "https://gitlab.com");
+        set_repo_config(&repo_path, "jj-vine.gitlab.project", "group/repo");
+        set_repo_config(&repo_path, "jj-vine.gitlab.token", "test-token");
+        add_git_remote(&repo_path, "origin", "git@github.com:owner/repo.git");
+
+        let config = load_isolated(&repo_path).expect("load GitLab config");
+
+        assert!(config.github.project.is_empty());
+        assert!(config.github.host.is_empty());
+    }
+
+    #[test]
+    fn derive_explicit_empty_project_collapses_to_absent() {
+        let (_temp, repo_path) = create_test_repo();
+        seed_github_config(&repo_path);
+        set_repo_config(&repo_path, "jj-vine.github.project", "");
+        add_git_remote(&repo_path, "origin", "git@github.com:owner/repo.git");
+
+        let config = load_isolated(&repo_path).expect("load config from GitHub remote");
+
+        assert_eq!(config.github.project, "owner/repo");
+    }
+    #[test]
+    fn derive_explicit_empty_host_collapses_to_absent() {
+        let (_temp, repo_path) = create_test_repo();
+        seed_github_config(&repo_path);
+        set_repo_config(&repo_path, "jj-vine.github.project", "configured/repo");
+        set_repo_config(&repo_path, "jj-vine.github.host", "");
+        add_git_remote(&repo_path, "origin", "git@github.com:owner/remote.git");
+
+        let config = load_isolated(&repo_path).expect("load config from GitHub remote");
+
+        assert_eq!(config.github.project, "configured/repo");
+        assert_eq!(config.github.host, "https://api.github.com");
+    }
+
+    #[test]
+    fn derive_does_not_change_target_project() {
+        let (_temp, repo_path) = create_test_repo();
+        seed_github_config(&repo_path);
+        add_git_remote(&repo_path, "origin", "git@github.com:owner/repo.git");
+
+        let config = load_isolated(&repo_path).expect("load config from GitHub remote");
+
+        assert!(config.github.target_project.is_empty());
+    }
+
+    #[test]
+    fn derive_explicit_host_is_preserved_while_project_derives() {
+        let (_temp, repo_path) = create_test_repo();
+        seed_github_config(&repo_path);
+        set_repo_config(
+            &repo_path,
+            "jj-vine.github.host",
+            "https://ghe.example/api/v3",
+        );
+        add_git_remote(&repo_path, "origin", "git@github.com:owner/repo.git");
+
+        let config = load_isolated(&repo_path).expect("load config from GitHub remote");
+
+        assert_eq!(config.github.host, "https://ghe.example/api/v3");
+        assert_eq!(config.github.project, "owner/repo");
+    }
+
+    #[test]
+    fn derive_gitlab_remote_as_github_is_not_used() {
+        let (_temp, repo_path) = create_test_repo();
+        seed_github_config(&repo_path);
+        add_git_remote(&repo_path, "origin", "git@gitlab.com:group/repo.git");
+
+        let result = load_isolated(&repo_path);
+        let Err(Error::Config { message, .. }) = result else {
+            panic!("Expected Config error, got: {result:?}");
+        };
+
+        assert!(message.contains("auto-detection from the 'origin' remote"));
     }
 
     /// Verify `JJ_CONFIG` both supplies and replaces the user config layer.

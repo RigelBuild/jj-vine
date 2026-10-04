@@ -336,7 +336,11 @@ struct GraphQLError {
 pub fn validate_config(config: &Config) -> Result<()> {
     if config.github.project.is_empty() {
         return Err(ConfigSnafu {
-            message: "github.project is required when forge is github".to_owned(),
+            message: format!(
+                "github.project is required when forge is github (auto-detection from the \
+                 '{}' remote found no GitHub owner/repo); set jj-vine.github.project",
+                config.remote_name
+            ),
         }
         .build());
     }
