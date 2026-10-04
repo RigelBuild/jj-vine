@@ -440,6 +440,45 @@ pub struct Jujutsu {
     default_branch: OnceCell<Result<String, Error>>,
 }
 
+/// Assemble the full argv for pushing bookmarks with the selected command.
+pub(crate) fn build_push_argv(
+    push_argv: &[String],
+    remote: Option<&str>,
+    bookmarks: impl IntoIterator<Item = String>,
+) -> Vec<String> {
+    let mut args = push_argv.to_vec();
+
+    if let Some(remote) = remote {
+        args.extend(["--remote".to_owned(), remote.to_owned()]);
+    }
+
+    for bookmark in bookmarks {
+        args.extend(["--bookmark".to_owned(), bookmark]);
+    }
+
+    args
+}
+
+/// Assemble the full argv for pushing changes and creating their bookmarks.
+pub(crate) fn build_push_create_argv(
+    push_argv: &[String],
+    remote: Option<&str>,
+    change_ids: impl IntoIterator<Item = String>,
+) -> Vec<String> {
+    let mut args = push_argv.to_vec();
+
+    if let Some(remote) = remote {
+        args.extend(["--remote".to_owned(), remote.to_owned()]);
+    }
+
+    for change_id in change_ids {
+        args.extend(["-c".to_owned(), change_id]);
+    }
+
+    args
+}
+
+
 #[cfg(test)]
 pub(crate) const ISOLATED_TEST_CONFIG: &str = "isolated-user-config.toml";
 
@@ -484,9 +523,7 @@ impl Jujutsu {
         let jj_bin = Self::which()?;
         let mut command = Command::new(&jj_bin);
         command.current_dir(&self.cwd).args(args);
-        if let Some(config_path) = &self.config_override {
-            command.env("JJ_CONFIG", config_path);
-        }
+        self.apply_config_override(&mut command);
         let output = command.output()?;
 
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -509,6 +546,54 @@ impl Jujutsu {
             stdout: stdout.to_string(),
             stderr: stderr.to_string(),
         })
+    }
+
+    /// Run an arbitrary command given as a full argv (`argv[0]` is the binary).
+    pub fn exec_argv(&self, argv: &[String]) -> Result<CommandOutput> {
+        let Some((bin, bin_args)) = argv.split_first() else {
+            return Err(ConfigSnafu {
+                message: "push command must not be empty".to_owned(),
+            }
+            .build());
+        };
+
+        let bin_path = which::which(bin).map_err(|error| {
+            ConfigSnafu {
+                message: format!("push command binary `{bin}` not found in PATH: {error}"),
+            }
+            .build()
+        })?;
+        let command_string = argv.join(" ");
+        trace!("Running push command: {command_string}");
+
+        let mut command = Command::new(bin_path);
+        command.current_dir(&self.cwd).args(bin_args);
+        self.apply_config_override(&mut command);
+        let output = command.output()?;
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !output.status.success() {
+            return Err(JjCommandSnafu {
+                message: format!("{command_string} failed: {stderr}"),
+                output: Some(output),
+            }
+            .build());
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        trace!("push command output: {stdout}");
+        trace!("push command stderr: {stderr}");
+        Ok(CommandOutput {
+            status: output.status,
+            stdout: stdout.to_string(),
+            stderr: stderr.to_string(),
+        })
+    }
+
+    fn apply_config_override(&self, command: &mut Command) {
+        if let Some(config_path) = &self.config_override {
+            command.env("JJ_CONFIG", config_path);
+        }
     }
 
     /// Find the jj binary.
@@ -642,50 +727,32 @@ impl Jujutsu {
         self.exec(args).map(|_| ())
     }
 
-    /// Push a bookmark to a remote using jj git push. This will automatically
-    /// track the bookmark on the remote if it's not already tracked.
+    /// Push bookmarks through `push_argv`, tracking them when needed.
     pub fn push_bookmarks(
         &self,
         bookmarks: impl IntoIterator<Item = impl JJName + Copy>,
         remote: Option<&str>,
+        push_argv: &[String],
     ) -> Result<bool> {
-        let mut args = vec!["git".to_owned(), "push".to_owned()];
-
-        if let Some(remote) = remote {
-            args.push("--remote".to_owned());
-            args.push(remote.to_owned());
-        }
-
-        for bookmark in bookmarks {
-            args.push("--bookmark".to_owned());
-            args.push(bookmark.name_for_jj());
-        }
-
-        let output = self.exec(&args)?;
+        let bookmark_names = bookmarks.into_iter().map(|bookmark| bookmark.name_for_jj());
+        let args = build_push_argv(push_argv, remote, bookmark_names);
+        let output = self.exec_argv(&args)?;
 
         Ok(!output.stderr.contains("Nothing changed."))
     }
 
-    /// Create a bookmark for a change and push it in one step.
-    /// Uses jj's push bookmark template to generate the bookmark name.
+    /// Create bookmarks for changes and push them through `push_argv`.
     pub fn push_changes_create(
         &self,
         change_ids: impl IntoIterator<Item = impl AsRef<str>>,
         remote: Option<&str>,
+        push_argv: &[String],
     ) -> Result<()> {
-        let mut args = vec!["git".to_owned(), "push".to_owned()];
-
-        if let Some(remote) = remote {
-            args.push("--remote".to_owned());
-            args.push(remote.to_owned());
-        }
-
-        for change_id in change_ids {
-            args.push("-c".to_owned());
-            args.push(change_id.as_ref().to_owned());
-        }
-
-        self.exec(&args)?;
+        let change_ids = change_ids
+            .into_iter()
+            .map(|change_id| change_id.as_ref().to_owned());
+        let args = build_push_create_argv(push_argv, remote, change_ids);
+        self.exec_argv(&args)?;
 
         Ok(())
     }
@@ -927,7 +994,11 @@ mod tests {
             &remote_dir.to_string_lossy(),
         ])?;
 
-        jj.push_bookmarks(["feature-a"], Some("origin"))?;
+        jj.push_bookmarks(
+            ["feature-a"],
+            Some("origin"),
+            &["jj".to_owned(), "git".to_owned(), "push".to_owned()],
+        )?;
 
         let tracked = jj.log("(mine() & tracked_remote_bookmarks()) ~ trunk()")?;
 
@@ -940,4 +1011,64 @@ mod tests {
 
         Ok(())
     }
+    fn argv(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|part| (*part).to_owned()).collect()
+    }
+
+    #[test]
+    fn build_push_argv_appends_remote_and_bookmark_flags() {
+        let result = build_push_argv(
+            &argv(&["custom-push", "push"]),
+            Some("origin"),
+            ["feature-a".to_owned(), "feature-b".to_owned()],
+        );
+
+        assert_eq!(
+            result,
+            argv(&[
+                "custom-push",
+                "push",
+                "--remote",
+                "origin",
+                "--bookmark",
+                "feature-a",
+                "--bookmark",
+                "feature-b",
+            ])
+        );
+    }
+
+    #[test]
+    fn build_push_create_argv_appends_remote_and_change_flags() {
+        let result = build_push_create_argv(
+            &argv(&["custom-push", "push"]),
+            Some("origin"),
+            ["qpvuntsm".to_owned(), "kkmpptxz".to_owned()],
+        );
+
+        assert_eq!(
+            result,
+            argv(&[
+                "custom-push",
+                "push",
+                "--remote",
+                "origin",
+                "-c",
+                "qpvuntsm",
+                "-c",
+                "kkmpptxz",
+            ])
+        );
+    }
+
+    #[test]
+    fn exec_argv_rejects_empty_argv() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let jj = Jujutsu::new(temp_dir.path()).expect("jj instance");
+
+        let error = jj.exec_argv(&[]).expect_err("empty argv must be rejected");
+
+        assert!(error.to_string().contains("push command must not be empty"));
+    }
+
 }

@@ -53,23 +53,38 @@ impl ExecuteAction for PushAction {
         ctx: ExecuteActionContext<'_>,
     ) -> impl Future<Output = Result<ActionResultData>> {
         let bookmarks_string = self.bookmarks.iter().map(|b| b.magenta()).join(", ");
+        let push_argv = ctx.execute.config.push.resolve_argv(ctx.execute.no_hooks);
+
         core::future::ready(if ctx.execute.dry_run {
+            let push_description = push_argv.as_ref().map_or_else(
+                || "(pushing disabled)".to_owned(),
+                |argv| format!("via `{}`", argv.join(" ")),
+            );
             ctx.execute.output.log_message(&format!(
-                "Would push bookmarks to remote {}: {bookmarks_string}",
+                "Would push bookmarks to remote {} {push_description}: {bookmarks_string}",
                 self.remote.cyan()
             ));
 
             Ok(ActionResultData::Pushed {
                 bookmarks: self.bookmarks.clone(),
                 created_bookmarks: HashMap::new(),
-                pushed: true,
+                pushed: push_argv.is_some(),
             })
         } else {
-            match ctx
-                .execute
-                .jj
-                .push_bookmarks(&self.bookmarks, Some(&self.remote))
-            {
+            let Some(push_argv) = push_argv else {
+                debug!("Pushing disabled; skipping {bookmarks_string}");
+                return core::future::ready(Ok(ActionResultData::Pushed {
+                    bookmarks: self.bookmarks.clone(),
+                    created_bookmarks: HashMap::new(),
+                    pushed: false,
+                }));
+            };
+
+            match ctx.execute.jj.push_bookmarks(
+                &self.bookmarks,
+                Some(&self.remote),
+                &push_argv,
+            ) {
                 Ok(pushed) => {
                     if pushed {
                         ctx.execute
