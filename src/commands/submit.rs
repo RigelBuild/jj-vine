@@ -18,7 +18,7 @@ use crate::{
     bookmark::{BookmarkGraph, BookmarkOrPending},
     cli::CliConfig,
     commands::{GetBookmarksOptions, StrVisualWidth as _},
-    config::Config,
+    config::{Config, ForgeType},
     description::FormatMergeRequest as _,
     error::{AggregateSnafu, Result},
     forge::ForgeImpl,
@@ -30,6 +30,7 @@ use crate::{
         execute::{self, MRUpdate, MRUpdateType},
         find_changes_to_submit,
         plan,
+        stack_link::{self, StackLinkOutcome},
     },
 };
 
@@ -271,6 +272,18 @@ pub async fn submit(config: &SubmitCommandConfig, cli_config: &CliConfig<'_>) ->
 
     output.finish();
 
+    if repo_config.forge == ForgeType::GitHub {
+        let outcome = stack_link::link_stacks(
+            &repo_config.github,
+            &jj,
+            &result,
+            config.revset_options.tracked,
+            config.dry_run,
+            config.no_hooks,
+        );
+        render_stack_link_outcome(&mut output, &outcome)?;
+    }
+
     writeln!(output, "\n═══════════════════════════════════════")?;
     writeln!(output, "{}", "Summary".bold())?;
     writeln!(output, "═══════════════════════════════════════")?;
@@ -387,6 +400,76 @@ pub async fn submit(config: &SubmitCommandConfig, cli_config: &CliConfig<'_>) ->
     }
 
     Ok(())
+}
+
+fn render_stack_link_outcome(
+    output: &mut impl core::fmt::Write,
+    outcome: &StackLinkOutcome,
+) -> core::fmt::Result {
+    match outcome {
+        StackLinkOutcome::Linked { stacks, unlinked } => {
+            for stack in stacks {
+                let chain = stack
+                    .iter()
+                    .map(|pr| format!("#{pr}"))
+                    .collect::<Vec<_>>()
+                    .join(" → ");
+                writeln!(output, "{} {chain}", "Stacked:".green().bold())?;
+            }
+            for note in unlinked {
+                writeln!(output, "{}", format!("Note: {note}").yellow())?;
+            }
+        }
+        StackLinkOutcome::Failed { warning } => {
+            writeln!(output, "{}", format!("Warning: {warning}").yellow())?;
+        }
+        StackLinkOutcome::Skipped(_) => {}
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::render_stack_link_outcome;
+    use crate::submit::stack_link::{SkipReason, StackLinkOutcome};
+
+    #[test]
+    fn linked_stack_renders_pull_request_chain() {
+        let mut output = String::new();
+        let outcome = StackLinkOutcome::Linked {
+            stacks: vec![vec![10, 20, 30]],
+            unlinked: vec![],
+        };
+
+        render_stack_link_outcome(&mut output, &outcome).unwrap();
+
+        assert!(output.contains("#10 → #20 → #30"));
+    }
+
+    #[test]
+    fn failed_stack_link_renders_warning_without_changing_submit_result() {
+        let mut output = String::new();
+        let outcome = StackLinkOutcome::Failed {
+            warning: "gh-stack failed".to_owned(),
+        };
+
+        render_stack_link_outcome(&mut output, &outcome).unwrap();
+
+        assert!(output.contains("Warning: gh-stack failed"));
+    }
+
+    #[test]
+    fn missing_binary_skip_renders_nothing() {
+        let mut output = String::new();
+
+        render_stack_link_outcome(
+            &mut output,
+            &StackLinkOutcome::Skipped(SkipReason::MissingBinary),
+        )
+        .unwrap();
+
+        assert!(output.is_empty());
+    }
 }
 
 trait WrapText {

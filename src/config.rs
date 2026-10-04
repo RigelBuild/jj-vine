@@ -516,6 +516,11 @@ pub struct GitHubConfig {
     /// starts another session or group can escape cleanup.
     #[serde(default)]
     pub token_command: Vec<String>,
+    /// Register submitted pull requests as GitHub-native stacks with
+    /// `gh-stack`. Defaults to false; enables stack linking after GitHub
+    /// submits.
+    #[serde(default)]
+    pub link_stack: bool,
 }
 
 /// Maximum wall-clock time to wait for a `tokenCommand` helper.
@@ -1616,11 +1621,31 @@ mod tests {
             target_project: String::new(),
             token: "token".to_owned(),
             token_command: Vec::new(),
+            link_stack: true,
         };
 
         assert_eq!(config.target_project(), "myuser/myrepo");
         assert_eq!(config.source_project(), "myuser/myrepo");
         assert!(!config.is_fork_workflow());
+    }
+
+    #[test]
+    fn github_link_stack_defaults_to_false_when_absent() {
+        let config: GitHubConfig =
+            toml::from_str("project = \"owner/repo\"").expect("parse GitHubConfig");
+        assert!(!config.link_stack);
+    }
+
+    #[test]
+    fn github_link_stack_false_parses_to_false() {
+        let config: GitHubConfig = toml::from_str("linkStack = false").expect("parse GitHubConfig");
+        assert!(!config.link_stack);
+    }
+
+    #[test]
+    fn github_link_stack_true_parses_to_true() {
+        let config: GitHubConfig = toml::from_str("linkStack = true").expect("parse GitHubConfig");
+        assert!(config.link_stack);
     }
 
     #[test]

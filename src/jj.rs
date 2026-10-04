@@ -918,6 +918,12 @@ impl Jujutsu {
             .as_ref().map_err::<Error, _>(|e| make_whatever!("{}", e.to_string()))?
             .as_str())
     }
+
+    /// Return the repository working directory used for subprocesses.
+    #[must_use]
+    pub fn cwd(&self) -> &std::path::Path {
+        &self.cwd
+    }
 }
 
 /// Quotes `value` as a jj string literal. JSON and jj share the escapes for
