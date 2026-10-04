@@ -863,14 +863,9 @@ impl<'a> BookmarkGraph<'a> {
 
     /// Find the nearest bookmarked ancestors starting from a given commit.
     ///
-    /// `visited` records the `commit_id` of every commit whose ancestry has
-    /// already been expanded. Without it, a history with merge commits re-walks
-    /// shared ancestors once per path that reaches them — one `jj log`
-    /// subprocess each — which is exponential in the number of merges and does
-    /// not terminate on a moderately branchy repo. Deduplicating the expansion
-    /// makes the walk linear; the resulting set of boundary ancestors is
-    /// unchanged, because a boundary found on the first visit already bubbles
-    /// up to the root and the caller deduplicates.
+    /// Each unbookmarked commit is expanded once per starting bookmark. Its
+    /// first expansion collects all reachable boundary bookmarks, so later
+    /// paths to the same commit need not expand it again.
     fn find_nearest_bookmarked_ancestors(
         jj: &Jujutsu,
         from: &Change,
