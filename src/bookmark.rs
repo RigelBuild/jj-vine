@@ -672,6 +672,15 @@ impl<'a> BookmarkGraph<'a> {
             .filter_map(|b| b.as_pending().map(|c| c.change_id.clone()))
             .collect();
 
+        // Only selected bookmarks may become graph parents. A bookmarked
+        // ancestor outside the selection (untracked under --tracked, or not
+        // authored by the current user) is walked past like an unbookmarked
+        // change, so the adjacency list never names a missing bookmark.
+        let included_names: HashSet<String> = local_bookmarks
+            .iter()
+            .map(|b| b.name().to_owned())
+            .collect();
+
         let mut adjacency_list = BTreeMap::new();
 
         for bookmark in &local_bookmarks {
@@ -683,13 +692,14 @@ impl<'a> BookmarkGraph<'a> {
             let parent_bookmark_changes = Self::find_nearest_bookmarked_ancestors(
                 jj,
                 bookmark.change(),
-                skip_untracked_local_bookmarks,
+                &included_names,
                 &pending_bookmarks,
             )?;
 
             let parent_bookmark_names = BookmarkOrPending::from_changes(&parent_bookmark_changes)
                 .into_iter()
-                .map(|bookmark| bookmark.name().to_owned());
+                .map(|bookmark| bookmark.name().to_owned())
+                .filter(|name| included_names.contains(name));
 
             adjacency_list
                 .entry(bookmark.name().to_owned())
@@ -860,11 +870,12 @@ impl<'a> BookmarkGraph<'a> {
         component.downstack_of(bookmark_name)
     }
 
-    /// Find the nearest bookmarked ancestors starting from a given commit.
+    /// Find the nearest ancestors starting from a given commit that carry a
+    /// selected bookmark (one of `included_names`) or a pending bookmark.
     fn find_nearest_bookmarked_ancestors(
         jj: &Jujutsu,
         from: &Change,
-        skip_untracked_local_bookmarks: bool,
+        included_names: &HashSet<String>,
         pending_bookmarks: &HashSet<String>,
     ) -> Result<Vec<Change>> {
         let mut ancestors = Vec::new();
@@ -875,19 +886,18 @@ impl<'a> BookmarkGraph<'a> {
         )?;
 
         for parent in parents {
-            let bookmarks: Vec<_> = parent
+            let has_included_bookmark = parent
                 .bookmarks
                 .iter()
-                .filter(|bookmark| !skip_untracked_local_bookmarks || bookmark.is_tracked())
-                .collect();
+                .any(|bookmark| included_names.contains(bookmark.name()));
 
-            if !bookmarks.is_empty() || pending_bookmarks.contains(&parent.change_id) {
+            if has_included_bookmark || pending_bookmarks.contains(&parent.change_id) {
                 ancestors.push(parent);
             } else {
                 ancestors.extend(Self::find_nearest_bookmarked_ancestors(
                     jj,
                     &parent,
-                    skip_untracked_local_bookmarks,
+                    included_names,
                     pending_bookmarks,
                 )?);
             }

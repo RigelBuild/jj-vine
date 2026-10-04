@@ -11,6 +11,7 @@ use assertables::{
 
 use crate::{
     bookmark::{Bookmark, BookmarkGraph, BookmarkOrPending, BookmarkRef},
+    commands::submit::literal_bookmark_targets,
     error::Result,
     submit::find_changes_to_submit,
     tests::TestRepo,
@@ -147,7 +148,7 @@ fn find_changes_to_submit_with_advanced_main() -> Result<()> {
 
     // From feature-3, we expect the whole downstack back to (but not including)
     // trunk — i.e. feature-2 and feature-3.
-    let changes = find_changes_to_submit(&repo.jj, ["feature-3"], &HashSet::new())?;
+    let changes = find_changes_to_submit(&repo.jj, ["feature-3"], ["feature-3"], &HashSet::new())?;
     let mut names: Vec<_> = Bookmark::from_changes(&changes)
         .into_iter()
         .map(|b| b.name().to_owned())
@@ -157,7 +158,7 @@ fn find_changes_to_submit_with_advanced_main() -> Result<()> {
 
     // From feature, we expect just feature: it branched off old main but is
     // not in the ancestry of the new trunk, so it should not be filtered out.
-    let changes = find_changes_to_submit(&repo.jj, ["feature"], &HashSet::new())?;
+    let changes = find_changes_to_submit(&repo.jj, ["feature"], ["feature"], &HashSet::new())?;
     let names: Vec<_> = Bookmark::from_changes(&changes)
         .into_iter()
         .map(|b| b.name().to_owned())
@@ -183,7 +184,7 @@ fn find_changes_to_submit_includes_foreign_authored_named_target() -> Result<()>
     repo.set_config("user.name", "Current User");
     // The explicitly named bookmark is included even though its commit author
     // differs from the current user.
-    let changes = find_changes_to_submit(&repo.jj, ["feature"], &HashSet::new())?;
+    let changes = find_changes_to_submit(&repo.jj, ["feature"], ["feature"], &HashSet::new())?;
     let names: Vec<_> = Bookmark::from_changes(&changes)
         .into_iter()
         .map(|bookmark| bookmark.name().to_owned())
@@ -220,7 +221,7 @@ fn find_changes_to_submit_excludes_foreign_authored_ancestry_companion() -> Resu
 
     // Submitting the top bookmark walks the ancestry, but must omit the foreign
     // middle bookmark.
-    let changes = find_changes_to_submit(&repo.jj, ["b"], &HashSet::new())?;
+    let changes = find_changes_to_submit(&repo.jj, ["b"], ["b"], &HashSet::new())?;
     let mut names: Vec<_> = Bookmark::from_changes(&changes)
         .into_iter()
         .map(|bookmark| bookmark.name().to_owned())
@@ -238,7 +239,7 @@ fn find_changes_to_submit_excludes_foreign_authored_ancestry_companion() -> Resu
     repo.set_config("user.email", "current@example.com");
     repo.set_config("user.name", "Current User");
 
-    let changes = find_changes_to_submit(&repo.jj, ["b", "d"], &HashSet::new())?;
+    let changes = find_changes_to_submit(&repo.jj, ["b", "d"], ["b", "d"], &HashSet::new())?;
     let mut names: Vec<_> = Bookmark::from_changes(&changes)
         .into_iter()
         .map(|bookmark| bookmark.name().to_owned())
@@ -257,11 +258,160 @@ fn find_changes_to_submit_includes_pending_bookmark_without_local_bookmark() -> 
     let change = repo.jj.log("@")?.pop().expect("working change exists");
     let pending = HashSet::from([change.change_id.clone()]);
 
-    let changes = find_changes_to_submit(&repo.jj, [change.change_id.as_str()], &pending)?;
+    let changes = find_changes_to_submit(
+        &repo.jj,
+        [change.change_id.as_str()],
+        [] as [&str; 0],
+        &pending,
+    )?;
     assert_eq!(changes.len(), 1);
     assert_eq!(changes[0].change_id, change.change_id);
     assert!(changes[0].pending_bookmark);
     assert!(changes[0].bookmarks.is_empty());
+
+    Ok(())
+}
+
+/// Re-author the working-copy change as a different user, then restore the
+/// current user so `mine()` no longer matches it.
+fn make_foreign(repo: &TestRepo<TestRepo<()>>) -> Result<()> {
+    repo.set_config("user.email", "author@example.com");
+    repo.set_config("user.name", "Original Author");
+    repo.jj.exec(["metaedit", "--update-author"])?;
+    repo.set_config("user.email", "current@example.com");
+    repo.set_config("user.name", "Current User");
+    Ok(())
+}
+
+fn as_current_user(repo: &TestRepo<TestRepo<()>>) {
+    repo.set_config("user.email", "current@example.com");
+    repo.set_config("user.name", "Current User");
+}
+
+/// Mirrors the selection in `commands::submit::submit`: resolve the revset,
+/// find the changes to submit, and build the graph from them.
+fn submission_changes(
+    repo: &TestRepo<TestRepo<()>>,
+    revset: &str,
+) -> Result<Vec<crate::jj::Change>> {
+    let changes = repo.jj.log(revset)?;
+    let bookmarks: Vec<_> = BookmarkOrPending::from_changes(&changes)
+        .into_iter()
+        .collect();
+    find_changes_to_submit(
+        &repo.jj,
+        bookmarks.iter().map(BookmarkOrPending::change_id),
+        literal_bookmark_targets(revset, &bookmarks),
+        &HashSet::<String>::new(),
+    )
+}
+
+fn sorted_names(changes: &[crate::jj::Change]) -> Vec<String> {
+    let mut names: Vec<_> = Bookmark::from_changes(changes)
+        .into_iter()
+        .map(|bookmark| bookmark.name().to_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+#[test]
+fn graph_skips_foreign_parent_of_named_target() -> Result<()> {
+    let repo = TestRepo::with_local_remote();
+    as_current_user(&repo);
+
+    // main -> x (foreign) -> y (mine)
+    repo.jj.exec(["new", "main"])?;
+    repo.create_change("x.txt", "x", "Change X")
+        .create_bookmark("x");
+    make_foreign(&repo)?;
+    repo.jj.exec(["new"])?;
+    repo.create_change("y.txt", "y", "Change Y")
+        .create_bookmark("y");
+
+    let changes = submission_changes(&repo, "y")?;
+    assert_eq!(sorted_names(&changes), vec!["y".to_owned()]);
+
+    let graph = BookmarkGraph::from_changes(&repo.jj, &changes, false)?;
+    let y = graph.find_bookmark_in_components("y").unwrap();
+    assert_eq!(y.parents, vec![]);
+    assert_none!(graph.find_bookmark_in_components("x"));
+
+    Ok(())
+}
+
+#[test]
+fn graph_walks_past_foreign_middle_bookmark() -> Result<()> {
+    let repo = TestRepo::with_local_remote();
+    as_current_user(&repo);
+
+    // main -> a (mine) -> c (foreign) -> b (mine)
+    repo.jj.exec(["new", "main"])?;
+    repo.create_change("a.txt", "a", "Change A")
+        .create_bookmark("a");
+    repo.jj.exec(["new"])?;
+    repo.create_change("c.txt", "c", "Change C")
+        .create_bookmark("c");
+    make_foreign(&repo)?;
+    repo.jj.exec(["new"])?;
+    repo.create_change("b.txt", "b", "Change B")
+        .create_bookmark("b");
+
+    let changes = submission_changes(&repo, "b")?;
+    assert_eq!(sorted_names(&changes), vec!["a".to_owned(), "b".to_owned()]);
+
+    let graph = BookmarkGraph::from_changes(&repo.jj, &changes, false)?;
+    let a = graph.find_bookmark_in_components("a").unwrap();
+    let b = graph.find_bookmark_in_components("b").unwrap();
+    assert_eq!(b.parents, vec![BookmarkRef::Bookmark(a.clone())]);
+    assert_none!(graph.find_bookmark_in_components("c"));
+
+    Ok(())
+}
+
+#[test]
+fn general_revset_keeps_mine_filter_for_foreign_targets() -> Result<()> {
+    let repo = TestRepo::with_local_remote();
+    as_current_user(&repo);
+
+    // main -> mine-1 ; main -> foreign-1
+    repo.jj.exec(["new", "main"])?;
+    repo.create_change("m.txt", "m", "Mine")
+        .create_bookmark("mine-1");
+    repo.jj.exec(["new", "main"])?;
+    repo.create_change("f.txt", "f", "Foreign")
+        .create_bookmark("foreign-1");
+    make_foreign(&repo)?;
+
+    // Only a literally named bookmark bypasses `mine()`; `bookmarks()` does not.
+    let changes = submission_changes(&repo, "bookmarks()")?;
+    assert_eq!(sorted_names(&changes), vec!["mine-1".to_owned()]);
+
+    let graph = BookmarkGraph::from_changes(&repo.jj, &changes, false)?;
+    assert_some!(graph.component_containing("mine-1"));
+    assert_none!(graph.component_containing("foreign-1"));
+
+    Ok(())
+}
+
+#[test]
+fn named_foreign_bookmark_builds_graph() -> Result<()> {
+    let repo = TestRepo::with_local_remote();
+    as_current_user(&repo);
+
+    repo.jj.exec(["new", "main"])?;
+    repo.create_change("f.txt", "f", "Foreign")
+        .create_bookmark("foreign-1");
+    make_foreign(&repo)?;
+
+    for revset in ["foreign-1", "\"foreign-1\""] {
+        let changes = submission_changes(&repo, revset)?;
+        assert_eq!(sorted_names(&changes), vec!["foreign-1".to_owned()]);
+
+        let graph = BookmarkGraph::from_changes(&repo.jj, &changes, false)?;
+        let target = graph.find_bookmark_in_components("foreign-1").unwrap();
+        assert_eq!(target.parents, vec![]);
+    }
 
     Ok(())
 }

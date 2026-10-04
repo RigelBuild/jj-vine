@@ -241,6 +241,7 @@ pub async fn submit(config: &SubmitCommandConfig, cli_config: &CliConfig<'_>) ->
     let changes = find_changes_to_submit(
         &jj,
         bookmarks.iter().map(BookmarkOrPending::change_id),
+        literal_bookmark_targets(&revset, &bookmarks),
         &pending_bookmarks,
     )?;
 
@@ -423,6 +424,31 @@ pub async fn submit(config: &SubmitCommandConfig, cli_config: &CliConfig<'_>) ->
     }
 
     Ok(())
+}
+
+/// Change IDs of the resolved `bookmarks` that the user named literally in
+/// `revset`: a bare or double-quoted bookmark name, alone or in a `|` union.
+/// Only these bypass the `mine()` filter. A generalized revset such as
+/// `bookmarks()` or `mine() & tracked_remote_bookmarks()` names no bookmark,
+/// so its targets stay subject to `mine()`.
+pub(crate) fn literal_bookmark_targets<'b>(
+    revset: &str,
+    bookmarks: &'b [BookmarkOrPending<'_>],
+) -> impl Iterator<Item = &'b str> {
+    let literal_names: HashSet<&str> = revset
+        .split('|')
+        .map(str::trim)
+        .map(|atom| {
+            atom.strip_prefix('"')
+                .and_then(|quoted| quoted.strip_suffix('"'))
+                .unwrap_or(atom)
+        })
+        .collect();
+
+    bookmarks
+        .iter()
+        .filter(move |bookmark| bookmark.is_bookmark() && literal_names.contains(bookmark.name()))
+        .map(BookmarkOrPending::change_id)
 }
 
 fn render_stack_link_outcome(
