@@ -257,3 +257,37 @@ async fn disabled_real_push_returns_without_running_jj() {
     let (_, _, did_push) = pushed(result);
     assert!(!did_push);
 }
+
+#[tokio::test]
+async fn dry_run_does_not_disclose_configured_push_arguments() {
+    let sentinel = "push-sentinel-secret-value";
+    let (result, output) = run_action(
+        push_action(),
+        RepoPushConfig::Command(vec!["custom-push".to_owned(), sentinel.to_owned()]),
+        true,
+        false,
+    )
+    .await;
+
+    let (_, _, did_push) = pushed(result);
+    assert!(did_push, "an enabled dry-run reports a planned push");
+    assert!(output.contains("via configured push command"));
+    assert!(!output.contains(sentinel));
+}
+
+#[tokio::test]
+async fn create_dry_run_does_not_disclose_configured_push_arguments() {
+    let sentinel = "create-push-sentinel-secret";
+    let (result, output) = run_action(
+        push_create_action(),
+        RepoPushConfig::Command(vec!["custom-push".to_owned(), sentinel.to_owned()]),
+        true,
+        false,
+    )
+    .await;
+
+    let (_, _, did_push) = pushed(result);
+    assert!(did_push, "an enabled dry-run reports a planned create-push");
+    assert!(output.contains("via configured push command"));
+    assert!(!output.contains(sentinel));
+}

@@ -199,10 +199,9 @@ pub struct Config {
 
     /// Push command to run. Defaults to `jj git push`; false disables pushing.
     ///
-    /// An array sets a complete argv, such as `["jj-hp", "push"]`. The remote and
-    /// bookmark or change arguments are appended, so the command must accept
-    /// the corresponding `jj git push` flags. `submit --no-hooks` runs the
-    /// built-in command instead.
+    /// An array sets a complete argv. The remote and bookmark or change arguments
+    /// are appended, so the command must accept the corresponding `jj git push`
+    /// flags. `submit --no-hooks` runs the built-in command instead.
     #[serde(default)]
     #[builder(default)]
     pub push: RepoPushConfig,
@@ -305,6 +304,36 @@ impl RepoPushConfig {
 impl Default for RepoPushConfig {
     fn default() -> Self {
         Self::Enabled(true)
+    }
+}
+
+pub(crate) fn push_description(push_argv: Option<&[String]>) -> &'static str {
+    let Some(argv) = push_argv else {
+        return "(pushing disabled)";
+    };
+
+    if argv.len() == 3 && argv[0] == "jj" && argv[1] == "git" && argv[2] == "push" {
+        "via `jj git push`"
+    } else {
+        "via configured push command"
+    }
+}
+
+#[cfg(test)]
+mod push_description_tests {
+    use super::push_description;
+
+    #[test]
+    fn describes_builtin_and_custom_commands_without_rendering_argv() {
+        let builtin = vec!["jj".to_owned(), "git".to_owned(), "push".to_owned()];
+        let custom = vec!["custom-push".to_owned(), "secret-argument".to_owned()];
+
+        assert_eq!(push_description(Some(&builtin)), "via `jj git push`");
+        assert_eq!(
+            push_description(Some(&custom)),
+            "via configured push command"
+        );
+        assert_eq!(push_description(None), "(pushing disabled)");
     }
 }
 

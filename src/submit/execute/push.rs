@@ -6,6 +6,7 @@ use owo_colors::OwoColorize as _;
 use tracing::{debug, error};
 
 use crate::{
+    config::push_description,
     error::{Error, Result},
     submit::execute::{ActionInfo, ActionResultData, ExecuteAction, ExecuteActionContext},
 };
@@ -56,10 +57,7 @@ impl ExecuteAction for PushAction {
         let push_argv = ctx.execute.config.push.resolve_argv(ctx.execute.no_hooks);
 
         core::future::ready(if ctx.execute.dry_run {
-            let push_description = push_argv.as_ref().map_or_else(
-                || "(pushing disabled)".to_owned(),
-                |argv| format!("via `{}`", argv.join(" ")),
-            );
+            let push_description = push_description(push_argv.as_deref());
             ctx.execute.output.log_message(&format!(
                 "Would push bookmarks to remote {} {push_description}: {bookmarks_string}",
                 self.remote.cyan()

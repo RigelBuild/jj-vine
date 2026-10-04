@@ -557,32 +557,29 @@ impl Jujutsu {
             .build());
         };
 
-        let bin_path = which::which(bin).map_err(|error| {
+        let bin_path = which::which(bin).map_err(|_| {
             ConfigSnafu {
-                message: format!("push command binary `{bin}` not found in PATH: {error}"),
+                message: "push command executable not found in PATH".to_owned(),
             }
             .build()
         })?;
-        let command_string = argv.join(" ");
-        trace!("Running push command: {command_string}");
+        trace!("Running configured push command");
 
         let mut command = Command::new(bin_path);
         command.current_dir(&self.cwd).args(bin_args);
         self.apply_config_override(&mut command);
         let output = command.output()?;
 
-        let stderr = String::from_utf8_lossy(&output.stderr);
         if !output.status.success() {
             return Err(JjCommandSnafu {
-                message: format!("{command_string} failed: {stderr}"),
-                output: Some(output),
+                message: format!("push command failed with {}", output.status),
+                output: None,
             }
             .build());
         }
 
         let stdout = String::from_utf8_lossy(&output.stdout);
-        trace!("push command output: {stdout}");
-        trace!("push command stderr: {stderr}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
         Ok(CommandOutput {
             status: output.status,
             stdout: stdout.to_string(),
@@ -1071,4 +1068,28 @@ mod tests {
         assert!(error.to_string().contains("push command must not be empty"));
     }
 
+    #[test]
+    fn failed_argv_command_does_not_disclose_arguments_or_stderr() {
+        let temp = TempDir::new().expect("temp dir");
+        let jj = Jujutsu::new(temp.path()).expect("jj instance");
+        let sentinel = "push-sentinel-secret-value";
+        let argv = vec![
+            "sh".to_owned(),
+            "-c".to_owned(),
+            format!("printf '%s' '{sentinel}' >&2; exit 7"),
+            sentinel.to_owned(),
+        ];
+
+        let error = jj.exec_argv(&argv).expect_err("command must fail");
+        let message = error.to_string();
+        let diagnostic = format!("{error:?}");
+
+        assert!(message.contains("push command failed with"));
+        assert!(!message.contains(sentinel));
+        assert!(!diagnostic.contains(sentinel));
+        let Error::JjCommand { output, .. } = error else {
+            panic!("configured push failure uses the JjCommand variant");
+        };
+        assert!(output.is_none(), "failed command output must not escape");
+    }
 }

@@ -7,6 +7,7 @@ use tracing::{debug, error};
 
 use crate::{
     bookmark::{Bookmark, change_id_to_temp_bookmark_name},
+    config::push_description,
     error::{Error, Result},
     submit::execute::{ActionInfo, ActionResultData, ExecuteAction, ExecuteActionContext},
 };
@@ -71,10 +72,7 @@ impl ExecuteAction for PushCreateAction {
         let push_argv = ctx.execute.config.push.resolve_argv(ctx.execute.no_hooks);
 
         if ctx.execute.dry_run {
-            let push_description = push_argv.as_ref().map_or_else(
-                || "(pushing disabled)".to_owned(),
-                |argv| format!("via `{}`", argv.join(" ")),
-            );
+            let push_description = push_description(push_argv.as_deref());
             ctx.execute.output.log_message(&format!(
                 "Would {} and push to remote {} {push_description} for changes: {change_ids_string}",
                 "create bookmarks".green(),
