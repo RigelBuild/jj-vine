@@ -228,14 +228,40 @@ fn find_changes_to_submit_excludes_foreign_authored_ancestry_companion() -> Resu
     names.sort();
     assert_eq!(names, vec!["a".to_owned(), "b".to_owned()]);
 
-    // Naming two targets explicitly exercises the multi-target selection path.
-    let changes = find_changes_to_submit(&repo.jj, ["a", "b"], &HashSet::new())?;
+    // A separate foreign-authored target must survive the multi-target union.
+    repo.jj.exec(["new", "main"])?;
+    repo.create_change("d.txt", "d", "Change D")
+        .create_bookmark("d");
+    repo.set_config("user.email", "author@example.com");
+    repo.set_config("user.name", "Original Author");
+    repo.jj.exec(["metaedit", "--update-author"])?;
+    repo.set_config("user.email", "current@example.com");
+    repo.set_config("user.name", "Current User");
+
+    let changes = find_changes_to_submit(&repo.jj, ["b", "d"], &HashSet::new())?;
     let mut names: Vec<_> = Bookmark::from_changes(&changes)
         .into_iter()
         .map(|bookmark| bookmark.name().to_owned())
         .collect();
     names.sort();
-    assert_eq!(names, vec!["a".to_owned(), "b".to_owned()]);
+    assert_eq!(names, vec!["a".to_owned(), "b".to_owned(), "d".to_owned()]);
+
+    Ok(())
+}
+
+#[test]
+fn find_changes_to_submit_includes_pending_bookmark_without_local_bookmark() -> Result<()> {
+    let repo = TestRepo::with_local_remote();
+    repo.jj.exec(["new", "main"])?;
+    repo.create_change("pending.txt", "pending", "Pending change");
+    let change = repo.jj.log("@")?.pop().expect("working change exists");
+    let pending = HashSet::from([change.change_id.clone()]);
+
+    let changes = find_changes_to_submit(&repo.jj, [change.change_id.as_str()], &pending)?;
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0].change_id, change.change_id);
+    assert!(changes[0].pending_bookmark);
+    assert!(changes[0].bookmarks.is_empty());
 
     Ok(())
 }
