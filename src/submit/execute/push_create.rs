@@ -136,11 +136,17 @@ impl ExecuteAction for PushCreateAction {
                     ));
 
                     Ok(ActionResultData::Pushed {
-                        bookmarks: bookmarks.iter().map(|bookmark| bookmark.name().to_owned()).collect(),
+                        bookmarks: bookmarks
+                            .iter()
+                            .map(|bookmark| bookmark.name().to_owned())
+                            .collect(),
                         created_bookmarks: bookmarks
                             .iter()
                             .map(|bookmark| {
-                                (bookmark.change.change_id.clone(), bookmark.name().to_owned())
+                                (
+                                    bookmark.change.change_id.clone(),
+                                    bookmark.name().to_owned(),
+                                )
                             })
                             .collect(),
                         pushed: true,

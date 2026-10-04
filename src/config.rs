@@ -199,9 +199,10 @@ pub struct Config {
 
     /// Push command to run. Defaults to `jj git push`; false disables pushing.
     ///
-    /// An array sets a complete argv. The remote and bookmark or change arguments
-    /// are appended, so the command must accept the corresponding `jj git push`
-    /// flags. `submit --no-hooks` runs the built-in command instead.
+    /// An array sets a complete argv. The remote and bookmark or change
+    /// arguments are appended, so the command must accept the corresponding
+    /// `jj git push` flags. `submit --no-hooks` runs the built-in command
+    /// instead.
     #[serde(default)]
     #[builder(default)]
     pub push: RepoPushConfig,
@@ -286,7 +287,8 @@ impl RepoPushConfig {
     /// Resolve the push argv for this run.
     ///
     /// `no_hooks` selects the built-in `jj git push` command instead of a
-    /// configured command. It does not re-enable pushing when config disables it.
+    /// configured command. It does not re-enable pushing when config disables
+    /// it.
     #[must_use]
     pub fn resolve_argv(&self, no_hooks: bool) -> Option<Vec<String>> {
         match (self, no_hooks) {
@@ -1833,8 +1835,7 @@ mod tests {
             Some(vec!["jj".to_owned(), "git".to_owned(), "push".to_owned()])
         );
         assert_eq!(
-            RepoPushConfig::Command(vec!["custom-push".to_owned(), "push".to_owned()])
-                .to_argv(),
+            RepoPushConfig::Command(vec!["custom-push".to_owned(), "push".to_owned()]).to_argv(),
             Some(vec!["custom-push".to_owned(), "push".to_owned()])
         );
         assert_eq!(RepoPushConfig::Enabled(false).to_argv(), None);

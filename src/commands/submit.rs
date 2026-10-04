@@ -49,7 +49,8 @@ pub struct SubmitCommandConfig {
     #[arg(long)]
     pub dry_run: bool,
 
-    /// Use the built-in `jj git push` command instead of the configured push command.
+    /// Use the built-in `jj git push` command instead of the configured push
+    /// command.
     #[arg(long)]
     pub no_hooks: bool,
 
