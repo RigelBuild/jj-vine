@@ -251,6 +251,102 @@ fn find_changes_to_submit_excludes_foreign_authored_ancestry_companion() -> Resu
     Ok(())
 }
 
+/// Regression: a chain of merges must not re-walk shared ancestors once per
+/// path. Each repeated expansion starts another `jj log` subprocess.
+#[test]
+fn merge_ladder_does_not_rewalk_combinatorially() -> Result<()> {
+    let repo = TestRepo::new();
+
+    // Each rung merges a child with its parent. That parent is reached twice:
+    // directly from the merge and through the child. Temporary rung bookmarks
+    // only navigate the setup; remove them before resolving leaf to base.
+    repo.create_change("base.txt", "base", "base")
+        .create_bookmark("base");
+
+    // Eight rungs exceed 500 invocations without deduplication, but stay below
+    // 200 with the visited set.
+    let rungs: u32 = 8;
+    for i in 0..rungs {
+        let parent = if i == 0 {
+            "base".to_owned()
+        } else {
+            format!("rung{}", i - 1)
+        };
+        repo.jj(["new", &parent])?
+            .create_change(&format!("r{i}.txt"), "r", "right");
+        let rung_name = format!("rung{i}");
+        repo.jj(["new", "@", "@-"])?
+            .create_change(&format!("m{i}.txt"), "m", "merge")
+            .create_bookmark(&rung_name);
+    }
+
+    repo.jj(["new", &format!("rung{}", rungs - 1)])?
+        .create_change("leaf.txt", "leaf", "leaf")
+        .create_bookmark("leaf");
+
+    // Drop the interior rung bookmarks so only `base` and `leaf` remain.
+    for i in 0..rungs {
+        repo.jj(["bookmark", "delete", &format!("rung{i}")])?;
+    }
+
+    let changes = repo.jj.log("base | leaf")?;
+    let bookmarks: Vec<_> = BookmarkOrPending::from_changes(&changes)
+        .into_iter()
+        .collect();
+
+    let before = repo.jj.exec_count();
+    let graph = BookmarkGraph::from_bookmarks(&repo.jj, bookmarks.iter().cloned(), false)?;
+    let spawned = repo.jj.exec_count() - before;
+
+    // The pre-fix walk spawns over 500 subprocesses at eight rungs.
+    // A generous linear ceiling separates the two regimes.
+    assert!(
+        spawned <= 200,
+        "resolving `leaf` over {rungs} merge rungs spawned {spawned} jj \
+         invocations; expected a linear count (<=200). A combinatorial blow-up \
+         means the visited-set dedup regressed."
+    );
+
+    // The fix preserves behavior: leaf resolves and its downstack reaches base
+    // through the ladder.
+    assert_some!(graph.find_bookmark_in_components("leaf"));
+    let downstack = graph.downstack_of("leaf")?;
+    assert_any!(downstack.iter(), |b: &BookmarkOrPending| b.name() == "base");
+
+    Ok(())
+}
+
+#[test]
+fn merge_frontier_preserves_both_bookmarked_parents() -> Result<()> {
+    let repo = TestRepo::new();
+    repo.create_change("base.txt", "base", "base")
+        .create_bookmark("base");
+    repo.jj(["new", "base"])?
+        .create_change("left.txt", "left", "left")
+        .create_bookmark("left");
+    repo.jj(["new", "base"])?
+        .create_change("right.txt", "right", "right")
+        .create_bookmark("right");
+    repo.jj(["new", "left", "right"])?
+        .create_change("merge.txt", "merge", "merge")
+        .jj(["new", "@"])?
+        .create_change("leaf.txt", "leaf", "leaf")
+        .create_bookmark("leaf");
+    repo.jj(["new", "@-"])?
+        .create_change("peer.txt", "peer", "peer")
+        .create_bookmark("peer");
+
+    let changes = repo.jj.log("base | left | right | leaf | peer")?;
+    let graph = BookmarkGraph::from_changes(&repo.jj, &changes, false)?;
+    for child in ["leaf", "peer"] {
+        let downstack = graph.downstack_of(child)?;
+        assert_any!(downstack.iter(), |b: &BookmarkOrPending| b.name() == "left");
+        assert_any!(downstack.iter(), |b: &BookmarkOrPending| b.name()
+            == "right");
+    }
+    Ok(())
+}
+
 #[cfg(not(feature = "no-e2e-tests"))]
 mod e2e {
     use assertables::assert_contains;

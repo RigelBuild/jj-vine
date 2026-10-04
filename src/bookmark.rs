@@ -685,6 +685,7 @@ impl<'a> BookmarkGraph<'a> {
                 bookmark.change(),
                 skip_untracked_local_bookmarks,
                 &pending_bookmarks,
+                &mut HashSet::new(),
             )?;
 
             adjacency_list
@@ -861,11 +862,16 @@ impl<'a> BookmarkGraph<'a> {
     }
 
     /// Find the nearest bookmarked ancestors starting from a given commit.
+    ///
+    /// Each unbookmarked commit is expanded once per starting bookmark. Its
+    /// first expansion collects all reachable boundary bookmarks, so later
+    /// paths to the same commit need not expand it again.
     fn find_nearest_bookmarked_ancestors(
         jj: &Jujutsu,
         from: &Change,
         skip_untracked_local_bookmarks: bool,
         pending_bookmarks: &HashSet<String>,
+        visited: &mut HashSet<String>,
     ) -> Result<Vec<Change>> {
         let mut ancestors = Vec::new();
 
@@ -878,15 +884,16 @@ impl<'a> BookmarkGraph<'a> {
                 .filter(|bookmark| !skip_untracked_local_bookmarks || bookmark.is_tracked())
                 .collect();
 
-            if bookmarks.is_empty() && !pending_bookmarks.contains(&parent.change_id) {
+            if !bookmarks.is_empty() || pending_bookmarks.contains(&parent.change_id) {
+                ancestors.push(parent);
+            } else if visited.insert(parent.commit_id.clone()) {
                 ancestors.extend(Self::find_nearest_bookmarked_ancestors(
                     jj,
                     &parent,
                     skip_untracked_local_bookmarks,
                     pending_bookmarks,
+                    visited,
                 )?);
-            } else {
-                ancestors.push(parent);
             }
         }
 

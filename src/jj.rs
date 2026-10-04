@@ -441,6 +441,11 @@ pub struct Jujutsu {
 
     /// The default branch name.
     default_branch: OnceCell<Result<String, Error>>,
+
+    /// Count of `jj` subprocesses spawned, used by tests to assert the number
+    /// of invocations stays linear (see the merge-graph re-walk regression).
+    #[cfg(test)]
+    exec_count: core::sync::atomic::AtomicUsize,
 }
 
 /// Assemble the full argv for a bookmark push: the resolved push command
@@ -505,6 +510,8 @@ impl Jujutsu {
             cwd: cwd.into(),
             config_override: None,
             default_branch: OnceCell::new(),
+            #[cfg(test)]
+            exec_count: core::sync::atomic::AtomicUsize::new(0),
         })
     }
 
@@ -554,6 +561,10 @@ impl Jujutsu {
         let args_string = args.iter().map(|s| s.as_ref().to_string_lossy()).join(" ");
         trace!("Running jj command: jj {args_string}",);
 
+        #[cfg(test)]
+        self.exec_count
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+
         let jj_bin = Self::which()?;
         let mut cmd = Command::new(&jj_bin);
         cmd.current_dir(&self.cwd).args(args);
@@ -580,6 +591,13 @@ impl Jujutsu {
             stdout: stdout.to_string(),
             stderr: stderr.to_string(),
         })
+    }
+
+    /// Number of `jj` subprocesses spawned so far. Test-only.
+    #[cfg(test)]
+    #[must_use]
+    pub fn exec_count(&self) -> usize {
+        self.exec_count.load(core::sync::atomic::Ordering::Relaxed)
     }
 
     /// Run an arbitrary command given as a full argv (`argv[0]` is the binary,
