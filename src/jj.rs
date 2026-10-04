@@ -433,10 +433,9 @@ pub struct Jujutsu {
     cwd: PathBuf,
 
     /// When set, every spawned command gets `JJ_CONFIG` pointed at this path,
-    /// which replaces jj's user-level config lookup entirely (repo-level
-    /// config is still merged as usual). Used by tests so a developer's
-    /// `~/.config/jj/config.toml` can never leak into a scratch repo; `None`
-    /// on the production path, which reads the real user config.
+    /// which replaces jj's user-level config entirely. Tests default to a
+    /// shared empty config; `new_isolated` can override it for specific tests.
+    /// The production path has no override and reads user config.
     config_override: Option<PathBuf>,
 
     /// The default branch name.
@@ -502,12 +501,23 @@ pub(crate) fn build_push_create_argv(
     args
 }
 
+#[cfg(test)]
+static ISOLATED_TEST_CONFIG: std::sync::LazyLock<PathBuf> = std::sync::LazyLock::new(|| {
+    let dir = tempfile::tempdir().expect("Failed to create isolated test config dir");
+    let config_path = dir.path().join("config.toml");
+    std::fs::write(&config_path, "").expect("Failed to write isolated test config");
+    dir.keep()
+});
+
 impl Jujutsu {
     /// Create a new Jujutsu instance for the given working directory.
     pub fn new(cwd: impl Into<PathBuf>) -> Result<Self> {
         Self::which()?;
         Ok(Self {
             cwd: cwd.into(),
+            #[cfg(test)]
+            config_override: Some(ISOLATED_TEST_CONFIG.clone()),
+            #[cfg(not(test))]
             config_override: None,
             default_branch: OnceCell::new(),
             #[cfg(test)]
@@ -522,16 +532,8 @@ impl Jujutsu {
         &self.cwd
     }
 
-    /// Create a Jujutsu instance whose commands read `config_path` in place of
-    /// the user-level config, by way of `JJ_CONFIG`. The variable is set
-    /// per-`Command`, so it neither mutates this process's environment nor
-    /// races with other threads. Intended for tests that need a repo whose
-    /// resolved config depends only on what the test itself sets.
-    ///
-    /// Test-only: `config_override` is always `None` on the production path
-    /// (see the field's docs), so gating this to `cfg(test)` keeps the
-    /// affordance out of the fork's public surface — a sealed delta that must
-    /// be re-applied on every upstream import is cheaper the narrower it is.
+    /// For a test that needs its own config file rather than the shared empty
+    /// default. `JJ_CONFIG` is set per command, so process env is untouched.
     #[cfg(test)]
     pub(crate) fn new_isolated(
         cwd: impl Into<PathBuf>,

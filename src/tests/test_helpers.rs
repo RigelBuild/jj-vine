@@ -45,7 +45,30 @@ impl TestRepo<()> {
         let RepoInfo { dir, path, .. } = Self::make_repo();
         Self {
             dir,
-            jj: Jujutsu::new(&path).expect("Failed to create Jujutsu"),
+            jj: {
+                let jj = Jujutsu::new(&path).expect("Failed to create Jujutsu");
+                jj.exec(["config", "set", "--repo", "jj-vine.fetch", "false"])
+                    .unwrap();
+                jj.exec(["config", "set", "--repo", "jj-vine.forge", "github"])
+                    .unwrap();
+                jj.exec([
+                    "config",
+                    "set",
+                    "--repo",
+                    "jj-vine.github.project",
+                    "test/test",
+                ])
+                .unwrap();
+                jj.exec([
+                    "config",
+                    "set",
+                    "--repo",
+                    "jj-vine.github.token",
+                    "test-token",
+                ])
+                .unwrap();
+                jj
+            },
             path,
             forge: Default::default(),
             id: uuid::Uuid::new_v4().to_string(),

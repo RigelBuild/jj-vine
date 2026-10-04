@@ -1038,13 +1038,8 @@ mod tests {
     /// and so on) still apply, none of which live under `jj-vine`.
     const ISOLATED_CONFIG: &str = "isolated-user-config.toml";
 
-    /// A [`Jujutsu`] for a `create_test_repo` repo with the user-level jj
-    /// config swapped out for the empty isolated one. Every test *in this
-    /// module* goes through this rather than [`Jujutsu::new`], or a stray key
-    /// in the user's config leaks into the assertions. `jj.rs`'s own tests and
-    /// the e2e harness in `tests::test_helpers` still construct unisolated
-    /// instances, so the invariant is module-local, not crate-wide; closing
-    /// that gap is SEA-1425.
+    /// The crate-wide test default isolates jj from user config. This helper
+    /// selects a dedicated empty config for tests that need their own file.
     fn isolated_jj(repo_path: &Path) -> Jujutsu {
         let config_path = repo_path
             .parent()
