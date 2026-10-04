@@ -732,7 +732,11 @@ impl Jujutsu {
     ) -> Result<bool> {
         let bookmark_names = bookmarks.into_iter().map(|bookmark| bookmark.name_for_jj());
         let args = build_push_argv(push_argv, remote, bookmark_names);
-        let output = self.exec_argv(&args)?;
+        let output = if push_argv == ["jj", "git", "push"] {
+            self.exec(args.iter().skip(1))?
+        } else {
+            self.exec_argv(&args)?
+        };
 
         Ok(!output.stderr.contains("Nothing changed."))
     }
@@ -748,7 +752,11 @@ impl Jujutsu {
             .into_iter()
             .map(|change_id| change_id.as_ref().to_owned());
         let args = build_push_create_argv(push_argv, remote, change_ids);
-        self.exec_argv(&args)?;
+        if push_argv == ["jj", "git", "push"] {
+            self.exec(args.iter().skip(1))?;
+        } else {
+            self.exec_argv(&args)?;
+        }
 
         Ok(())
     }
@@ -1090,5 +1098,15 @@ mod tests {
             panic!("configured push failure uses the JjCommand variant");
         };
         assert!(output.is_none(), "failed command output must not escape");
+    }
+    #[test]
+    fn builtin_push_failure_preserves_jj_diagnostic() {
+        let temp = TempDir::new().expect("temp dir");
+        let jj = Jujutsu::new(temp.path()).expect("jj instance");
+        let error = jj
+            .push_bookmarks(["missing-bookmark"], None, &argv(&["jj", "git", "push"]))
+            .expect_err("push from a non-repository must fail");
+        assert!(error.to_string().contains("jj git push"));
+        assert!(!error.to_string().contains("push command failed with"));
     }
 }
