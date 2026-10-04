@@ -347,6 +347,8 @@ will always be kept in sync with your PR/MR stack upon submitting your bookmark(
 If you would like description generation, but not a stack diagram, you can set each value of `description.diagram` to `none`. Alternatively, if you would
 like to only generate a stack diagram, you can set `description.singleRevision` and `description.multipleRevisions` to `none`.
 
+On resubmission, `bottom` moves an existing stack block below all user text, including text previously written after the block. This may reorder an existing description; the user text is retained.
+
 ### Configuration{#description-configuration}
 
 | Setting | Description | Type | Required | Default |
