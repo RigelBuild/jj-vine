@@ -247,10 +247,7 @@ pub async fn submit(config: &SubmitCommandConfig, cli_config: &CliConfig<'_>) ->
     ensure_whatever!(
         !changes.is_empty(),
         "Resolved bookmark(s) {} but found no changes to submit — the named bookmark(s) may already be merged into trunk (inspect with `jj log -r <bookmark>`). For stacked submissions, confirm the expected commits are reachable from the named target.",
-        bookmarks
-            .iter()
-            .map(JJName::raw_name)
-            .join(", ")
+        bookmarks.iter().map(JJName::raw_name).join(", ")
     );
 
     let forge = ForgeImpl::new(&repo_config)?;
