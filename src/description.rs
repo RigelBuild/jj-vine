@@ -615,28 +615,32 @@ pub fn insert_stack_into_description(
         if !after.is_empty() {
             write!(result, "\n{after}").unwrap();
         }
-    } else {
-        if placement == StackPlacement::Top {
-            write!(result, "{START_MARKER}\n{stack_description}\n{END_MARKER}").unwrap();
+    } else if placement == StackPlacement::Top {
+        write!(result, "{START_MARKER}\n{stack_description}\n{END_MARKER}").unwrap();
 
-            if !before.is_empty() {
-                write!(result, "\n\n{before}").unwrap();
-            }
-
-            if !after.is_empty() {
-                write!(result, "\n\n{after}").unwrap();
-            }
-        } else {
-            if !before.is_empty() {
-                writeln!(result, "{before}\n").unwrap();
-            }
-
-            write!(result, "{START_MARKER}\n{stack_description}\n{END_MARKER}").unwrap();
-
-            if !after.is_empty() {
-                write!(result, "\n\n{after}").unwrap();
-            }
+        if !before.is_empty() {
+            write!(result, "\n\n{before}").unwrap();
         }
+
+        if !after.is_empty() {
+            write!(result, "\n\n{after}").unwrap();
+        }
+    } else {
+        if !before.is_empty() {
+            write!(result, "{before}").unwrap();
+        }
+
+        if !after.is_empty() {
+            if !result.is_empty() {
+                write!(result, "\n\n").unwrap();
+            }
+            write!(result, "{after}").unwrap();
+        }
+
+        if !result.is_empty() {
+            write!(result, "\n\n").unwrap();
+        }
+        write!(result, "{START_MARKER}\n{stack_description}\n{END_MARKER}").unwrap();
     }
 
     result
@@ -2072,7 +2076,20 @@ mod tests {
                 ),
                 StackPlacement::Bottom
             ),
-            format!("My notes before\n\n{START_MARKER}\nNew stack\n{END_MARKER}\n\nMy notes after")
+            format!("My notes before\n\nMy notes after\n\n{START_MARKER}\nNew stack\n{END_MARKER}")
+        );
+    }
+
+    #[test]
+    fn bottom_moves_top_block_after_user_content() {
+        let existing = format!("{START_MARKER}\nOld stack\n{END_MARKER}\n\nMy notes");
+        let expected = format!("My notes\n\n{START_MARKER}\nNew stack\n{END_MARKER}");
+        let actual = insert_stack_into_description("New stack", &existing, StackPlacement::Bottom);
+
+        assert_str_eq!(actual, expected);
+        assert_str_eq!(
+            insert_stack_into_description("New stack", &actual, StackPlacement::Bottom),
+            expected
         );
     }
 
