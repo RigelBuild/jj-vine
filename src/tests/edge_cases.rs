@@ -167,6 +167,79 @@ fn find_changes_to_submit_with_advanced_main() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn find_changes_to_submit_includes_foreign_authored_named_target() -> Result<()> {
+    let repo = TestRepo::with_local_remote();
+
+    repo.set_config("user.email", "current@example.com");
+    repo.set_config("user.name", "Current User");
+    repo.jj.exec(["new", "main"])?;
+    repo.create_change("feature.txt", "feature", "Feature commit")
+        .create_bookmark("feature");
+    repo.set_config("user.email", "author@example.com");
+    repo.set_config("user.name", "Original Author");
+    repo.jj.exec(["metaedit", "--update-author"])?;
+    repo.set_config("user.email", "current@example.com");
+    repo.set_config("user.name", "Current User");
+    // The explicitly named bookmark is included even though its commit author
+    // differs from the current user.
+    let changes = find_changes_to_submit(&repo.jj, ["feature"], &HashSet::new())?;
+    let names: Vec<_> = Bookmark::from_changes(&changes)
+        .into_iter()
+        .map(|bookmark| bookmark.name().to_owned())
+        .collect();
+    assert_eq!(names, vec!["feature".to_owned()]);
+
+    Ok(())
+}
+
+#[test]
+fn find_changes_to_submit_excludes_foreign_authored_ancestry_companion() -> Result<()> {
+    let repo = TestRepo::with_local_remote();
+
+    repo.set_config("user.email", "current@example.com");
+    repo.set_config("user.name", "Current User");
+    repo.jj.exec(["new", "main"])?;
+    repo.create_change("a.txt", "a", "Change A")
+        .create_bookmark("a");
+
+    // Build a stack where a foreign-authored bookmark sits between two changes
+    // authored by the current user.
+    repo.jj.exec(["new"])?;
+    repo.create_change("c.txt", "c", "Change C")
+        .create_bookmark("c");
+    repo.set_config("user.email", "author@example.com");
+    repo.set_config("user.name", "Original Author");
+    repo.jj.exec(["metaedit", "--update-author"])?;
+    repo.set_config("user.email", "current@example.com");
+    repo.set_config("user.name", "Current User");
+
+    repo.jj.exec(["new"])?;
+    repo.create_change("b.txt", "b", "Change B")
+        .create_bookmark("b");
+
+    // Submitting the top bookmark walks the ancestry, but must omit the foreign
+    // middle bookmark.
+    let changes = find_changes_to_submit(&repo.jj, ["b"], &HashSet::new())?;
+    let mut names: Vec<_> = Bookmark::from_changes(&changes)
+        .into_iter()
+        .map(|bookmark| bookmark.name().to_owned())
+        .collect();
+    names.sort();
+    assert_eq!(names, vec!["a".to_owned(), "b".to_owned()]);
+
+    // Naming two targets explicitly exercises the multi-target selection path.
+    let changes = find_changes_to_submit(&repo.jj, ["a", "b"], &HashSet::new())?;
+    let mut names: Vec<_> = Bookmark::from_changes(&changes)
+        .into_iter()
+        .map(|bookmark| bookmark.name().to_owned())
+        .collect();
+    names.sort();
+    assert_eq!(names, vec!["a".to_owned(), "b".to_owned()]);
+
+    Ok(())
+}
+
 #[cfg(not(feature = "no-e2e-tests"))]
 mod e2e {
     use assertables::assert_contains;

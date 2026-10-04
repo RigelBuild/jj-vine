@@ -18,7 +18,7 @@ use tracing::warn;
 use unicode_segmentation::UnicodeSegmentation as _;
 
 use crate::{
-    bookmark::{BookmarkGraph, BookmarkOrPending},
+    bookmark::{BookmarkGraph, BookmarkOrPending, JJName as _},
     cli::CliConfig,
     commands::{GetBookmarksOptions, StrVisualWidth as _},
     config::{Config, ForgeType},
@@ -223,8 +223,6 @@ pub async fn submit(config: &SubmitCommandConfig, cli_config: &CliConfig<'_>) ->
 
     ensure_whatever!(!bookmarks.is_empty(), "No bookmarks in revset {}", revset);
 
-    let forge = ForgeImpl::new(&repo_config)?;
-
     output.log_message(&format!(
         "Submitting bookmarks{}: {}",
         if config.dry_run {
@@ -234,7 +232,10 @@ pub async fn submit(config: &SubmitCommandConfig, cli_config: &CliConfig<'_>) ->
         } else {
             ""
         },
-        bookmarks.iter().map(|b| b.magenta().to_string()).join(", ")
+        bookmarks
+            .iter()
+            .map(|bookmark| bookmark.magenta().to_string())
+            .join(", ")
     ));
 
     let changes = find_changes_to_submit(
@@ -242,6 +243,17 @@ pub async fn submit(config: &SubmitCommandConfig, cli_config: &CliConfig<'_>) ->
         bookmarks.iter().map(BookmarkOrPending::change_id),
         &pending_bookmarks,
     )?;
+
+    ensure_whatever!(
+        !changes.is_empty(),
+        "Resolved bookmark(s) {} but found no changes to submit — the named bookmark(s) may already be merged into trunk (inspect with `jj log -r <bookmark>`). For stacked submissions, confirm the expected commits are reachable from the named target.",
+        bookmarks
+            .iter()
+            .map(|bookmark| bookmark.raw_name())
+            .join(", ")
+    );
+
+    let forge = ForgeImpl::new(&repo_config)?;
 
     let bookmark_graph = BookmarkGraph::from_changes(&jj, &changes, config.revset_options.tracked)?;
 

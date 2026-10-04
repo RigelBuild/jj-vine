@@ -20,25 +20,35 @@ pub mod plan;
 pub mod stack_link;
 
 /// Find the changes that matter for a submission starting from `targets`:
-/// bookmarked changes authored by the current user that are reachable from
-/// the targets and are not already in the trunk ancestry.
+/// bookmarked changes reachable from the targets that are not already in the
+/// trunk ancestry. Explicit targets are included regardless of their author,
+/// while ancestry-walked bookmarks are limited to the current user.
 pub fn find_changes_to_submit(
     jj: &Jujutsu,
     targets: impl IntoIterator<Item = impl JJName>,
     change_ids_pending_bookmarks: &HashSet<String, impl BuildHasher>,
 ) -> Result<Vec<Change>> {
+    let target_atoms: Vec<String> = targets.into_iter().map(|t| t.name_for_jj()).collect();
+
+    let explicit = if target_atoms.is_empty() {
+        "none()".to_owned()
+    } else {
+        target_atoms.iter().join(" | ")
+    };
+    let ancestry = if target_atoms.is_empty() {
+        "none()".to_owned()
+    } else {
+        target_atoms.iter().map(|t| format!("::{t}")).join(" | ")
+    };
+    let pending = if change_ids_pending_bookmarks.is_empty() {
+        "none()".to_owned()
+    } else {
+        change_ids_pending_bookmarks.iter().join(" | ")
+    };
+
     jj.log_with_pending_bookmarks(
         format!(
-            "((({}) & mine() & bookmarks()) | ({})) ~ (::trunk())",
-            targets
-                .into_iter()
-                .map(|t| format!("::{}", t.name_for_jj()))
-                .join(" | "),
-            if change_ids_pending_bookmarks.is_empty() {
-                "none()".to_owned()
-            } else {
-                change_ids_pending_bookmarks.iter().join(" | ")
-            }
+            "(({explicit}) | (({ancestry}) & mine() & bookmarks()) | ({pending})) ~ (::trunk())"
         ),
         change_ids_pending_bookmarks,
     )
