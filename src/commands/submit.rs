@@ -18,7 +18,7 @@ use tracing::warn;
 use unicode_segmentation::UnicodeSegmentation as _;
 
 use crate::{
-    bookmark::{BookmarkGraph, BookmarkOrPending, JJName as _},
+    bookmark::{BookmarkGraph, BookmarkOrPending, JJName},
     cli::CliConfig,
     commands::{GetBookmarksOptions, StrVisualWidth as _},
     config::{Config, ForgeType},
