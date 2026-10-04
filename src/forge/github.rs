@@ -340,15 +340,48 @@ pub fn validate_config(config: &Config) -> Result<()> {
         }
         .build());
     }
-
-    if config.github.token.is_empty() {
+    if config.github.token.trim().is_empty() && config.github.token_command.is_empty() {
         return Err(ConfigSnafu {
-            message: "github.token is required when forge is github".to_owned(),
+            message: "github.token or github.tokenCommand is required when forge is github"
+                .to_owned(),
         }
         .build());
     }
-
     Ok(())
+}
+
+#[cfg(test)]
+mod token_config_tests {
+    use super::*;
+
+    #[test]
+    fn validate_config_accepts_token_command_without_literal_token() {
+        let config = Config::builder()
+            .forge(crate::config::ForgeType::GitHub)
+            .github(crate::config::GitHubConfig {
+                project: "owner/repo".to_owned(),
+                token_command: vec!["printf".to_owned(), "token".to_owned()],
+                ..crate::config::GitHubConfig::default()
+            })
+            .build();
+
+        assert!(validate_config(&config).is_ok());
+    }
+
+    #[test]
+    fn validate_config_rejects_whitespace_token_without_command() {
+        let config = Config::builder()
+            .forge(crate::config::ForgeType::GitHub)
+            .github(crate::config::GitHubConfig {
+                project: "owner/repo".to_owned(),
+                token: " \n\t".to_owned(),
+                ..crate::config::GitHubConfig::default()
+            })
+            .build();
+
+        let error = validate_config(&config).expect_err("whitespace token is absent");
+        assert!(error.to_string().contains("token or github.tokenCommand"));
+    }
 }
 
 impl GitHubForge {
@@ -359,7 +392,7 @@ impl GitHubForge {
             config.github.host.clone(),
             source.to_owned(),
             target.to_owned(),
-            config.github.token.clone(),
+            config.github.resolved_token()?,
             config.ca_bundle.clone(),
             config.tls_accept_non_compliant_certs,
         )

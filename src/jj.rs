@@ -432,16 +432,47 @@ pub struct Jujutsu {
     /// The directory to run all jj commands from.
     cwd: PathBuf,
 
+    /// Config file supplied to spawned commands for test isolation.
+    config_override: Option<PathBuf>,
+
     /// The default branch name.
     default_branch: OnceCell<Result<String, Error>>,
 }
 
+#[cfg(test)]
+pub(crate) const ISOLATED_TEST_CONFIG: &str = "isolated-user-config.toml";
+
+#[cfg(test)]
+static ISOLATED_TEST_CONFIG_PATH: std::sync::LazyLock<PathBuf> = std::sync::LazyLock::new(|| {
+    let dir = tempfile::tempdir().expect("Failed to create isolated test config dir");
+    let config_path = dir.path().join("config.toml");
+    std::fs::write(&config_path, "").expect("Failed to write isolated test config");
+    dir.keep()
+});
 impl Jujutsu {
     /// Create a new Jujutsu instance for the given working directory.
     pub fn new(cwd: impl Into<PathBuf>) -> Result<Self> {
         Self::which()?;
         Ok(Self {
             cwd: cwd.into(),
+            #[cfg(test)]
+            config_override: Some(ISOLATED_TEST_CONFIG_PATH.clone()),
+            #[cfg(not(test))]
+            config_override: None,
+            default_branch: OnceCell::new(),
+        })
+    }
+
+    /// Create a Jujutsu instance that uses only the supplied config file.
+    #[cfg(test)]
+    pub(crate) fn new_isolated(
+        cwd: impl Into<PathBuf>,
+        config_path: impl Into<PathBuf>,
+    ) -> Result<Self> {
+        Self::which()?;
+        Ok(Self {
+            cwd: cwd.into(),
+            config_override: Some(config_path.into()),
             default_branch: OnceCell::new(),
         })
     }
@@ -457,10 +488,12 @@ impl Jujutsu {
         trace!("Running jj command: jj {args_string}",);
 
         let jj_bin = Self::which()?;
-        let output = Command::new(&jj_bin)
-            .current_dir(&self.cwd)
-            .args(args)
-            .output()?;
+        let mut command = Command::new(&jj_bin);
+        command.current_dir(&self.cwd).args(args);
+        if let Some(config_path) = &self.config_override {
+            command.env("JJ_CONFIG", config_path);
+        }
+        let output = command.output()?;
 
         let stderr = String::from_utf8_lossy(&output.stderr);
 
@@ -771,7 +804,9 @@ mod tests {
         let temp_dir = TempDir::new()?;
         let repo_path = temp_dir.path().to_path_buf();
 
-        let jj = Jujutsu::new(&repo_path)?;
+        let config_path = temp_dir.path().join(ISOLATED_TEST_CONFIG);
+        std::fs::write(&config_path, "")?;
+        let jj = Jujutsu::new_isolated(&repo_path, config_path)?;
 
         jj.exec(["git", "init"])?;
         jj.exec(["config", "set", "--repo", "user.name", "Test User"])?;

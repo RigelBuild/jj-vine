@@ -413,10 +413,21 @@ pub struct GitHubConfig {
     #[serde(default)]
     pub target_project: String,
 
-    /// GitHub Personal Access Token.
+    /// GitHub Personal Access Token, as a literal string. Takes precedence
+    /// over `tokenCommand` when both are set.
     #[serde(default)]
     pub token: String,
+
+    /// A command whose stdout supplies the GitHub token, as a full argv whose
+    /// first element is the binary. Used only when `token` is empty. The
+    /// trimmed stdout becomes the token. A non-zero exit or empty output is an
+    /// error.
+    #[serde(default)]
+    pub token_command: Vec<String>,
 }
+
+/// Maximum wall-clock time to wait for a `tokenCommand` helper.
+const TOKEN_COMMAND_TIMEOUT: core::time::Duration = core::time::Duration::from_secs(10);
 
 impl GitHubConfig {
     /// Get the repository where PRs target.
@@ -439,6 +450,81 @@ impl GitHubConfig {
     #[must_use]
     pub fn is_fork_workflow(&self) -> bool {
         self.target_project() != self.project
+    }
+
+    /// Resolve the GitHub token from a literal or a configured command. A
+    /// non-empty literal wins and is trimmed; otherwise the command's trimmed
+    /// stdout is used. Errors do not include the command's stderr.
+    pub fn resolved_token(&self) -> Result<String> {
+        self.resolved_token_with_timeout(TOKEN_COMMAND_TIMEOUT)
+    }
+
+    /// Resolve the token with a caller-supplied timeout for deterministic
+    /// tests.
+    fn resolved_token_with_timeout(&self, timeout: core::time::Duration) -> Result<String> {
+        let literal = self.token.trim();
+        if !literal.is_empty() {
+            return Ok(literal.to_owned());
+        }
+
+        let Some((bin, args)) = self.token_command.split_first() else {
+            return Err(ConfigSnafu {
+                message: "github.token or github.tokenCommand is required when forge is github"
+                    .to_owned(),
+            }
+            .build());
+        };
+
+        let bin_path = which::which(bin).map_err(|error| {
+            ConfigSnafu {
+                message: format!("github.tokenCommand binary `{bin}` not found in PATH: {error}"),
+            }
+            .build()
+        })?;
+
+        let mut command = std::process::Command::new(&bin_path);
+        command.args(args);
+        let Some(output) = crate::process::output_with_timeout(command, timeout)? else {
+            return Err(ConfigSnafu {
+                message: format!(
+                    "github.tokenCommand `{}` timed out after {}s",
+                    self.token_command.join(" "),
+                    timeout.as_secs()
+                ),
+            }
+            .build());
+        };
+        if !output.status.success() {
+            return Err(ConfigSnafu {
+                message: format!(
+                    "github.tokenCommand `{}` failed with {}",
+                    self.token_command.join(" "),
+                    output.status
+                ),
+            }
+            .build());
+        }
+
+        let raw = String::from_utf8(output.stdout).map_err(|_| {
+            ConfigSnafu {
+                message: format!(
+                    "github.tokenCommand `{}` produced non-UTF-8 output",
+                    self.token_command.join(" ")
+                ),
+            }
+            .build()
+        })?;
+        let token = raw.trim().to_owned();
+        if token.is_empty() {
+            return Err(ConfigSnafu {
+                message: format!(
+                    "github.tokenCommand `{}` produced empty output",
+                    self.token_command.join(" ")
+                ),
+            }
+            .build());
+        }
+        Ok(token)
     }
 }
 
@@ -706,7 +792,12 @@ impl Default for DescriptionDiagramConfig {
 impl Config {
     /// Load configuration from jj config.
     pub fn load(repo_path: impl Into<PathBuf>) -> Result<Self> {
-        let jj = Jujutsu::new(repo_path)?;
+        Self::load_with(&Jujutsu::new(repo_path)?)
+    }
+
+    /// Load configuration through an existing Jujutsu instance. Tests use
+    /// this with an isolated config file without changing the public API.
+    fn load_with(jj: &Jujutsu) -> Result<Self> {
         let output = jj.exec(["config", "list"])?;
 
         let toml_value: toml::Value = toml::from_str(&output.stdout).map_err(|e| {
@@ -749,27 +840,85 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use tempfile::TempDir;
 
     use super::*;
+    use crate::jj::ISOLATED_TEST_CONFIG;
 
+    fn isolated_jj(repo_path: &Path) -> Result<Jujutsu> {
+        let config_path = repo_path
+            .parent()
+            .expect("test repo always has a parent temp dir")
+            .join(ISOLATED_TEST_CONFIG);
+        Jujutsu::new_isolated(repo_path, config_path)
+    }
+
+    fn load_isolated(repo_path: &Path) -> Result<Config> {
+        load_with(&isolated_jj(repo_path)?)
+    }
+
+    /// Load using a caller-supplied Jujutsu instance.
+    fn load_with(jj: &Jujutsu) -> Result<Config> {
+        Config::load_with(jj)
+    }
     fn create_test_repo() -> (TempDir, PathBuf) {
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
-        let repo_path = temp_dir.path().to_path_buf();
+        std::fs::write(temp_dir.path().join(ISOLATED_TEST_CONFIG), "")
+            .expect("Failed to write isolated config");
+        let repo_path = temp_dir.path().join("repo");
+        std::fs::create_dir_all(&repo_path).expect("Failed to create repo dir");
 
-        let jj = Jujutsu::new(&repo_path).expect("Failed to create Jujutsu instance");
+        let jj = isolated_jj(&repo_path).expect("Failed to create Jujutsu instance");
         jj.exec(["git", "init", "--colocate"])
             .expect("Failed to init jj repo");
 
         (temp_dir, repo_path)
     }
 
+    /// Verify `JJ_CONFIG` both supplies and replaces the user config layer.
+    #[test]
+    fn config_isolation_replaces_user_layer() {
+        const SEEDED_KEY: &str = r#"jj-vine.branchPrefix = "config-isolation-probe/""#;
+
+        let (temp, repo_path) = create_test_repo();
+        let seeded_config = temp.path().join("seeded-user-config.toml");
+        std::fs::write(
+            &seeded_config,
+            "[jj-vine]\nbranchPrefix = \"config-isolation-probe/\"\n",
+        )
+        .expect("Failed to write seeded config");
+
+        let seeded = Jujutsu::new_isolated(&repo_path, &seeded_config)
+            .expect("Failed to create Jujutsu instance");
+        let listed = seeded
+            .exec(["config", "list"])
+            .expect("Failed to list config")
+            .stdout;
+        assert!(
+            listed.contains(SEEDED_KEY),
+            "JJ_CONFIG must be honored by the spawned command, so the seeded \
+             user-level key is resolved; got: {listed}"
+        );
+
+        // The resolved path distinguishes replacement from an additive config.
+        let resolved = seeded
+            .exec(["config", "path", "--user"])
+            .expect("Failed to resolve user config path")
+            .stdout;
+        assert_eq!(
+            Path::new(resolved.trim()),
+            seeded_config,
+            "JJ_CONFIG must replace the user-level layer"
+        );
+    }
     #[test]
     fn config_load_missing_required() {
         let (_temp, repo_path) = create_test_repo();
 
         // Try to load config without setting anything
-        let result = Config::load(&repo_path);
+        let result = load_isolated(&repo_path);
         assert!(result.is_err());
 
         if let Err(Error::Config { message, .. }) = result {
@@ -788,7 +937,7 @@ mod tests {
     fn config_load_complete() {
         let (_temp, repo_path) = create_test_repo();
 
-        let jj = Jujutsu::new(&repo_path).expect("Failed to create Jujutsu instance");
+        let jj = isolated_jj(&repo_path).expect("Failed to create Jujutsu instance");
         // Set required config
         jj.exec([
             "config",
@@ -821,7 +970,7 @@ mod tests {
             .expect("Failed to set config");
 
         // Load config
-        let config = Config::load(&repo_path).expect("Failed to load config");
+        let config = load_isolated(&repo_path).expect("Failed to load config");
 
         assert_eq!(config.gitlab.host, "https://gitlab.example.com".to_owned());
         assert_eq!(config.gitlab.project, "my-group/my-project".to_owned());
@@ -833,7 +982,7 @@ mod tests {
     fn config_with_optional_fields() {
         let (_temp, repo_path) = create_test_repo();
 
-        let jj = Jujutsu::new(&repo_path).expect("Failed to create Jujutsu instance");
+        let jj = isolated_jj(&repo_path).expect("Failed to create Jujutsu instance");
         // Set all config including optional fields
         jj.exec([
             "config",
@@ -875,7 +1024,7 @@ mod tests {
             .expect("Failed to set config");
 
         // Load config
-        let config = Config::load(&repo_path).expect("Failed to load config");
+        let config = load_isolated(&repo_path).expect("Failed to load config");
 
         assert_eq!(config.gitlab.host, "https://gitlab.example.com".to_owned());
         assert_eq!(config.gitlab.project, "my-group/my-project".to_owned());
@@ -887,7 +1036,7 @@ mod tests {
     fn config_default_stack_visualization() {
         let (_temp, repo_path) = create_test_repo();
 
-        let jj = Jujutsu::new(&repo_path).expect("Failed to create Jujutsu instance");
+        let jj = isolated_jj(&repo_path).expect("Failed to create Jujutsu instance");
         // Set required config, but not stack visualization config
         jj.exec([
             "config",
@@ -913,7 +1062,7 @@ mod tests {
         jj.exec(["config", "set", "--repo", "jj-vine.forge", "gitlab"])
             .expect("Failed to set config");
 
-        let config = Config::load(&repo_path).expect("Failed to load config");
+        let config = load_isolated(&repo_path).expect("Failed to load config");
 
         assert!(config.description.enabled);
         assert!(matches!(
@@ -938,7 +1087,7 @@ mod tests {
     fn config_explicit_stack_visualization() {
         let (_temp, repo_path) = create_test_repo();
 
-        let jj = Jujutsu::new(&repo_path).expect("Failed to create Jujutsu instance");
+        let jj = isolated_jj(&repo_path).expect("Failed to create Jujutsu instance");
         // Set required config
         jj.exec([
             "config",
@@ -973,7 +1122,7 @@ mod tests {
         jj.exec(["config", "set", "--repo", "jj-vine.forge", "gitlab"])
             .expect("Failed to set config");
 
-        let config = Config::load(&repo_path).expect("Failed to load config");
+        let config = load_isolated(&repo_path).expect("Failed to load config");
 
         assert!(!config.description.enabled);
         assert!(matches!(
@@ -998,7 +1147,7 @@ mod tests {
     fn config_default_mr_settings() {
         let (_temp, repo_path) = create_test_repo();
 
-        let jj = Jujutsu::new(&repo_path).expect("Failed to create Jujutsu instance");
+        let jj = isolated_jj(&repo_path).expect("Failed to create Jujutsu instance");
         // Set required config only, don't set MR settings
         jj.exec([
             "config",
@@ -1024,7 +1173,7 @@ mod tests {
         jj.exec(["config", "set", "--repo", "jj-vine.forge", "gitlab"])
             .expect("Failed to set config");
 
-        let config = Config::load(&repo_path).expect("Failed to load config");
+        let config = load_isolated(&repo_path).expect("Failed to load config");
 
         assert!(config.delete_source_branch);
         assert!(!config.squash_commits);
@@ -1034,7 +1183,7 @@ mod tests {
     fn config_explicit_mr_settings() {
         let (_temp, repo_path) = create_test_repo();
 
-        let jj = Jujutsu::new(&repo_path).expect("Failed to create Jujutsu instance");
+        let jj = isolated_jj(&repo_path).expect("Failed to create Jujutsu instance");
         // Set required config
         jj.exec([
             "config",
@@ -1073,7 +1222,7 @@ mod tests {
         jj.exec(["config", "set", "--repo", "jj-vine.forge", "gitlab"])
             .expect("Failed to set config");
 
-        let config = Config::load(&repo_path).expect("Failed to load config");
+        let config = load_isolated(&repo_path).expect("Failed to load config");
 
         assert!(!config.delete_source_branch);
         assert!(config.squash_commits);
@@ -1083,7 +1232,7 @@ mod tests {
     fn config_default_assign_to_self() {
         let (_temp, repo_path) = create_test_repo();
 
-        let jj = Jujutsu::new(&repo_path).expect("Failed to create Jujutsu instance");
+        let jj = isolated_jj(&repo_path).expect("Failed to create Jujutsu instance");
         // Set required config only
         jj.exec([
             "config",
@@ -1109,7 +1258,7 @@ mod tests {
         jj.exec(["config", "set", "--repo", "jj-vine.forge", "gitlab"])
             .expect("Failed to set config");
 
-        let config = Config::load(&repo_path).expect("Failed to load config");
+        let config = load_isolated(&repo_path).expect("Failed to load config");
 
         assert!(!config.assign_to_self);
     }
@@ -1118,7 +1267,7 @@ mod tests {
     fn config_explicit_assign_to_self() {
         let (_temp, repo_path) = create_test_repo();
 
-        let jj = Jujutsu::new(&repo_path).expect("Failed to create Jujutsu instance");
+        let jj = isolated_jj(&repo_path).expect("Failed to create Jujutsu instance");
         // Set required config
         jj.exec([
             "config",
@@ -1148,7 +1297,7 @@ mod tests {
         jj.exec(["config", "set", "--repo", "jj-vine.forge", "gitlab"])
             .expect("Failed to set config");
 
-        let config = Config::load(&repo_path).expect("Failed to load config");
+        let config = load_isolated(&repo_path).expect("Failed to load config");
 
         assert!(config.assign_to_self);
     }
@@ -1157,7 +1306,7 @@ mod tests {
     fn config_default_reviewers_empty() {
         let (_temp, repo_path) = create_test_repo();
 
-        let jj = Jujutsu::new(&repo_path).expect("Failed to create Jujutsu instance");
+        let jj = isolated_jj(&repo_path).expect("Failed to create Jujutsu instance");
         // Set required config only
         jj.exec([
             "config",
@@ -1183,7 +1332,7 @@ mod tests {
         jj.exec(["config", "set", "--repo", "jj-vine.forge", "gitlab"])
             .expect("Failed to set config");
 
-        let config = Config::load(&repo_path).expect("Failed to load config");
+        let config = load_isolated(&repo_path).expect("Failed to load config");
 
         assert!(config.default_reviewers.is_empty());
     }
@@ -1192,7 +1341,7 @@ mod tests {
     fn config_default_reviewers_single() {
         let (_temp, repo_path) = create_test_repo();
 
-        let jj = Jujutsu::new(&repo_path).expect("Failed to create Jujutsu instance");
+        let jj = isolated_jj(&repo_path).expect("Failed to create Jujutsu instance");
         // Set required config
         jj.exec([
             "config",
@@ -1228,7 +1377,7 @@ mod tests {
         jj.exec(["config", "set", "--repo", "jj-vine.forge", "gitlab"])
             .expect("Failed to set config");
 
-        let config = Config::load(&repo_path).expect("Failed to load config");
+        let config = load_isolated(&repo_path).expect("Failed to load config");
 
         assert_eq!(config.default_reviewers, vec!["reviewer1"]);
     }
@@ -1237,7 +1386,7 @@ mod tests {
     fn config_default_reviewers_multiple() {
         let (_temp, repo_path) = create_test_repo();
 
-        let jj = Jujutsu::new(&repo_path).expect("Failed to create Jujutsu instance");
+        let jj = isolated_jj(&repo_path).expect("Failed to create Jujutsu instance");
         // Set required config
         jj.exec([
             "config",
@@ -1273,7 +1422,7 @@ mod tests {
         jj.exec(["config", "set", "--repo", "jj-vine.forge", "gitlab"])
             .expect("Failed to set config");
 
-        let config = Config::load(&repo_path).expect("Failed to load config");
+        let config = load_isolated(&repo_path).expect("Failed to load config");
 
         assert_eq!(
             config.default_reviewers,
@@ -1369,10 +1518,154 @@ mod tests {
             project: "myuser/myrepo".to_owned(),
             target_project: String::new(),
             token: "token".to_owned(),
+            token_command: Vec::new(),
         };
 
         assert_eq!(config.target_project(), "myuser/myrepo");
         assert_eq!(config.source_project(), "myuser/myrepo");
         assert!(!config.is_fork_workflow());
+    }
+
+    #[test]
+    fn resolved_token_errors_when_neither_source_is_configured() {
+        let error = GitHubConfig::default()
+            .resolved_token()
+            .expect_err("missing token sources must error");
+
+        assert!(
+            error
+                .to_string()
+                .contains("github.token or github.tokenCommand")
+        );
+    }
+
+    #[test]
+    fn resolved_token_trims_literal_token() {
+        let config = GitHubConfig {
+            token: "literal-token\n".to_owned(),
+            ..GitHubConfig::default()
+        };
+
+        assert_eq!(
+            config.resolved_token().expect("literal token"),
+            "literal-token"
+        );
+    }
+
+    #[test]
+    fn resolved_token_prefers_literal_over_command() {
+        let config = GitHubConfig {
+            token: " literal-token\n".to_owned(),
+            token_command: vec!["false".to_owned()],
+            ..GitHubConfig::default()
+        };
+        assert_eq!(
+            config.resolved_token().expect("literal token"),
+            "literal-token"
+        );
+    }
+
+    #[test]
+    fn resolved_token_runs_command_and_trims() {
+        let config = GitHubConfig {
+            token_command: vec!["printf".to_owned(), "  command-token\n".to_owned()],
+            ..GitHubConfig::default()
+        };
+        assert_eq!(
+            config.resolved_token().expect("command token"),
+            "command-token"
+        );
+    }
+
+    #[test]
+    fn resolved_token_rejects_nonzero_exit_without_stderr() {
+        let config = GitHubConfig {
+            token_command: vec![
+                "sh".to_owned(),
+                "-c".to_owned(),
+                "printf '%s%s' \"$1\" \"$2\" >&2; exit 1".to_owned(),
+                "sh".to_owned(),
+                "SAFE_ARG_A".to_owned(),
+                "SAFE_ARG_B".to_owned(),
+            ],
+            ..GitHubConfig::default()
+        };
+        let message = config
+            .resolved_token()
+            .expect_err("non-zero exit")
+            .to_string();
+        assert!(message.contains("failed"));
+        assert!(!message.contains("SAFE_ARG_A_SAFE_ARG_B"));
+    }
+
+    #[test]
+    fn resolved_token_rejects_non_utf8_output() {
+        let config = GitHubConfig {
+            token_command: vec![
+                "sh".to_owned(),
+                "-c".to_owned(),
+                "printf '\\377\\376'".to_owned(),
+            ],
+            ..GitHubConfig::default()
+        };
+        let message = config
+            .resolved_token()
+            .expect_err("non-UTF-8 output")
+            .to_string();
+        assert!(message.contains("non-UTF-8"));
+    }
+
+    #[test]
+    fn resolved_token_rejects_empty_output() {
+        let config = GitHubConfig {
+            token_command: vec!["true".to_owned()],
+            ..GitHubConfig::default()
+        };
+        let message = config
+            .resolved_token()
+            .expect_err("empty output")
+            .to_string();
+        assert!(message.contains("empty output"));
+    }
+
+    #[test]
+    fn resolved_token_rejects_missing_binary() {
+        let config = GitHubConfig {
+            token_command: vec!["jj-vine-no-such-token-bin".to_owned()],
+            ..GitHubConfig::default()
+        };
+        let message = config
+            .resolved_token()
+            .expect_err("missing binary")
+            .to_string();
+        assert!(message.contains("not found in PATH"));
+    }
+
+    #[test]
+    fn resolved_token_timeout_kills_helper() {
+        let config = GitHubConfig {
+            token_command: vec!["sh".to_owned(), "-c".to_owned(), "sleep 30".to_owned()],
+            ..GitHubConfig::default()
+        };
+        let start = std::time::Instant::now();
+        let message = config
+            .resolved_token_with_timeout(core::time::Duration::from_millis(200))
+            .expect_err("helper must time out")
+            .to_string();
+        assert!(message.contains("timed out"));
+        assert!(start.elapsed() < core::time::Duration::from_secs(5));
+    }
+
+    #[test]
+    fn resolved_token_whitespace_literal_uses_command() {
+        let config = GitHubConfig {
+            token: " \n".to_owned(),
+            token_command: vec!["printf".to_owned(), "command-token".to_owned()],
+            ..GitHubConfig::default()
+        };
+        assert_eq!(
+            config.resolved_token().expect("command token"),
+            "command-token"
+        );
     }
 }
