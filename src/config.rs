@@ -838,7 +838,8 @@ pub struct DescriptionConfig {
     #[serde(default)]
     pub diagram: DescriptionDiagramConfig,
 
-    /// Where to place the stack visualization in the description (defaults to bottom).
+    /// Where to place the stack visualization in the description (defaults to
+    /// bottom).
     #[serde(default)]
     pub placement: StackPlacement,
 }
@@ -1291,8 +1292,14 @@ mod tests {
             "false",
         ])
         .expect("Failed to set config");
-        jj.exec(["config", "set", "--repo", "jj-vine.description.placement", "top"])
-            .expect("Failed to set config");
+        jj.exec([
+            "config",
+            "set",
+            "--repo",
+            "jj-vine.description.placement",
+            "top",
+        ])
+        .expect("Failed to set config");
 
         jj.exec(["config", "set", "--repo", "jj-vine.forge", "gitlab"])
             .expect("Failed to set config");

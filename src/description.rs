@@ -864,17 +864,16 @@ mod tests {
 
     #[test]
     fn parse_empty_description() {
-        assert_str_eq!(insert_stack_into_description("", "", StackPlacement::Bottom), "");
+        assert_str_eq!(
+            insert_stack_into_description("", "", StackPlacement::Bottom),
+            ""
+        );
     }
 
     #[test]
     fn parse_user_content_only() {
         assert_str_eq!(
-            insert_stack_into_description(
-                "",
-                "User's description here",
-                StackPlacement::Bottom
-            ),
+            insert_stack_into_description("", "User's description here", StackPlacement::Bottom),
             "User's description here"
         );
     }
@@ -2079,9 +2078,8 @@ mod tests {
 
     #[test]
     fn top_round_trip_preserves_user_content_and_is_idempotent() {
-        let existing = format!(
-            "My notes before\n\n{START_MARKER}\nOld stack\n{END_MARKER}\n\nMy notes after"
-        );
+        let existing =
+            format!("My notes before\n\n{START_MARKER}\nOld stack\n{END_MARKER}\n\nMy notes after");
         let expected =
             format!("{START_MARKER}\nNew stack\n{END_MARKER}\n\nMy notes before\n\nMy notes after");
         let actual = insert_stack_into_description("New stack", &existing, StackPlacement::Top);
