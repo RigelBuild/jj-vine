@@ -140,7 +140,8 @@ async fn custom_push_create_argv_runs_with_change_arguments() {
         .push(RepoPushConfig::Command(vec![
             "sh".to_owned(),
             "-c".to_owned(),
-            "printf '%s\\n' \"$0\" \"$@\" > push-args.txt; exec jj git push \"$0\" \"$@\"".to_owned(),
+            "printf '%s\\n' \"$0\" \"$@\" > push-args.txt; exec jj git push \"$0\" \"$@\""
+                .to_owned(),
         ]))
         .build();
     jj.exec(["git", "init"]).expect("initialize jj repository");
@@ -148,15 +149,16 @@ async fn custom_push_create_argv_runs_with_change_arguments() {
         .expect("configure jj username");
     jj.exec(["config", "set", "--repo", "user.email", "test@example.com"])
         .expect("configure jj email");
-    std::fs::write(temp.path().join("README.md"), "initial commit\n")
-        .expect("write initial file");
+    std::fs::write(temp.path().join("README.md"), "initial commit\n").expect("write initial file");
     jj.exec(["describe", "-m", "Initial commit"])
         .expect("create initial commit");
 
     let remote_dir = temp.path().join("remote.git");
     std::fs::create_dir_all(&remote_dir).expect("create bare remote directory");
     let remote = Jujutsu::new(&remote_dir).expect("remote jj instance");
-    remote.exec(["git", "init"]).expect("initialize bare remote");
+    remote
+        .exec(["git", "init"])
+        .expect("initialize bare remote");
     jj.exec([
         "git",
         "remote",
@@ -219,14 +221,18 @@ async fn no_hooks_uses_builtin_push_command() {
     .await;
 
     let (_, _, did_push) = pushed(result);
-    assert!(did_push, "a dry-run with pushing enabled reports a planned push");
+    assert!(
+        did_push,
+        "a dry-run with pushing enabled reports a planned push"
+    );
     assert!(output.contains("via `jj git push`"));
     assert!(!output.contains("custom-push"));
 }
 
 #[tokio::test]
 async fn disabled_push_is_not_reported_even_with_no_hooks() {
-    let (result, output) = run_action(push_action(), RepoPushConfig::Enabled(false), true, true).await;
+    let (result, output) =
+        run_action(push_action(), RepoPushConfig::Enabled(false), true, true).await;
 
     let (_, _, did_push) = pushed(result);
     assert!(!did_push, "disabled pushing stays disabled with no-hooks");

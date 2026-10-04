@@ -78,11 +78,11 @@ impl ExecuteAction for PushAction {
                 }));
             };
 
-            match ctx.execute.jj.push_bookmarks(
-                &self.bookmarks,
-                Some(&self.remote),
-                &push_argv,
-            ) {
+            match ctx
+                .execute
+                .jj
+                .push_bookmarks(&self.bookmarks, Some(&self.remote), &push_argv)
+            {
                 Ok(pushed) => {
                     if pushed {
                         ctx.execute

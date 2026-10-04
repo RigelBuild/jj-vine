@@ -478,7 +478,6 @@ pub(crate) fn build_push_create_argv(
     args
 }
 
-
 #[cfg(test)]
 pub(crate) const ISOLATED_TEST_CONFIG: &str = "isolated-user-config.toml";
 
