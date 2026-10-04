@@ -249,7 +249,7 @@ pub async fn submit(config: &SubmitCommandConfig, cli_config: &CliConfig<'_>) ->
         "Resolved bookmark(s) {} but found no changes to submit — the named bookmark(s) may already be merged into trunk (inspect with `jj log -r <bookmark>`). For stacked submissions, confirm the expected commits are reachable from the named target.",
         bookmarks
             .iter()
-            .map(|bookmark| bookmark.raw_name())
+            .map(JJName::raw_name)
             .join(", ")
     );
 
