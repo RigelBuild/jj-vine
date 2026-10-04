@@ -335,6 +335,7 @@ These settings apply to all forges:
 | `defaultBaseBranch` | Default target branch for pull/merge requests into `trunk()` | String | No | (detected automatically using the `trunk()` revset) |
 | `openAsDraft` | Open newly created pull/merge requests as drafts | Boolean | No | false |
 | `fetch` | Whether to fetch the remote before planning a submission, or the `jj` command to run prior to planning. Defaults to true, which is equivalent to `jj git fetch --tracked`. This may also be set to an array, for example `["git", "fetch"]` will run `jj git fetch`. Set to false to disable fetching completely. If disabled, jj-vine may recreate deleted bookmarks, so be careful when disabling this. | Boolean \| String[] | No | true |
+| `push` | Push command as full argv; remote and bookmark/change flags are appended. `false` disables pushing. A custom command should preserve jj's `Nothing changed.` stderr to report a no-op accurately. `submit --no-hooks` uses the built-in command unless pushing is disabled. | Boolean \| String[] | No | true (`jj git push`) |
 | `description` | Configuration for pull/merge request description generation | Object (see below) | No | (see below) |
 
 ## Description Generation / Stack Visualization{#description-generation-stack-visualization}

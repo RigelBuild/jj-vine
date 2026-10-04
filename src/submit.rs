@@ -130,9 +130,9 @@ impl<'a> RootExecuteContext<'a> {
             config,
             output,
             dry_run,
+            no_hooks,
             plan,
             changes,
-            no_hooks,
             skip_untracked_local_bookmarks,
         }
     }

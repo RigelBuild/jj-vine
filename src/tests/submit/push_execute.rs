@@ -21,12 +21,15 @@ use crate::{
     },
 };
 
-async fn run_action<A: ExecuteAction>(
+async fn run_action<A>(
     action: A,
     push: RepoPushConfig,
     dry_run: bool,
     no_hooks: bool,
-) -> (ActionResultData, String) {
+) -> (ActionResultData, String)
+where
+    A: ExecuteAction,
+{
     let temp = TempDir::new().expect("temp dir");
     let jj = Jujutsu::new(temp.path()).expect("jj instance");
     let forge = ForgeImpl::Test(TestForge::default());
