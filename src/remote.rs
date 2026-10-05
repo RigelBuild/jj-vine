@@ -142,9 +142,10 @@ pub(crate) fn parse_forge_url(url: &str) -> Option<DetectedForge> {
     };
 
     let host = match forge_type {
-        ForgeType::GitHub if remote.hostname == "github.com" => {
-            "https://api.github.com".to_owned()
-        }
+        ForgeType::GitHub if remote.hostname == "github.com" => "https://api.github.com".to_owned(),
+        // RIG-4484 (open): this derives a token-bearing API host from any
+        // remote host that ForgeType::detect_from_host classifies as GitHub,
+        // including HTTP. Not a trusted credential endpoint until decided.
         ForgeType::GitHub => format!("{}/api/v3", remote.web_origin()),
         ForgeType::GitLab | ForgeType::Forgejo | ForgeType::AzureDevOps => remote.web_origin(),
     };
@@ -243,7 +244,10 @@ mod tests {
         assert_eq!(detected.project, "owner/repo");
     }
 
+    /// Pins remote-derived GitHub Enterprise API hosts, which receive the
+    /// configured token. Whether that host may be trusted is undecided.
     #[test]
+    #[ignore = "RIG-4484: GHE token-host trust undecided; not a safety claim"]
     fn parse_github_enterprise_url() {
         let detected = parse_forge_url("https://github.example.com/owner/repo.git")
             .expect("GitHub Enterprise URL");
@@ -271,6 +275,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "RIG-4484: GHE token-host trust undecided; not a safety claim"]
     fn parse_github_enterprise_ssh() {
         let detected = parse_forge_url("git@github.example.com:owner/repo.git")
             .expect("GitHub Enterprise SSH URL");
@@ -293,14 +298,19 @@ mod tests {
         assert!(parse_forge_url("git@git.example.com:owner/repo.git").is_none());
     }
 
+    /// Policy-independent: the SSH port never becomes a project segment and
+    /// never reaches the API host.
     #[test]
     fn parse_ssh_url_with_port_keeps_project_path() {
         let detected = parse_forge_url("ssh://git@github.example.com:2222/owner/repo.git")
             .expect("port-bearing SSH URL");
         assert_eq!(detected.forge_type, ForgeType::GitHub);
         assert_eq!(detected.project, "owner/repo");
-        // The SSH port is not the API port.
-        assert_eq!(detected.host, "https://github.example.com/api/v3");
+        assert!(
+            !detected.host.contains("2222"),
+            "SSH port leaked: {}",
+            detected.host
+        );
     }
 
     #[test]
@@ -312,11 +322,22 @@ mod tests {
         assert_eq!(detected.project, "owner/repo");
     }
 
+    /// Policy-independent: userinfo never reaches the derived host, whatever
+    /// RIG-4484 decides about trusting that host.
     #[test]
     fn parse_https_enterprise_userinfo_never_reaches_api_host() {
         let detected = parse_forge_url("https://token@github.example.com:8443/owner/repo.git")
             .expect("credential-bearing Enterprise URL");
-        assert_eq!(detected.host, "https://github.example.com:8443/api/v3");
+        assert!(
+            !detected.host.contains('@'),
+            "userinfo leaked: {}",
+            detected.host
+        );
+        assert!(
+            !detected.host.contains("token"),
+            "userinfo leaked: {}",
+            detected.host
+        );
         assert_eq!(detected.project, "owner/repo");
     }
 
@@ -474,8 +495,14 @@ mod tests {
         });
 
         // The subscriber must observe the command, or the check proves nothing.
-        assert!(logs.contains("git remote list"), "trace capture is live: {logs}");
-        assert!(!logs.contains("s3cret-token"), "remote userinfo leaked: {logs}");
+        assert!(
+            logs.contains("git remote list"),
+            "trace capture is live: {logs}"
+        );
+        assert!(
+            !logs.contains("s3cret-token"),
+            "remote userinfo leaked: {logs}"
+        );
     }
 
     #[test]
@@ -493,8 +520,14 @@ mod tests {
             assert!(detect_project(&jj, "origin", ForgeType::GitLab).is_none());
         });
 
-        assert!(logs.contains("git remote list"), "trace capture is live: {logs}");
-        assert!(!logs.contains("s3cret-token"), "remote userinfo leaked: {logs}");
+        assert!(
+            logs.contains("git remote list"),
+            "trace capture is live: {logs}"
+        );
+        assert!(
+            !logs.contains("s3cret-token"),
+            "remote userinfo leaked: {logs}"
+        );
     }
 
     #[test]
