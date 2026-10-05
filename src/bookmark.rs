@@ -1429,4 +1429,62 @@ mod tests {
 
         Ok(())
     }
+
+    #[test]
+    fn nearest_pending_ancestor_stops_diamond_walk() -> Result<()> {
+        let mut commits: BTreeMap<String, Change> = BTreeMap::new();
+        let mut add = |change: Change| {
+            let commit_id = change.commit_id.clone();
+            commits.insert(commit_id.clone(), change);
+            commit_id
+        };
+
+        let mut older_pending = Change::mock_from_change_id("older-pending");
+        older_pending.pending_bookmark = true;
+        let older_pending_id = add(older_pending);
+        let mut nearest_pending = Change::mock_from_change_id("nearest-pending")
+            .with_mock_parent_commit_ids([older_pending_id.as_str()]);
+        nearest_pending.pending_bookmark = true;
+        let nearest_pending_id = add(nearest_pending);
+        let left_id = add(Change::mock_from_change_id("left")
+            .with_mock_parent_commit_ids([nearest_pending_id.as_str()]));
+        let right_id = add(Change::mock_from_change_id("right")
+            .with_mock_parent_commit_ids([nearest_pending_id.as_str()]));
+        let merge_id = add(Change::mock_from_change_id("merge")
+            .with_mock_parent_commit_ids([left_id.as_str(), right_id.as_str()]));
+        let leaf_id = add(
+            Change::mock_from_bookmark("leaf").with_mock_parent_commit_ids([merge_id.as_str()])
+        );
+
+        let included_names = HashSet::from(["leaf".to_owned()]);
+        let pending_change_ids =
+            HashSet::from(["nearest-pending".to_owned(), "older-pending".to_owned()]);
+        let mut queries: BTreeMap<String, usize> = BTreeMap::new();
+
+        let ancestors = BookmarkGraph::walk_nearest_bookmarked_ancestors(
+            &commits[&leaf_id],
+            &included_names,
+            &pending_change_ids,
+            |change| {
+                *queries.entry(change.commit_id.clone()).or_default() += 1;
+                Ok(change
+                    .parent_commit_ids
+                    .iter()
+                    .map(|id| commits[id].clone())
+                    .collect())
+            },
+        )?;
+
+        let pending_ids: Vec<_> = ancestors
+            .iter()
+            .map(|change| change.change_id.as_str())
+            .collect();
+        assert_eq!(pending_ids, ["nearest-pending"]);
+        assert_eq!(
+            queries,
+            BTreeMap::from([(leaf_id, 1), (merge_id, 1), (left_id, 1), (right_id, 1),])
+        );
+
+        Ok(())
+    }
 }
