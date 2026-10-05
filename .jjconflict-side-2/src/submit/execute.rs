@@ -5,7 +5,7 @@ pub mod sync_dependent_merge_requests;
 pub mod update_mr_base;
 pub mod update_mr_title_description;
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use bon::bon;
 use enum_dispatch::enum_dispatch;
@@ -99,6 +99,11 @@ pub struct SubmissionResult {
 
     /// Changes after execution has assigned names to pending bookmarks.
     pub changes: Vec<Change>,
+
+    /// Bookmarks whose push or MR base update failed, including when the
+    /// action was skipped because a dependency failed. Their remote head or
+    /// PR base may not match the local stack.
+    pub failed_bookmarks: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -181,6 +186,33 @@ impl ExecuteActionContext<'_> {
             }
         }
     }
+}
+
+/// Collect the bookmarks of every failed push or MR base update. A skipped
+/// action carries an error result, so dependency failures count.
+///
+/// A failed MR creation or `--create` push needs no entry: it leaves the
+/// bookmark without a PR, which the stack link already treats as a gap.
+fn failed_bookmarks(actions: &[Vec<Action>], results: &[ActionResult]) -> BTreeSet<String> {
+    let mut failed = BTreeSet::new();
+    for action in actions.iter().flatten() {
+        let bookmarks = match action {
+            Action::Push(push) => push.bookmarks.as_slice(),
+            Action::UpdateMRBase(update) => core::slice::from_ref(&update.bookmark),
+            Action::PushCreate(_)
+            | Action::CreateMR(_)
+            | Action::UpdateMRTitleDescription(_)
+            | Action::SyncDependentMergeRequests(_) => continue,
+        };
+        let id = action.id();
+        if results
+            .iter()
+            .any(|result| result.id == id && result.data.is_err())
+        {
+            failed.extend(bookmarks.iter().cloned());
+        }
+    }
+    failed
 }
 
 #[enum_dispatch]
@@ -387,6 +419,8 @@ pub async fn execute(mut ctx: RootExecuteContext<'_>) -> Result<SubmissionResult
         }
     }
 
+    let failed_bookmarks = failed_bookmarks(&ctx.plan.actions, &current_results);
+
     for result in current_results {
         match result.data {
             Ok(ActionResultData::Pushed {
@@ -411,6 +445,7 @@ pub async fn execute(mut ctx: RootExecuteContext<'_>) -> Result<SubmissionResult
         errors,
         bookmarks_pushed,
         changes: ctx.changes,
+        failed_bookmarks,
     })
 }
 /// Planned push targets whose remote head will not match the local head
