@@ -453,19 +453,8 @@ pub(crate) fn announce_submission_graph(
     Ok(())
 }
 
-/// Names of the resolved `bookmarks` that the user named literally in
-/// `revset`. Only these bypass the `mine()` filter.
-///
-/// A name counts as literal when it is a member of the revset's top-level
-/// union, spelled as a bare identifier, a `"string"`, or a `'raw string'`,
-/// optionally inside parentheses or a nested parenthesized union. Every
-/// other member — a function call, pattern, range, operator expression, or
-/// anything this recognizer does not understand — is generalized, so the
-/// bookmarks it selects stay subject to `mine()`.
-///
-/// A literal must also resolve to the bookmark in jj: a bare identifier that
-/// is a revset alias expands to the alias, and a name that is also a tag
-/// resolves to the tag first, so neither names the bookmark.
+/// Exact top-level union bookmark names bypass `mine()`; other revsets do not.
+/// A same-named tag or bare revset alias prevents that bypass.
 pub(crate) fn literal_bookmark_targets<'b>(
     jj: &Jujutsu,
     revset: &str,

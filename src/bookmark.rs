@@ -878,14 +878,31 @@ impl<'a> BookmarkGraph<'a> {
         included_names: &HashSet<String>,
         pending_bookmarks: &HashSet<String>,
     ) -> Result<Vec<Change>> {
+        Self::walk_nearest_bookmarked_ancestors(from, included_names, pending_bookmarks, |change| {
+            jj.log_with_pending_bookmarks(
+                format!("{}- ~ ::trunk()", change.commit_id),
+                pending_bookmarks,
+            )
+        })
+    }
+
+    /// Visits each commit at most once, so merge paths sharing an unselected
+    /// ancestor cost one `query_parents` call per commit, not per path.
+    fn walk_nearest_bookmarked_ancestors(
+        from: &Change,
+        included_names: &HashSet<String>,
+        pending_bookmarks: &HashSet<String>,
+        mut query_parents: impl FnMut(&Change) -> Result<Vec<Change>>,
+    ) -> Result<Vec<Change>> {
         let mut ancestors = Vec::new();
+        let mut visited = HashSet::from([from.commit_id.clone()]);
+        let mut to_visit: Vec<Change> = query_parents(from)?.into_iter().rev().collect();
 
-        let parents = jj.log_with_pending_bookmarks(
-            format!("{}- ~ ::trunk()", from.commit_id),
-            pending_bookmarks,
-        )?;
+        while let Some(parent) = to_visit.pop() {
+            if !visited.insert(parent.commit_id.clone()) {
+                continue;
+            }
 
-        for parent in parents {
             let has_included_bookmark = parent
                 .bookmarks
                 .iter()
@@ -894,12 +911,7 @@ impl<'a> BookmarkGraph<'a> {
             if has_included_bookmark || pending_bookmarks.contains(&parent.change_id) {
                 ancestors.push(parent);
             } else {
-                ancestors.extend(Self::find_nearest_bookmarked_ancestors(
-                    jj,
-                    &parent,
-                    included_names,
-                    pending_bookmarks,
-                )?);
+                to_visit.extend(query_parents(&parent)?.into_iter().rev());
             }
         }
 
@@ -1357,6 +1369,63 @@ mod tests {
         let graph = BookmarkGraph::from_bookmarks(&repo.jj, bookmarks, false)?;
 
         assert_eq!(graph.components().len(), 1);
+
+        Ok(())
+    }
+
+    #[test]
+    fn nearest_ancestors_dedupes_diamond_merges() -> Result<()> {
+        let mut commits: BTreeMap<String, Change> = BTreeMap::new();
+        let mut add = |change: Change| {
+            let commit_id = change.commit_id.clone();
+            commits.insert(commit_id.clone(), change);
+            commit_id
+        };
+
+        add(Change::mock_from_bookmark("sel-a"));
+        add(Change::mock_from_bookmark("sel-b"));
+        let mut base =
+            add(Change::mock_from_bookmark("excluded")
+                .with_mock_parent_bookmarks(["sel-a", "sel-b"]));
+        for level in 0_usize..4 {
+            let left = add(Change::mock_from_change_id(&format!("left-{level}"))
+                .with_mock_parent_commit_ids([base.as_str()]));
+            let right = add(Change::mock_from_change_id(&format!("right-{level}"))
+                .with_mock_parent_commit_ids([base.as_str()]));
+            base = add(Change::mock_from_change_id(&format!("merge-{level}"))
+                .with_mock_parent_commit_ids([left.as_str(), right.as_str()]));
+        }
+        let leaf_id =
+            add(Change::mock_from_bookmark("leaf").with_mock_parent_commit_ids([base.as_str()]));
+
+        let included_names =
+            HashSet::from(["leaf".to_owned(), "sel-a".to_owned(), "sel-b".to_owned()]);
+        let mut queries: BTreeMap<String, usize> = BTreeMap::new();
+
+        let ancestors = BookmarkGraph::walk_nearest_bookmarked_ancestors(
+            &commits[&leaf_id],
+            &included_names,
+            &HashSet::new(),
+            |change| {
+                *queries.entry(change.commit_id.clone()).or_default() += 1;
+                Ok(change
+                    .parent_commit_ids
+                    .iter()
+                    .map(|id| commits[id].clone())
+                    .collect())
+            },
+        )?;
+
+        let names: Vec<_> = BookmarkOrPending::from_changes(&ancestors)
+            .into_iter()
+            .map(|bookmark| bookmark.name().to_owned())
+            .collect();
+        assert_eq!(names, ["sel-a", "sel-b"]);
+        assert!(
+            queries.values().all(|&count| count == 1),
+            "a commit was queried more than once: {queries:?}"
+        );
+        assert_eq!(queries.len(), 14);
 
         Ok(())
     }
