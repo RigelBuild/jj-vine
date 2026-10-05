@@ -1,5 +1,6 @@
 //! Register submitted GitHub pull requests as native stacks.
 
+use core::cell::OnceCell;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     ffi::OsString,
@@ -21,17 +22,29 @@ const STACK_LINK_TIMEOUT: core::time::Duration = core::time::Duration::from_secs
 /// Result of trying to register submitted pull requests as GitHub stacks.
 #[derive(Debug)]
 pub enum StackLinkOutcome {
-    /// No stack link was attempted.
+    /// No stack link was attempted, or there was nothing to link and nothing
+    /// to warn about.
     Skipped(SkipReason),
-    /// One or more stacks were linked, in bottom-to-top order. `warnings`
-    /// lists components that could not be linked in the same run.
+    /// At least one stack was linked.
     Linked {
+        /// Each linked stack as PR numbers, bottom to top.
         stacks: Vec<Vec<u64>>,
+        /// Notes about submitted PRs left out of a linked stack: the top
+        /// bookmarks above a linked run that have no PR yet, and PRs that are
+        /// in no stack and not named in `warnings`.
         unlinked: Vec<String>,
+        /// Problems with other stacks in the same run: a gap in a stack, a
+        /// non-linear stack, `gh-stack` failing or exiting not-enabled, or
+        /// `gh-stack` missing from `PATH` before the remaining stacks.
         warnings: Vec<String>,
     },
-    /// Stack linking failed. Submit itself remains successful.
-    Failed { warning: String },
+    /// No stack was linked and at least one problem needs the user's
+    /// attention. `warning` joins every problem with `"; "`. Submit itself
+    /// remains successful.
+    Failed {
+        /// The user-facing description of every problem.
+        warning: String,
+    },
 }
 
 /// Why stack linking was skipped.
@@ -50,6 +63,7 @@ pub enum SkipReason {
 }
 
 impl SkipReason {
+    /// A short user-facing description of why stack linking was skipped.
     #[must_use]
     pub fn describe(&self) -> &'static str {
         match self {
@@ -86,10 +100,11 @@ pub fn link_stacks(
     dry_run: bool,
     no_hooks: bool,
 ) -> StackLinkOutcome {
-    let runner = GhStackRunner {
-        cwd: jj.cwd().to_path_buf(),
-        search_path: std::env::var_os("PATH"),
-    };
+    let runner = GhStackRunner::new(
+        jj.cwd().to_path_buf(),
+        std::env::var_os("PATH"),
+        STACK_LINK_TIMEOUT,
+    );
     link_stacks_with_runner(
         &runner,
         github,
@@ -140,36 +155,45 @@ fn link_stacks_with_runner(
 }
 
 struct ContiguityScan {
+    /// PRs from the bottom of the stack up to the first bookmark without one.
     prs: Vec<u64>,
-    trailing_unmapped: Vec<String>,
-    interior_gap: bool,
+    /// Bookmarks without a PR, in order, before any PR above them.
+    unmapped: Vec<String>,
+    /// The first bookmark without a PR that has a PR above it. Linking across
+    /// it would rebase the PR above onto the wrong base.
+    gap: Option<String>,
+    /// PRs above `gap`, which stay unlinked.
+    stranded: Vec<u64>,
 }
 
 fn scan_contiguous_run(
     ordered: &[BookmarkOrPending<'_>],
     pr_map: &BTreeMap<String, u64>,
 ) -> ContiguityScan {
-    let mut prs = Vec::new();
-    let mut trailing_unmapped = Vec::new();
-    let mut interior_gap = false;
+    let mut scan = ContiguityScan {
+        prs: Vec::new(),
+        unmapped: Vec::new(),
+        gap: None,
+        stranded: Vec::new(),
+    };
 
     for bookmark in ordered {
         match pr_map.get(bookmark.name()) {
-            Some(&pr) if trailing_unmapped.is_empty() => prs.push(pr),
-            Some(_) => {
-                interior_gap = true;
-                break;
-            }
-            None if !prs.is_empty() => trailing_unmapped.push(bookmark.name().to_owned()),
+            Some(&pr) if scan.gap.is_some() => scan.stranded.push(pr),
+            Some(&pr) => match scan.unmapped.first() {
+                // A missing bottom PR is a gap like a missing middle PR.
+                Some(first) => {
+                    scan.gap = Some(first.clone());
+                    scan.stranded.push(pr);
+                }
+                None => scan.prs.push(pr),
+            },
+            None if scan.gap.is_none() => scan.unmapped.push(bookmark.name().to_owned()),
             None => {}
         }
     }
 
-    ContiguityScan {
-        prs,
-        trailing_unmapped,
-        interior_gap,
-    }
+    scan
 }
 
 fn link_from_graph(
@@ -183,10 +207,28 @@ fn link_from_graph(
     let mut notes = Vec::new();
     // PRs already named in a warning, so they are not listed again as orphans.
     let mut reported = BTreeSet::new();
+    // Whether the runner has found gh-stack at least once in this run.
+    let mut binary_found = false;
 
     for component in graph.components() {
         if !component.is_linear() {
-            debug!("stack link: skipping a non-linear component");
+            let mut prs: Vec<u64> = component
+                .all_bookmarks()
+                .iter()
+                .filter_map(|bookmark| pr_map.get(bookmark.name()).copied())
+                .collect();
+            prs.sort_unstable();
+            if prs.len() >= 2 {
+                let warning = format!(
+                    "skipped linking a non-linear stack; gh-stack links only linear stacks. Unlinked PRs: {}",
+                    format_pr_list(&prs)
+                );
+                warn!("stack link: {warning}");
+                warnings.push(warning);
+                reported.extend(prs);
+            } else {
+                debug!("stack link: skipping a non-linear component without PRs to link");
+            }
             continue;
         }
         let Some(leaf) = component.leaves.first() else {
@@ -196,26 +238,42 @@ fn link_from_graph(
         ordered.reverse();
         let ContiguityScan {
             prs,
-            trailing_unmapped,
-            interior_gap,
+            unmapped,
+            gap,
+            stranded,
         } = scan_contiguous_run(&ordered, pr_map);
 
-        if interior_gap {
-            let warning = format!(
-                "skipped linking a stack with a missing middle PR; PRs below the gap: {}",
-                format_prs(&prs)
-            );
+        if let Some(gap) = gap {
+            let warning = if prs.is_empty() {
+                format!(
+                    "skipped linking a stack whose bottom bookmark {gap} has no PR; PRs above it: {}",
+                    format_prs(&stranded)
+                )
+            } else {
+                format!(
+                    "skipped linking a stack with a missing middle PR ({gap}); PRs below the gap: {}",
+                    format_prs(&prs)
+                )
+            };
             warn!("stack link: {warning}");
             warnings.push(warning);
-            reported.extend(prs.iter().copied());
+            if prs.is_empty() {
+                reported.extend(stranded.iter().copied());
+            } else {
+                reported.extend(prs.iter().copied());
+            }
             continue;
         }
         if prs.len() < 2 {
             debug!("stack link: no qualifying PR stack in component");
             continue;
         }
+        // Without a gap, every unmapped bookmark sits above the linked run.
+        let trailing_unmapped = unmapped;
 
-        match runner.run(&prs, github) {
+        let outcome = runner.run(&prs, github);
+        binary_found |= outcome != LinkOutcome::MissingBinary;
+        match outcome {
             LinkOutcome::Linked => {
                 if !trailing_unmapped.is_empty() {
                     let note = format!(
@@ -236,12 +294,19 @@ fn link_from_graph(
                 reported.extend(prs.iter().copied());
             }
             LinkOutcome::MissingBinary => {
-                if stacks.is_empty() && warnings.is_empty() {
-                    return StackLinkOutcome::Skipped(SkipReason::MissingBinary);
+                if !binary_found {
+                    if stacks.is_empty() && warnings.is_empty() {
+                        return StackLinkOutcome::Skipped(SkipReason::MissingBinary);
+                    }
+                    warnings.push(
+                        "gh-stack is not installed; remaining stacks were not linked".to_owned(),
+                    );
+                } else {
+                    warnings.push(
+                        "gh-stack is no longer on PATH; remaining stacks were not linked"
+                            .to_owned(),
+                    );
                 }
-                warnings.push(
-                    "gh-stack is no longer on PATH; remaining stacks were not linked".to_owned(),
-                );
                 break;
             }
             LinkOutcome::Failed { detail } => {
@@ -322,6 +387,14 @@ fn format_prs(prs: &[u64]) -> String {
         .join(" -> ")
 }
 
+/// Format PRs that have no stack order.
+fn format_pr_list(prs: &[u64]) -> String {
+    prs.iter()
+        .map(|pr| format!("#{pr}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum LinkOutcome {
     Linked,
@@ -338,15 +411,33 @@ struct GhStackRunner {
     cwd: PathBuf,
     /// The `PATH` searched for `gh-stack`.
     search_path: Option<OsString>,
+    /// Wall-clock limit for each `gh-stack link` call.
+    timeout: core::time::Duration,
+    /// The token, or the failure detail, resolved once on first use so a
+    /// `tokenCommand` runs at most once per submit.
+    token: OnceCell<Result<String, String>>,
 }
 
 impl GhStackRunner {
+    fn new(cwd: PathBuf, search_path: Option<OsString>, timeout: core::time::Duration) -> Self {
+        Self {
+            cwd,
+            search_path,
+            timeout,
+            token: OnceCell::new(),
+        }
+    }
+
     fn run_with_binary(&self, binary: &Path, prs: &[u64], github: &GitHubConfig) -> LinkOutcome {
-        let token = match github.resolved_token() {
+        let token = match self.token.get_or_init(|| {
+            github
+                .resolved_token()
+                .map_err(|error| format!("could not resolve GH_TOKEN: {error}"))
+        }) {
             Ok(token) => token,
-            Err(error) => {
+            Err(detail) => {
                 return LinkOutcome::Failed {
-                    detail: format!("could not resolve GH_TOKEN: {error}"),
+                    detail: detail.clone(),
                 };
             }
         };
@@ -357,15 +448,15 @@ impl GhStackRunner {
             command.arg(pr.to_string());
         }
         command.current_dir(&self.cwd);
-        command.env("GH_TOKEN", &token);
+        command.env("GH_TOKEN", token);
         command.env("GH_REPO", github.target_project());
 
-        match crate::process::output_with_timeout(command, STACK_LINK_TIMEOUT) {
+        match crate::process::output_with_timeout(command, self.timeout) {
             Ok(Some(output)) if output.status.success() => LinkOutcome::Linked,
             Ok(Some(output)) if output.status.code() == Some(9) => LinkOutcome::NotEnabled,
             Ok(Some(output)) => {
                 let stderr = String::from_utf8_lossy(&output.stderr);
-                let stderr = stderr.replace(&token, "[redacted]");
+                let stderr = stderr.replace(token.as_str(), "[redacted]");
                 let stderr = stderr.trim();
                 LinkOutcome::Failed {
                     detail: if stderr.is_empty() {
@@ -376,7 +467,7 @@ impl GhStackRunner {
                 }
             }
             Ok(None) => LinkOutcome::Failed {
-                detail: format!("gh-stack timed out after {}s", STACK_LINK_TIMEOUT.as_secs()),
+                detail: format!("gh-stack timed out after {:?}", self.timeout),
             },
             // The binary was found on PATH, so a spawn failure here (including
             // NotFound for a missing interpreter or a racing uninstall) is a
@@ -509,10 +600,11 @@ mod tests {
     #[test]
     fn binary_absent_from_path_is_a_silent_skip() {
         let temp = tempfile::tempdir().expect("temporary directory");
-        let runner = GhStackRunner {
-            cwd: temp.path().to_path_buf(),
-            search_path: Some(temp.path().as_os_str().to_owned()),
-        };
+        let runner = GhStackRunner::new(
+            temp.path().to_path_buf(),
+            Some(temp.path().as_os_str().to_owned()),
+            STACK_LINK_TIMEOUT,
+        );
 
         let outcome = runner.run(&[1, 2], &github_config());
 
@@ -526,10 +618,7 @@ mod tests {
     #[test]
     fn spawn_not_found_after_lookup_is_a_warning() {
         let temp = tempfile::tempdir().expect("temporary directory");
-        let runner = GhStackRunner {
-            cwd: temp.path().to_path_buf(),
-            search_path: None,
-        };
+        let runner = GhStackRunner::new(temp.path().to_path_buf(), None, STACK_LINK_TIMEOUT);
         let vanished_binary = temp.path().join("gh-stack");
 
         let outcome = runner.run_with_binary(&vanished_binary, &[1, 2], &github_config());
@@ -781,7 +870,7 @@ mod tests {
     }
 
     #[test]
-    fn non_linear_component_is_skipped() {
+    fn non_linear_component_warns_and_names_its_pull_requests() {
         let changes = Change::mock_stack_map([
             Change::mock_from_bookmark("a"),
             Change::mock_from_bookmark("b"),
@@ -800,15 +889,61 @@ mod tests {
             ]),
         );
 
-        assert!(matches!(
-            outcome,
-            StackLinkOutcome::Skipped(SkipReason::NoQualifyingStack)
-        ));
-        assert!(runner.calls().is_empty());
+        assert!(
+            runner.calls().is_empty(),
+            "gh-stack links only linear stacks"
+        );
+        assert!(
+            matches!(&outcome, StackLinkOutcome::Failed { warning }
+                if warning.contains("non-linear") && warning.contains("#1, #2, #3")),
+            "a skipped non-linear stack must be reported, got {outcome:?}"
+        );
     }
 
     #[test]
-    fn missing_bottom_pr_does_not_block_contiguous_top_run() {
+    fn non_linear_component_is_not_repeated_as_orphans_beside_a_linked_stack() {
+        let mut changes = Change::mock_stack_map([
+            Change::mock_from_bookmark("a"),
+            Change::mock_from_bookmark("b"),
+            Change::mock_from_bookmark("c").with_mock_parent_bookmarks(["a", "b"]),
+        ]);
+        changes.extend(linear_changes(&["x", "y"]));
+        let runner = RecordingRunner::new(LinkOutcome::Linked);
+
+        let outcome = link_from_graph(
+            &runner,
+            &github_config(),
+            &graph(&changes),
+            &pr_map(&[
+                mr_update("a", "1"),
+                mr_update("b", "2"),
+                mr_update("c", "3"),
+                mr_update("x", "7"),
+                mr_update("y", "8"),
+            ]),
+        );
+
+        let StackLinkOutcome::Linked {
+            stacks,
+            unlinked,
+            warnings,
+        } = &outcome
+        else {
+            panic!("the linear stack must still link, got {outcome:?}");
+        };
+        assert_eq!(*stacks, vec![vec![7, 8]]);
+        assert!(
+            warnings.len() == 1 && warnings[0].contains("non-linear"),
+            "non-linear warning kept: {warnings:?}"
+        );
+        assert!(
+            unlinked.is_empty(),
+            "no duplicate orphan note: {unlinked:?}"
+        );
+    }
+
+    #[test]
+    fn missing_bottom_pr_never_links_the_prs_above_it() {
         let changes = linear_changes(&["a", "b", "c"]);
         let runner = RecordingRunner::new(LinkOutcome::Linked);
 
@@ -819,8 +954,51 @@ mod tests {
             &pr_map(&[mr_update("b", "20"), mr_update("c", "30")]),
         );
 
-        assert_eq!(runner.calls(), vec![vec![20, 30]]);
-        assert!(matches!(outcome, StackLinkOutcome::Linked { .. }));
+        assert!(
+            runner.calls().is_empty(),
+            "linking #20 -> #30 would rebase #20 off the missing bottom PR"
+        );
+        assert!(
+            matches!(&outcome, StackLinkOutcome::Failed { warning }
+                if warning.contains("bottom bookmark a has no PR")
+                    && warning.contains("#20 -> #30")),
+            "unexpected outcome {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn missing_bottom_pr_does_not_block_other_stacks() {
+        let mut changes = linear_changes(&["a", "b", "c"]);
+        changes.extend(linear_changes(&["x", "y"]));
+        let runner = RecordingRunner::new(LinkOutcome::Linked);
+
+        let outcome = link_from_graph(
+            &runner,
+            &github_config(),
+            &graph(&changes),
+            &pr_map(&[
+                mr_update("b", "20"),
+                mr_update("c", "30"),
+                mr_update("x", "7"),
+                mr_update("y", "8"),
+            ]),
+        );
+
+        assert_eq!(runner.calls(), vec![vec![7, 8]]);
+        let StackLinkOutcome::Linked {
+            unlinked, warnings, ..
+        } = &outcome
+        else {
+            panic!("the complete stack must still link, got {outcome:?}");
+        };
+        assert!(
+            warnings.len() == 1 && warnings[0].contains("bottom bookmark a"),
+            "bottom gap warned: {warnings:?}"
+        );
+        assert!(
+            unlinked.is_empty(),
+            "PRs named in the gap warning are not repeated: {unlinked:?}"
+        );
     }
 
     #[test]
@@ -1046,35 +1224,279 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[test]
-    fn stderr_does_not_expose_github_token() {
+    fn binary_missing_after_an_earlier_warning_says_not_installed() {
+        let mut changes = linear_changes(&["a", "b", "c"]);
+        changes.extend(linear_changes(&["x", "y"]));
+        // The gapped stack warns without running gh-stack; the first runner
+        // call then finds no binary at all.
+        let runner = SequencedRunner::new([LinkOutcome::MissingBinary]);
+
+        let outcome = link_from_graph(
+            &runner,
+            &github_config(),
+            &graph(&changes),
+            &pr_map(&[
+                mr_update("a", "1"),
+                mr_update("c", "3"),
+                mr_update("x", "7"),
+                mr_update("y", "8"),
+            ]),
+        );
+
+        assert!(
+            matches!(&outcome, StackLinkOutcome::Failed { warning }
+                if warning.contains("gh-stack is not installed")
+                    && !warning.contains("no longer on PATH")),
+            "gh-stack was never found, so it did not leave PATH: {outcome:?}"
+        );
+    }
+
+    /// Write an executable `gh-stack` shell script into `dir`.
+    #[cfg(unix)]
+    fn fake_gh_stack(dir: &Path, script: &str) -> PathBuf {
         use std::os::unix::fs::PermissionsExt as _;
 
-        let temp = tempfile::tempdir().expect("temporary directory");
-        let binary = temp.path().join("gh-stack-test");
-        std::fs::write(
-            &binary,
-            "#!/bin/sh\nprintf '%s\\n' \"$GH_TOKEN\" >&2\nexit 1\n",
-        )
-        .expect("write helper");
+        let binary = dir.join("gh-stack");
+        std::fs::write(&binary, format!("#!/bin/sh\n{script}\n")).expect("write helper");
         let mut permissions = std::fs::metadata(&binary)
             .expect("helper metadata")
             .permissions();
         permissions.set_mode(0o700);
         std::fs::set_permissions(&binary, permissions).expect("make helper executable");
+        binary
+    }
 
-        let outcome = GhStackRunner {
-            cwd: temp.path().to_path_buf(),
-            search_path: None,
-        }
-        .run_with_binary(&binary, &[1, 2], &github_config());
+    #[cfg(unix)]
+    #[test]
+    fn stderr_does_not_expose_github_token() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let binary = fake_gh_stack(temp.path(), "printf '%s\\n' \"$GH_TOKEN\" >&2\nexit 1");
+
+        let outcome = GhStackRunner::new(temp.path().to_path_buf(), None, STACK_LINK_TIMEOUT)
+            .run_with_binary(&binary, &[1, 2], &github_config());
 
         assert!(matches!(
             outcome,
             LinkOutcome::Failed { detail }
                 if detail.contains("[redacted]") && !detail.contains("test-token")
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exit_nine_from_gh_stack_on_path_means_not_enabled() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        fake_gh_stack(temp.path(), "echo 'stacks are not enabled' >&2\nexit 9");
+        let runner = GhStackRunner::new(
+            temp.path().to_path_buf(),
+            Some(temp.path().as_os_str().to_owned()),
+            STACK_LINK_TIMEOUT,
+        );
+
+        let outcome = runner.run(&[1, 2], &github_config());
+
+        assert_eq!(outcome, LinkOutcome::NotEnabled);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gh_stack_receives_link_args_token_and_repo() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let seen = temp.path().join("seen");
+        fake_gh_stack(
+            temp.path(),
+            &format!(
+                "printf '%s|%s|%s' \"$*\" \"$GH_TOKEN\" \"$GH_REPO\" > '{}'",
+                seen.display()
+            ),
+        );
+        let runner = GhStackRunner::new(
+            temp.path().to_path_buf(),
+            Some(temp.path().as_os_str().to_owned()),
+            STACK_LINK_TIMEOUT,
+        );
+
+        let outcome = runner.run(&[10, 20, 30], &github_config());
+
+        assert_eq!(outcome, LinkOutcome::Linked);
+        assert_eq!(
+            std::fs::read_to_string(&seen).expect("helper recorded its inputs"),
+            "link 10 20 30|test-token|owner/repo"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn overrunning_gh_stack_times_out_as_a_failure() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let binary = fake_gh_stack(temp.path(), "exec sleep 30");
+        let timeout = core::time::Duration::from_millis(200);
+        let runner = GhStackRunner::new(temp.path().to_path_buf(), None, timeout);
+
+        let start = std::time::Instant::now();
+        let outcome = runner.run_with_binary(&binary, &[1, 2], &github_config());
+
+        assert!(
+            matches!(&outcome, LinkOutcome::Failed { detail } if detail.contains("timed out after 200ms")),
+            "a timeout must warn, got {outcome:?}"
+        );
+        assert!(
+            start.elapsed() < core::time::Duration::from_secs(5),
+            "must return promptly after the timeout, not wait out the sleep"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn token_command_runs_once_per_submit() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let binary = fake_gh_stack(temp.path(), "exit 0");
+        let counter = temp.path().join("token-calls");
+        let github = GitHubConfig {
+            token: String::new(),
+            token_command: vec![
+                "sh".to_owned(),
+                "-c".to_owned(),
+                format!("echo call >> '{}'; printf command-token", counter.display()),
+            ],
+            ..github_config()
+        };
+        let runner = GhStackRunner::new(temp.path().to_path_buf(), None, STACK_LINK_TIMEOUT);
+
+        assert_eq!(
+            runner.run_with_binary(&binary, &[1, 2], &github),
+            LinkOutcome::Linked
+        );
+        assert_eq!(
+            runner.run_with_binary(&binary, &[3, 4], &github),
+            LinkOutcome::Linked
+        );
+
+        assert_eq!(
+            std::fs::read_to_string(&counter)
+                .expect("token command ran")
+                .lines()
+                .count(),
+            1,
+            "one tokenCommand run for two stacks"
+        );
+    }
+
+    /// Drive plan → execute → stack link where creating the bottom PR fails.
+    /// The PRs above it already exist, so execute returns a partial error and
+    /// a PR map with no bottom entry. Linking them would rebase the lowest PR
+    /// onto trunk, so the stack must stay unlinked.
+    #[tokio::test]
+    async fn production_failed_bottom_pr_create_leaves_stack_unlinked() {
+        use std::collections::HashSet;
+
+        use crate::{
+            config::{Config, ForgeType},
+            forge::{ForgeImpl, test::TestForge},
+            output::BufferedOutput,
+            submit::{
+                PlanContext,
+                RootExecuteContext,
+                execute::execute,
+                find_changes_to_submit,
+                plan::plan,
+            },
+            tests::TestRepo,
+        };
+
+        let repo = TestRepo::with_local_remote();
+        repo.create_change("a.txt", "a", "A").create_bookmark("a");
+        repo.push_bookmark("a");
+        repo.exec(["new"]);
+        repo.create_change("b.txt", "b", "B").create_bookmark("b");
+        repo.push_bookmark("b");
+        repo.exec(["new"]);
+        repo.create_change("c.txt", "c", "C").create_bookmark("c");
+        repo.push_bookmark("c");
+
+        let mut forge = TestForge::builder()
+            .fail_create_for(HashSet::from(["a".to_owned()]))
+            .build();
+        for (id, source, target) in [("20", "b", "a"), ("30", "c", "b")] {
+            forge.add_merge_request(
+                MergeRequest::builder()
+                    .id(id.to_owned())
+                    .title(format!("PR {source}"))
+                    .source_branch(source.to_owned())
+                    .target_branch(target.to_owned())
+                    .build(),
+            );
+        }
+        let forge = ForgeImpl::Test(forge);
+        let config = Config::builder()
+            .forge(ForgeType::GitHub)
+            .github(github_config())
+            .build();
+        let output = BufferedOutput::new();
+
+        let changes = find_changes_to_submit(&repo.jj, ["c"], &HashSet::<String>::new())
+            .expect("changes to submit");
+        let graph = BookmarkGraph::from_changes(&repo.jj, &changes, false).expect("graph");
+        let submission_plan = plan(PlanContext {
+            jj: &repo.jj,
+            forge: &forge,
+            config: &config,
+            output: &output,
+            bookmark_graph: &graph,
+            dry_run: false,
+        })
+        .await
+        .expect("plan");
+        let existing = submission_plan.existing_mrs.clone();
+
+        let result = execute(RootExecuteContext::new(
+            &repo.jj,
+            &forge,
+            &config,
+            &output,
+            false,
+            submission_plan,
+            changes.clone(),
+            false,
+            false,
+        ))
+        .await
+        .expect("execute");
+        assert!(
+            !result.errors.is_empty(),
+            "the bottom PR create must fail in execute"
+        );
+        assert!(
+            !result
+                .merge_requests
+                .iter()
+                .any(|update| update.bookmark == "a"),
+            "no PR for the bottom bookmark"
+        );
+
+        let runner = RecordingRunner::new(LinkOutcome::Linked);
+        let outcome = link_stacks_with_runner(
+            &runner,
+            &github_config(),
+            &repo.jj,
+            &result,
+            &existing,
+            false,
+            false,
+            false,
+        );
+
+        assert!(
+            runner.calls().is_empty(),
+            "#20 -> #30 must not be linked without the bottom PR"
+        );
+        assert!(
+            matches!(&outcome, StackLinkOutcome::Failed { warning }
+                if warning.contains("bottom bookmark a has no PR")
+                    && warning.contains("#20 -> #30")),
+            "unexpected outcome {outcome:?}"
+        );
     }
 
     /// Drive the real plan → execute → stack-link handoff with descriptions
