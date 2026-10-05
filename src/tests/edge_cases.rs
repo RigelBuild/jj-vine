@@ -525,6 +525,68 @@ fn dropped_generalized_target_does_not_seed_ancestry() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn alias_or_tag_named_like_foreign_bookmark_keeps_mine_filter() -> Result<()> {
+    let repo = TestRepo::with_local_remote();
+    as_current_user(&repo);
+
+    // main -> tagged (mine, tag `stack`) ; main -> stack (foreign) ; main ->
+    // work (foreign)
+    repo.jj.exec(["new", "main"])?;
+    repo.create_change("t.txt", "t", "Tagged");
+    repo.jj.exec(["tag", "set", "stack", "-r", "@"])?;
+    repo.jj.exec(["new", "main"])?;
+    repo.create_change("s.txt", "s", "Stack")
+        .create_bookmark("stack");
+    make_foreign(&repo)?;
+    repo.jj.exec(["new", "main"])?;
+    repo.create_change("w.txt", "w", "Work")
+        .create_bookmark("work");
+    make_foreign(&repo)?;
+    repo.set_config("revset-aliases.work", r#"bookmarks(glob:"wor*")"#);
+
+    // The symbol resolves to the tag or expands the alias, so the foreign
+    // bookmark is selected only by a generalized expression.
+    for revset in [
+        r#"stack | bookmarks(exact:"stack")"#,
+        r#""stack" | bookmarks(exact:"stack")"#,
+        "work",
+        "(work)",
+    ] {
+        let changes = submission_changes(&repo, revset)?;
+        assert_is_empty!(changes, "revset {revset}");
+    }
+
+    // A string literal is never alias-expanded, so it still names the bookmark.
+    for revset in [r#""work""#, "'work'"] {
+        let changes = submission_changes(&repo, revset)?;
+        assert_eq!(
+            sorted_names(&changes),
+            vec!["work".to_owned()],
+            "revset {revset}"
+        );
+    }
+
+    Ok(())
+}
+
+#[test]
+fn hex_escaped_non_ascii_name_bypasses_mine() -> Result<()> {
+    let repo = TestRepo::with_local_remote();
+    as_current_user(&repo);
+
+    repo.jj.exec(["new", "main"])?;
+    repo.create_change("e.txt", "e", "Accent")
+        .create_bookmark("é");
+    make_foreign(&repo)?;
+
+    // jj decodes `\xHH` to the character U+00HH.
+    let changes = submission_changes(&repo, r#""\xe9""#)?;
+    assert_eq!(sorted_names(&changes), vec!["é".to_owned()]);
+
+    Ok(())
+}
+
 #[cfg(not(feature = "no-e2e-tests"))]
 mod e2e {
     use assertables::assert_contains;

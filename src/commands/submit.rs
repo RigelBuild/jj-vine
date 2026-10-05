@@ -242,7 +242,7 @@ pub async fn submit(config: &SubmitCommandConfig, cli_config: &CliConfig<'_>) ->
 
     ensure_whatever!(
         !changes.is_empty(),
-        "Resolved bookmark(s) {} but found no changes to submit — the named bookmark(s) may already be merged into trunk (inspect with `jj log -r <bookmark>`). For stacked submissions, confirm the expected commits are reachable from the named target.",
+        "Resolved bookmark(s) {} but found no changes to submit. The bookmark(s) may already be merged into trunk (inspect with `jj log -r <bookmark>`), or none is authored by you: only a bookmark named literally in the revset bypasses the `mine()` filter. For stacked submissions, confirm the expected commits are reachable from the named target.",
         bookmarks.iter().map(JJName::raw_name).join(", ")
     );
 
@@ -432,7 +432,7 @@ pub(crate) fn select_changes_to_submit(
     find_changes_to_submit(
         jj,
         bookmarks.iter().map(BookmarkOrPending::change_id),
-        literal_bookmark_targets(revset, bookmarks),
+        literal_bookmark_targets(jj, revset, bookmarks)?,
         pending_bookmarks,
     )
 }
@@ -446,24 +446,73 @@ pub(crate) fn select_changes_to_submit(
 /// other member — a function call, pattern, range, operator expression, or
 /// anything this recognizer does not understand — is generalized, so the
 /// bookmarks it selects stay subject to `mine()`.
+///
+/// A literal must also resolve to the bookmark in jj: a bare identifier that
+/// is a revset alias expands to the alias, and a name that is also a tag
+/// resolves to the tag first, so neither names the bookmark.
 pub(crate) fn literal_bookmark_targets<'b>(
+    jj: &Jujutsu,
     revset: &str,
     bookmarks: &'b [BookmarkOrPending<'_>],
-) -> impl Iterator<Item = &'b str> {
-    let mut literal_names = HashSet::new();
-    collect_union_literals(&tokenize_revset(revset), &mut literal_names);
+) -> Result<Vec<&'b str>> {
+    let mut literals = HashMap::new();
+    collect_union_literals(&tokenize_revset(revset), &mut literals);
 
-    bookmarks
+    let candidates: Vec<(&'b str, bool)> = bookmarks
         .iter()
-        .filter(move |bookmark| bookmark.is_bookmark() && literal_names.contains(bookmark.name()))
-        .map(BookmarkOrPending::name)
+        .filter(|bookmark| bookmark.is_bookmark())
+        .filter_map(|bookmark| {
+            literals
+                .get(bookmark.name())
+                .map(|&is_bare| (bookmark.name(), is_bare))
+        })
+        .collect();
+    if candidates.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let tags: HashSet<String> = jj
+        .exec(["tag", "list", "--template", r#"name ++ "\n""#])?
+        .stdout
+        .lines()
+        .map(str::to_owned)
+        .collect();
+
+    let mut targets = Vec::with_capacity(candidates.len());
+    for (name, is_bare) in candidates {
+        if tags.contains(name) || (is_bare && is_revset_alias(jj, name)?) {
+            continue;
+        }
+        targets.push(name);
+    }
+    Ok(targets)
+}
+
+/// Whether jj defines a symbol revset alias named `identifier`. jj expands
+/// such an alias in place of a bare identifier, never in place of a string
+/// literal.
+fn is_revset_alias(jj: &Jujutsu, identifier: &str) -> Result<bool> {
+    // A bare identifier holds no `"` or `\`, so quoting it as a TOML key is
+    // exact.
+    let key = format!(r#"revset-aliases."{identifier}""#);
+    let output = jj.exec([
+        "config",
+        "list",
+        "--include-defaults",
+        "--template",
+        r#"name ++ "\n""#,
+        &key,
+    ])?;
+    Ok(!output.stdout.trim().is_empty())
 }
 
 /// The few revset tokens that decide whether a union member is a literal.
 #[derive(Debug, PartialEq, Eq)]
 enum RevsetToken {
-    /// A bare identifier or a decoded string literal.
-    Symbol(String),
+    /// A bare identifier, which jj may expand as a revset alias.
+    Identifier(String),
+    /// A decoded string literal, which jj never alias-expands.
+    String(String),
     LParen,
     RParen,
     Union,
@@ -485,7 +534,7 @@ fn tokenize_revset(revset: &str) -> Vec<RevsetToken> {
             ')' => RevsetToken::RParen,
             '|' => RevsetToken::Union,
             '"' => {
-                decode_string_literal(&mut chars).map_or(RevsetToken::Other, RevsetToken::Symbol)
+                decode_string_literal(&mut chars).map_or(RevsetToken::Other, RevsetToken::String)
             }
             '\'' => {
                 let mut content = String::new();
@@ -498,7 +547,7 @@ fn tokenize_revset(revset: &str) -> Vec<RevsetToken> {
                     content.push(next);
                 }
                 if is_closed {
-                    RevsetToken::Symbol(content)
+                    RevsetToken::String(content)
                 } else {
                     RevsetToken::Other
                 }
@@ -512,7 +561,7 @@ fn tokenize_revset(revset: &str) -> Vec<RevsetToken> {
                     chars.next();
                 }
                 if is_valid_identifier(&identifier) {
-                    RevsetToken::Symbol(identifier)
+                    RevsetToken::Identifier(identifier)
                 } else {
                     RevsetToken::Other
                 }
@@ -570,13 +619,13 @@ fn decode_string_literal(chars: &mut impl Iterator<Item = char>) -> Option<Strin
                 '"' => '"',
                 '\\' => '\\',
                 'x' => {
-                    let hex: String = chars.by_ref().take(2).collect();
-                    let byte = u8::from_str_radix(&hex, 16).ok()?;
-                    // jj only accepts escapes that keep the string valid UTF-8.
-                    if !byte.is_ascii() {
+                    // jj takes exactly two hex digits and decodes them to the
+                    // character U+00HH, so `\xe9` is `é`.
+                    let hex = [chars.next()?, chars.next()?];
+                    if !hex.iter().all(char::is_ascii_hexdigit) {
                         return None;
                     }
-                    char::from(byte)
+                    char::from(u8::from_str_radix(&String::from_iter(hex), 16).ok()?)
                 }
                 _ => return None,
             }),
@@ -585,8 +634,9 @@ fn decode_string_literal(chars: &mut impl Iterator<Item = char>) -> Option<Strin
     }
 }
 
-/// Collect the literal symbols of the union in `tokens` into `literals`.
-fn collect_union_literals(tokens: &[RevsetToken], literals: &mut HashSet<String>) {
+/// Collect the literal symbols of the union in `tokens` into `literals`,
+/// mapping each name to whether every spelling of it is a bare identifier.
+fn collect_union_literals(tokens: &[RevsetToken], literals: &mut HashMap<String, bool>) {
     let mut depth = 0_usize;
     let mut member_start = 0;
 
@@ -607,10 +657,15 @@ fn collect_union_literals(tokens: &[RevsetToken], literals: &mut HashSet<String>
 
 /// A union member is a literal when it is one symbol, or a parenthesized
 /// symbol or union.
-fn collect_member_literals(member: &[RevsetToken], literals: &mut HashSet<String>) {
+fn collect_member_literals(member: &[RevsetToken], literals: &mut HashMap<String, bool>) {
     match member {
-        [RevsetToken::Symbol(name)] => {
-            literals.insert(name.clone());
+        [RevsetToken::Identifier(name)] => {
+            literals.entry(name.clone()).or_insert(true);
+        }
+        // A string spelling names the bookmark even if a bare spelling of the
+        // same name elsewhere in the union expands an alias.
+        [RevsetToken::String(name)] => {
+            literals.insert(name.clone(), false);
         }
         [RevsetToken::LParen, inner @ .., RevsetToken::RParen] if is_balanced(inner) => {
             collect_union_literals(inner, literals);
