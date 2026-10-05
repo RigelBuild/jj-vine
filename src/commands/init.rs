@@ -13,22 +13,13 @@ use crate::{
     config::ForgeType,
     error::{Result, make_whatever},
     jj::Jujutsu,
+    remote::{self, DetectedForge},
 };
 
 mod azure;
 mod forgejo;
 mod github;
 mod gitlab;
-
-#[derive(Debug, Clone)]
-struct DetectedForge {
-    forge_type: ForgeType,
-    host: String,
-    project: String,
-
-    /// Only for Azure DevOps, the name of the repository.
-    repository_name: Option<String>,
-}
 
 #[derive(Debug, Clone)]
 struct Remotes {
@@ -213,8 +204,9 @@ fn detect_remotes(jj: &Jujutsu) -> Result<Option<Remotes>> {
         .lines()
         .map(|line| {
             line.split_whitespace()
+                .take(2)
                 .collect_tuple()
-                .ok_or_else(|| make_whatever!("Failed to parse remote line: {}", line))
+                .ok_or_else(|| make_whatever!("Failed to parse remote line"))
         })
         .collect::<Result<_>>()?;
 
@@ -225,7 +217,7 @@ fn detect_remotes(jj: &Jujutsu) -> Result<Option<Remotes>> {
     {
         return Ok(Some(Remotes {
             origin: origin.to_string(),
-            target_forge: parse_forge_url(upstream),
+            target_forge: remote::parse_forge_url(upstream),
             upstream: Some(upstream.to_string()),
         }));
     }
@@ -235,14 +227,14 @@ fn detect_remotes(jj: &Jujutsu) -> Result<Option<Remotes>> {
     {
         return Ok(Some(Remotes {
             origin: fork.to_string(),
-            target_forge: parse_forge_url(origin),
+            target_forge: remote::parse_forge_url(origin),
             upstream: Some(origin.to_string()),
         }));
     }
 
     if let Some(origin) = origin {
         return Ok(Some(Remotes {
-            target_forge: parse_forge_url(origin),
+            target_forge: remote::parse_forge_url(origin),
             origin: origin.to_string(),
             upstream: None,
         }));
@@ -251,206 +243,96 @@ fn detect_remotes(jj: &Jujutsu) -> Result<Option<Remotes>> {
     Ok(None)
 }
 
-/// Parse a forge remote URL to detect forge type, host, and project.
-fn parse_forge_url(url: &str) -> Option<DetectedForge> {
-    // SSH format: ssh://git@host:owner/repo.git
-    // or ssh://git@host/owner/repo.git
-    if url.starts_with("git@") || url.starts_with("ssh://git@") {
-        let rest = url.trim_start_matches("ssh://").strip_prefix("git@")?;
-
-        let (host, rest) = if let Some((host, rest)) = rest.split_once(':') {
-            (host, rest)
-        } else {
-            let (host, rest) = rest.split_once('/')?;
-            (host, rest)
-        };
-
-        let forge_type = ForgeType::detect_from_host(host)?;
-
-        let (project, repository_name) = match forge_type {
-            ForgeType::AzureDevOps => {
-                if let Some((_, org, project, repo)) =
-                    rest.trim_end_matches(".git").split('/').collect_tuple()
-                {
-                    (format!("{org}/{project}"), Some(repo.to_owned()))
-                } else {
-                    (rest.trim_end_matches(".git").to_owned(), None)
-                }
-            }
-            _ => (rest.trim_end_matches(".git").to_owned(), None),
-        };
-
-        let api_host = match forge_type {
-            ForgeType::GitHub if host == "github.com" => "https://api.github.com".to_owned(),
-            ForgeType::GitHub => format!("https://{host}/api/v3"),
-            ForgeType::GitLab | ForgeType::Forgejo | ForgeType::AzureDevOps => {
-                format!("https://{host}")
-            }
-        };
-
-        return Some(DetectedForge {
-            forge_type,
-            host: api_host,
-            project: project.clone(),
-            repository_name,
-        });
-    }
-
-    // HTTPS format: https://host/owner/repo.git
-    if url.starts_with("https://") || url.starts_with("http://") {
-        let without_protocol = url
-            .strip_prefix("https://")
-            .or_else(|| url.strip_prefix("http://"))?;
-
-        let (host, path) = without_protocol.split_once('/')?;
-
-        let protocol = if url.starts_with("https://") {
-            "https"
-        } else {
-            "http"
-        };
-
-        let forge_type = ForgeType::detect_from_host(host)?;
-
-        let (project, repository_name) = match forge_type {
-            ForgeType::AzureDevOps => {
-                if let Some((_, org, project, repo)) =
-                    path.trim_end_matches(".git").split('/').collect_tuple()
-                {
-                    (format!("{org}/{project}"), Some(repo.to_owned()))
-                } else {
-                    (path.trim_end_matches(".git").to_owned(), None)
-                }
-            }
-            _ => (path.trim_end_matches(".git").to_owned(), None),
-        };
-
-        let api_host = match forge_type {
-            ForgeType::GitHub if host == "github.com" => "https://api.github.com".to_owned(),
-            ForgeType::GitHub => format!("{protocol}://{host}/api/v3"),
-            ForgeType::GitLab | ForgeType::Forgejo | ForgeType::AzureDevOps => {
-                format!("{protocol}://{host}")
-            }
-        };
-
-        return Some(DetectedForge {
-            forge_type,
-            host: api_host,
-            project: project.clone(),
-            repository_name,
-        });
-    }
-
-    None
-}
-
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
+    use tempfile::TempDir;
+
     use super::*;
 
-    #[test]
-    fn parse_gitlab_url_ssh() {
-        let url = "git@gitlab.example.com:group/project.git";
-        let result = parse_forge_url(url);
-        assert!(result.is_some());
-        let detected = result.unwrap();
-        assert_eq!(detected.forge_type, ForgeType::GitLab);
-        assert_eq!(detected.host, "https://gitlab.example.com");
-        assert_eq!(detected.project, "group/project");
+    fn create_test_repo() -> (TempDir, PathBuf) {
+        let temp_dir = TempDir::new().expect("create temp directory");
+        let repo_path = temp_dir.path().join("repo");
+        std::fs::create_dir_all(&repo_path).expect("create repo directory");
+        let jj = Jujutsu::new(&repo_path).expect("create Jujutsu instance");
+        jj.exec(["git", "init", "--colocate"])
+            .expect("initialize jj repo");
+        (temp_dir, repo_path)
+    }
+
+    fn add_remote(repo_path: &Path, name: &str, url: &str) {
+        Jujutsu::new(repo_path)
+            .expect("create Jujutsu instance")
+            .exec(["git", "remote", "add", name, url])
+            .expect("add remote");
+    }
+    fn set_push_url(repo_path: &Path, name: &str, url: &str) {
+        Jujutsu::new(repo_path)
+            .expect("create Jujutsu instance")
+            .exec(["git", "remote", "set-url", name, "--push", url])
+            .expect("set push URL");
     }
 
     #[test]
-    fn parse_gitlab_url_https() {
-        let url = "https://gitlab.example.com/group/project.git";
-        let result = parse_forge_url(url);
-        assert!(result.is_some());
-        let detected = result.unwrap();
-        assert_eq!(detected.forge_type, ForgeType::GitLab);
-        assert_eq!(detected.host, "https://gitlab.example.com");
-        assert_eq!(detected.project, "group/project");
-    }
-
-    #[test]
-    fn parse_gitlab_url_nested_groups() {
-        let url = "git@gitlab.example.com:group/subgroup/project.git";
-        let result = parse_forge_url(url);
-        assert!(result.is_some());
-        let detected = result.unwrap();
-        assert_eq!(detected.forge_type, ForgeType::GitLab);
-        assert_eq!(detected.project, "group/subgroup/project");
-    }
-
-    #[test]
-    fn parse_github_url_ssh() {
-        let url = "git@github.com:owner/repo.git";
-        let result = parse_forge_url(url);
-        assert!(result.is_some());
-        let detected = result.unwrap();
-        assert_eq!(detected.forge_type, ForgeType::GitHub);
-        assert_eq!(detected.host, "https://api.github.com");
-        assert_eq!(detected.project, "owner/repo");
-    }
-
-    #[test]
-    fn parse_github_url_https() {
-        let url = "https://github.com/owner/repo.git";
-        let result = parse_forge_url(url);
-        assert!(result.is_some());
-        let detected = result.unwrap();
-        assert_eq!(detected.forge_type, ForgeType::GitHub);
-        assert_eq!(detected.host, "https://api.github.com");
-        assert_eq!(detected.project, "owner/repo");
-    }
-
-    #[test]
-    fn parse_github_enterprise_ssh() {
-        let url = "git@github.example.com:owner/repo.git";
-        let result = parse_forge_url(url);
-        assert!(result.is_some());
-        let detected = result.unwrap();
-        assert_eq!(detected.forge_type, ForgeType::GitHub);
-        assert_eq!(detected.host, "https://github.example.com/api/v3");
-        assert_eq!(detected.project, "owner/repo");
-    }
-
-    #[test]
-    fn parse_github_enterprise_https() {
-        let url = "https://github.example.com/owner/repo.git";
-        let result = parse_forge_url(url);
-        assert!(result.is_some());
-        let detected = result.unwrap();
-        assert_eq!(detected.forge_type, ForgeType::GitHub);
-        assert_eq!(detected.host, "https://github.example.com/api/v3");
-        assert_eq!(detected.project, "owner/repo");
-    }
-
-    #[test]
-    fn detect_forge_from_host_github() {
-        assert_eq!(
-            ForgeType::detect_from_host("github.com"),
-            Some(ForgeType::GitHub)
+    fn detect_remotes_uses_fetch_url_when_push_url_differs() {
+        let (_temp, repo_path) = create_test_repo();
+        add_remote(&repo_path, "origin", "git@github.com:owner/repo.git");
+        set_push_url(
+            &repo_path,
+            "origin",
+            "git@github.com:attacker/push-destination.git",
         );
+
+        let jj = Jujutsu::new(&repo_path).expect("jj");
+        let remotes = detect_remotes(&jj)
+            .expect("detect remotes")
+            .expect("origin");
+
+        assert_eq!(remotes.origin, "git@github.com:owner/repo.git");
         assert_eq!(
-            ForgeType::detect_from_host("github.example.com"),
-            Some(ForgeType::GitHub)
+            remotes.target_forge.expect("target forge").project,
+            "owner/repo"
         );
     }
 
     #[test]
-    fn detect_forge_from_host_gitlab() {
+    fn detect_remotes_selects_origin_or_upstream() {
+        let (_temp, repo_path) = create_test_repo();
+        add_remote(&repo_path, "origin", "git@github.com:person/fork.git");
+        add_remote(&repo_path, "upstream", "git@github.com:owner/repo.git");
+
+        let jj = Jujutsu::new(&repo_path).expect("jj");
+        let remotes = detect_remotes(&jj)
+            .expect("detect remotes")
+            .expect("origin");
+
+        assert_eq!(remotes.origin, "git@github.com:person/fork.git");
         assert_eq!(
-            ForgeType::detect_from_host("gitlab.com"),
-            Some(ForgeType::GitLab)
+            remotes.upstream.as_deref(),
+            Some("git@github.com:owner/repo.git")
         );
         assert_eq!(
-            ForgeType::detect_from_host("gitlab.example.com"),
-            Some(ForgeType::GitLab)
+            remotes.target_forge.expect("target forge").project,
+            "owner/repo"
         );
     }
 
     #[test]
-    fn detect_forge_from_host_unknown() {
-        assert_eq!(ForgeType::detect_from_host("git.example.com"), None);
-        assert_eq!(ForgeType::detect_from_host("code.example.com"), None);
+    fn detect_remotes_without_upstream_keeps_origin_as_source_and_target() {
+        let (_temp, repo_path) = create_test_repo();
+        add_remote(&repo_path, "origin", "git@github.com:owner/repo.git");
+
+        let jj = Jujutsu::new(&repo_path).expect("jj");
+        let remotes = detect_remotes(&jj)
+            .expect("detect remotes")
+            .expect("origin");
+
+        assert_eq!(remotes.origin, "git@github.com:owner/repo.git");
+        assert_eq!(remotes.upstream, None);
+        assert_eq!(
+            remotes.target_forge.expect("target forge").project,
+            "owner/repo"
+        );
     }
 }
