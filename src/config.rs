@@ -4,7 +4,6 @@ use std::path::PathBuf;
 
 use bon::Builder;
 use serde::{Deserialize, de::Visitor};
-use toml::Table;
 
 use crate::{
     error::{ConfigSnafu, Error, Result},
@@ -951,26 +950,40 @@ impl Default for DescriptionDiagramConfig {
     }
 }
 
-/// Read repo-layer GitHub config values, excluding the user/global config.
-/// Failures are best-effort and leave values eligible for remote detection.
-fn repo_layer_values(jj: &Jujutsu) -> Table {
-    let Ok(output) = jj.exec(["config", "list", "--repo"]) else {
-        return Table::new();
+/// Default GitHub API URL when no host is configured or derived.
+const GITHUB_DEFAULT_API_HOST: &str = "https://api.github.com";
+
+/// Names (`jj-vine.github.<key>`) whose effective value comes from the repo
+/// or workspace layer. Such values are explicit for this clone; values from
+/// the user/global layer are not. Only names and layer sources are read, so
+/// config values such as tokens never enter this output. Failures are
+/// best-effort and leave values eligible for remote detection.
+fn clone_layer_keys(jj: &Jujutsu) -> Vec<String> {
+    let Ok(output) = jj.exec([
+        "config",
+        "list",
+        "--template",
+        r#"name ++ "\t" ++ source ++ "\n""#,
+        "jj-vine.github",
+    ]) else {
+        return Vec::new();
     };
-    toml::from_str::<Table>(&output.stdout)
-        .ok()
-        .and_then(|table| table.get("jj-vine").cloned())
-        .and_then(|jj_vine| jj_vine.get("github").cloned())
-        .and_then(|github| github.as_table().cloned())
-        .unwrap_or_default()
+    output
+        .stdout
+        .lines()
+        .filter_map(|line| line.split_once('\t'))
+        .filter(|(_, source)| matches!(*source, "repo" | "workspace"))
+        .map(|(name, _)| name.to_owned())
+        .collect()
 }
 
-/// A non-empty repo-level value takes precedence over clone-derived values.
-fn repo_layer_nonempty(github: &Table, key: &str) -> bool {
-    github
-        .get(key)
-        .and_then(toml::Value::as_str)
-        .is_some_and(|value| !value.is_empty())
+/// A non-empty effective value from the repo or workspace layer takes
+/// precedence over clone-derived values.
+fn clone_layer_nonempty(clone_keys: &[String], key: &str, value: &str) -> bool {
+    !value.is_empty()
+        && clone_keys
+            .iter()
+            .any(|name| name.strip_prefix("jj-vine.github.") == Some(key))
 }
 
 impl Config {
@@ -1005,12 +1018,13 @@ impl Config {
             .build()
         })?;
 
-        // Repo-explicit values win; otherwise clone-derived values supersede
-        // global config. Empty repo values collapse into the derive path.
+        // Repo- or workspace-explicit values win; otherwise clone-derived
+        // values supersede global config. Empty values collapse into the
+        // derive path.
         if config.forge == ForgeType::GitHub {
-            let repo_layer = repo_layer_values(jj);
-            let project_set = repo_layer_nonempty(&repo_layer, "project");
-            let host_set = repo_layer_nonempty(&repo_layer, "host");
+            let clone_keys = clone_layer_keys(jj);
+            let project_set = clone_layer_nonempty(&clone_keys, "project", &config.github.project);
+            let host_set = clone_layer_nonempty(&clone_keys, "host", &config.github.host);
             if (!project_set || !host_set)
                 && let Some(detected) =
                     crate::remote::detect_project(jj, &config.remote_name, ForgeType::GitHub)
@@ -1021,6 +1035,9 @@ impl Config {
                 if !host_set {
                     config.github.host = detected.host;
                 }
+            }
+            if config.github.host.is_empty() {
+                GITHUB_DEFAULT_API_HOST.clone_into(&mut config.github.host);
             }
         }
 
@@ -1282,6 +1299,75 @@ mod tests {
         };
 
         assert!(message.contains("auto-detection from the 'origin' remote"));
+    }
+
+    fn set_workspace_config(repo_path: &Path, key: &str, value: &str) {
+        isolated_jj(repo_path)
+            .expect("Failed to create Jujutsu instance")
+            .exec(["config", "set", "--workspace", key, value])
+            .expect("Failed to set workspace config");
+    }
+
+    #[test]
+    fn derive_preserves_workspace_explicit_values() {
+        let (_temp, repo_path) = create_test_repo();
+        seed_github_config(&repo_path);
+        set_workspace_config(&repo_path, "jj-vine.github.project", "workspace/repo");
+        set_workspace_config(
+            &repo_path,
+            "jj-vine.github.host",
+            "https://ghe.example/api/v3",
+        );
+        add_git_remote(&repo_path, "origin", "git@github.com:owner/remote.git");
+
+        let config = load_isolated(&repo_path).expect("load config with workspace values");
+
+        assert_eq!(config.github.project, "workspace/repo");
+        assert_eq!(config.github.host, "https://ghe.example/api/v3");
+    }
+
+    #[test]
+    fn derive_workspace_empty_overrides_repo_value() {
+        let (_temp, repo_path) = create_test_repo();
+        seed_github_config(&repo_path);
+        set_repo_config(&repo_path, "jj-vine.github.project", "repo/value");
+        set_workspace_config(&repo_path, "jj-vine.github.project", "");
+        add_git_remote(&repo_path, "origin", "git@github.com:owner/remote.git");
+
+        let config = load_isolated(&repo_path).expect("load config from GitHub remote");
+
+        // The effective workspace value is empty, so it collapses to absent.
+        assert_eq!(config.github.project, "owner/remote");
+    }
+
+    #[test]
+    fn missing_host_defaults_when_derivation_unavailable() {
+        let (_temp, repo_path) = create_test_repo();
+        seed_github_config(&repo_path);
+        set_repo_config(&repo_path, "jj-vine.github.project", "owner/repo");
+        add_git_remote(&repo_path, "origin", "git@github.com:person/fork.git");
+        add_git_remote(&repo_path, "upstream", "git@github.com:owner/repo.git");
+
+        let config = load_isolated(&repo_path).expect("fenced fork with explicit project");
+
+        assert_eq!(config.github.project, "owner/repo");
+        assert_eq!(config.github.host, "https://api.github.com");
+    }
+
+    #[test]
+    fn missing_host_keeps_global_value_when_derivation_unavailable() {
+        let (temp, repo_path) = create_test_repo();
+        seed_github_config(&repo_path);
+        std::fs::write(
+            temp.path().join(ISOLATED_TEST_CONFIG),
+            "[jj-vine.github]\nhost = \"https://ghe.example/api/v3\"\n",
+        )
+        .expect("write user-level GitHub host");
+        set_repo_config(&repo_path, "jj-vine.github.project", "owner/repo");
+
+        let config = load_isolated(&repo_path).expect("load without a remote");
+
+        assert_eq!(config.github.host, "https://ghe.example/api/v3");
     }
 
     /// Verify `JJ_CONFIG` both supplies and replaces the user config layer.

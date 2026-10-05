@@ -17,104 +17,167 @@ pub(crate) struct DetectedForge {
     pub(crate) repository_name: Option<String>,
 }
 
+/// Transport of a parsed remote URL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Transport {
+    Ssh,
+    Http,
+    Https,
+}
+
+/// The parts of a remote URL that forge detection uses. Userinfo is never
+/// kept, so no field can carry a credential embedded in the remote.
+#[derive(Debug)]
+struct RemoteUrl<'a> {
+    transport: Transport,
+    hostname: &'a str,
+    port: Option<u16>,
+    path: &'a str,
+}
+
+impl<'a> RemoteUrl<'a> {
+    /// Parse `git@host:path`, `ssh://git@host[:port]/path`, or
+    /// `http[s]://[userinfo@]host[:port]/path`.
+    fn parse(url: &'a str) -> Option<Self> {
+        if let Some(rest) = url.strip_prefix("ssh://") {
+            let (authority, path) = rest.split_once('/')?;
+            let host_port = authority.strip_prefix("git@")?;
+            let (hostname, port) = split_host_port(host_port)?;
+            return Some(Self {
+                transport: Transport::Ssh,
+                hostname,
+                port,
+                path,
+            });
+        }
+
+        if let Some(rest) = url.strip_prefix("git@") {
+            // scp-like syntax has no port; the text after ':' is the path.
+            let (hostname, path) = rest.split_once(':')?;
+            return Some(Self {
+                transport: Transport::Ssh,
+                hostname: valid_hostname(hostname)?,
+                port: None,
+                path,
+            });
+        }
+
+        let (transport, rest) = if let Some(rest) = url.strip_prefix("https://") {
+            (Transport::Https, rest)
+        } else {
+            (Transport::Http, url.strip_prefix("http://")?)
+        };
+        // A query or fragment has no meaning for a clone URL.
+        if rest.contains(['?', '#']) {
+            return None;
+        }
+        let (authority, path) = rest.split_once('/')?;
+        // Userinfo ends at the last '@'; the host is only what follows it.
+        let host_port = authority
+            .rsplit_once('@')
+            .map_or(authority, |(_, host_port)| host_port);
+        let (hostname, port) = split_host_port(host_port)?;
+        Some(Self {
+            transport,
+            hostname,
+            port,
+            path,
+        })
+    }
+
+    /// Origin (`scheme://host[:port]`) of the forge web service. An SSH port
+    /// belongs to the Git transport, so SSH remotes map to default HTTPS.
+    fn web_origin(&self) -> String {
+        match (self.transport, self.port) {
+            (Transport::Ssh, _) => format!("https://{}", self.hostname),
+            (Transport::Http, None) => format!("http://{}", self.hostname),
+            (Transport::Http, Some(port)) => format!("http://{}:{port}", self.hostname),
+            (Transport::Https, None) => format!("https://{}", self.hostname),
+            (Transport::Https, Some(port)) => format!("https://{}:{port}", self.hostname),
+        }
+    }
+}
+
+/// Split `host[:port]`. A present port must be a valid, non-empty `u16`.
+fn split_host_port(host_port: &str) -> Option<(&str, Option<u16>)> {
+    match host_port.split_once(':') {
+        Some((hostname, port)) => Some((valid_hostname(hostname)?, Some(port.parse().ok()?))),
+        None => Some((valid_hostname(host_port)?, None)),
+    }
+}
+
+/// Accept a DNS-style hostname only: no userinfo, port, brackets, or path.
+fn valid_hostname(hostname: &str) -> Option<&str> {
+    let valid = !hostname.is_empty()
+        && hostname
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'.');
+    valid.then_some(hostname)
+}
+
+/// Strip `.git` and one trailing `/`, then require at least two non-empty
+/// path segments.
+fn project_path(path: &str) -> Option<&str> {
+    let path = path.strip_suffix('/').unwrap_or(path);
+    let path = path.strip_suffix(".git").unwrap_or(path);
+    let segments_valid = path.contains('/') && path.split('/').all(|segment| !segment.is_empty());
+    segments_valid.then_some(path)
+}
+
 /// Parse a forge remote URL to detect forge type, host, and project.
 pub(crate) fn parse_forge_url(url: &str) -> Option<DetectedForge> {
-    // SSH format: git@host:owner/repo.git or ssh://git@host/owner/repo.git
-    if url.starts_with("git@") || url.starts_with("ssh://git@") {
-        let rest = url.trim_start_matches("ssh://").strip_prefix("git@")?;
+    let remote = RemoteUrl::parse(url)?;
+    let forge_type = ForgeType::detect_from_host(remote.hostname)?;
+    let path = project_path(remote.path)?;
 
-        let (host, rest) = if let Some((host, rest)) = rest.split_once(':') {
-            (host, rest)
-        } else {
-            let (host, rest) = rest.split_once('/')?;
-            (host, rest)
-        };
-
-        let forge_type = ForgeType::detect_from_host(host)?;
-        let (project, repository_name) = match forge_type {
-            ForgeType::AzureDevOps => {
-                if let Some((_, org, project, repo)) =
-                    rest.trim_end_matches(".git").split('/').collect_tuple()
-                {
-                    (format!("{org}/{project}"), Some(repo.to_owned()))
-                } else {
-                    (rest.trim_end_matches(".git").to_owned(), None)
-                }
+    let (project, repository_name) = match forge_type {
+        ForgeType::AzureDevOps => {
+            if let Some((_, org, project, repo)) = path.split('/').collect_tuple() {
+                (format!("{org}/{project}"), Some(repo.to_owned()))
+            } else {
+                (path.to_owned(), None)
             }
-            _ => (rest.trim_end_matches(".git").to_owned(), None),
-        };
+        }
+        ForgeType::GitHub | ForgeType::GitLab | ForgeType::Forgejo => (path.to_owned(), None),
+    };
 
-        let api_host = match forge_type {
-            ForgeType::GitHub if host == "github.com" => "https://api.github.com".to_owned(),
-            ForgeType::GitHub => format!("https://{host}/api/v3"),
-            ForgeType::GitLab | ForgeType::Forgejo | ForgeType::AzureDevOps => {
-                format!("https://{host}")
-            }
-        };
+    let host = match forge_type {
+        ForgeType::GitHub if remote.hostname == "github.com" => {
+            "https://api.github.com".to_owned()
+        }
+        ForgeType::GitHub => format!("{}/api/v3", remote.web_origin()),
+        ForgeType::GitLab | ForgeType::Forgejo | ForgeType::AzureDevOps => remote.web_origin(),
+    };
 
-        return Some(DetectedForge {
-            forge_type,
-            host: api_host,
-            project,
-            repository_name,
-        });
-    }
+    Some(DetectedForge {
+        forge_type,
+        host,
+        project,
+        repository_name,
+    })
+}
 
-    // HTTP(S) format: https://host/owner/repo.git
-    if url.starts_with("https://") || url.starts_with("http://") {
-        let without_protocol = url
-            .strip_prefix("https://")
-            .or_else(|| url.strip_prefix("http://"))?;
-        let (host, path) = without_protocol.split_once('/')?;
-        let protocol = if url.starts_with("https://") {
-            "https"
-        } else {
-            "http"
-        };
-        let forge_type = ForgeType::detect_from_host(host)?;
-
-        let (project, repository_name) = match forge_type {
-            ForgeType::AzureDevOps => {
-                if let Some((_, org, project, repo)) =
-                    path.trim_end_matches(".git").split('/').collect_tuple()
-                {
-                    (format!("{org}/{project}"), Some(repo.to_owned()))
-                } else {
-                    (path.trim_end_matches(".git").to_owned(), None)
-                }
-            }
-            _ => (path.trim_end_matches(".git").to_owned(), None),
-        };
-
-        let api_host = match forge_type {
-            ForgeType::GitHub if host == "github.com" => "https://api.github.com".to_owned(),
-            ForgeType::GitHub => format!("{protocol}://{host}/api/v3"),
-            ForgeType::GitLab | ForgeType::Forgejo | ForgeType::AzureDevOps => {
-                format!("{protocol}://{host}")
-            }
-        };
-
-        return Some(DetectedForge {
-            forge_type,
-            host: api_host,
-            project,
-            repository_name,
-        });
-    }
-
-    None
+/// One `jj git remote list` entry: `<name> <fetch-url>`, optionally followed
+/// by ` (push: <push-url>)`. Returns the name and the fetch URL.
+fn parse_remote_list_line(line: &str) -> Option<(&str, &str)> {
+    let mut fields = line.split_whitespace();
+    let name = fields.next()?;
+    let fetch_url = fields.next()?;
+    Some((name, fetch_url))
 }
 
 /// Derive forge details for the configured remote. Returns `None` for an
 /// absent or unrecognized remote, a different forge type, or a clone with a
 /// separate `upstream` remote. Detection is best-effort so config validation
 /// can report a missing project instead of failing on remote inspection.
+///
+/// Remote URLs can embed credentials, so they are never logged.
 pub(crate) fn detect_project(
     jj: &Jujutsu,
     remote_name: &str,
     forge_type: ForgeType,
 ) -> Option<DetectedForge> {
-    let output = match jj.exec(["git", "remote", "list"]) {
+    let output = match jj.exec_redacted(["git", "remote", "list"]) {
         Ok(output) => output,
         Err(error) => {
             debug!("remote derivation: `jj git remote list` failed: {error}");
@@ -124,10 +187,7 @@ pub(crate) fn detect_project(
 
     let mut remote_url = None;
     let mut has_upstream = false;
-    for line in output.stdout.lines() {
-        let Some((name, url)) = line.split_whitespace().collect_tuple() else {
-            continue;
-        };
+    for (name, url) in output.stdout.lines().filter_map(parse_remote_list_line) {
         if name == remote_name {
             remote_url = Some(url);
         }
@@ -233,6 +293,54 @@ mod tests {
         assert!(parse_forge_url("git@git.example.com:owner/repo.git").is_none());
     }
 
+    #[test]
+    fn parse_ssh_url_with_port_keeps_project_path() {
+        let detected = parse_forge_url("ssh://git@github.example.com:2222/owner/repo.git")
+            .expect("port-bearing SSH URL");
+        assert_eq!(detected.forge_type, ForgeType::GitHub);
+        assert_eq!(detected.project, "owner/repo");
+        // The SSH port is not the API port.
+        assert_eq!(detected.host, "https://github.example.com/api/v3");
+    }
+
+    #[test]
+    fn parse_https_url_strips_userinfo_from_host() {
+        let detected = parse_forge_url("https://user:s3cret@github.com/owner/repo.git")
+            .expect("credential-bearing HTTPS URL");
+        assert_eq!(detected.forge_type, ForgeType::GitHub);
+        assert_eq!(detected.host, "https://api.github.com");
+        assert_eq!(detected.project, "owner/repo");
+    }
+
+    #[test]
+    fn parse_https_enterprise_userinfo_never_reaches_api_host() {
+        let detected = parse_forge_url("https://token@github.example.com:8443/owner/repo.git")
+            .expect("credential-bearing Enterprise URL");
+        assert_eq!(detected.host, "https://github.example.com:8443/api/v3");
+        assert_eq!(detected.project, "owner/repo");
+    }
+
+    #[test]
+    fn parse_https_userinfo_does_not_select_forge() {
+        // The real host is attacker.example; "github.com" is only userinfo.
+        assert!(parse_forge_url("https://github.com@attacker.example/owner/repo.git").is_none());
+    }
+
+    #[test]
+    fn parse_rejects_malformed_authority_and_path() {
+        for url in [
+            "https:///owner/repo.git",
+            "https://github.com:notaport/owner/repo.git",
+            "https://github.com/",
+            "https://github.com/owner//repo.git",
+            "https://github.com/owner/repo.git?x=1",
+            "ssh://git@github.com:/owner/repo.git",
+            "git@github.com:",
+        ] {
+            assert!(parse_forge_url(url).is_none(), "must reject {url}");
+        }
+    }
+
     use std::path::{Path, PathBuf};
 
     use tempfile::TempDir;
@@ -294,6 +402,99 @@ mod tests {
         add_remote(&repo_path, "upstream", "git@github.com:owner/repo.git");
         let jj = Jujutsu::new(&repo_path).expect("jj");
         assert!(detect_project(&jj, "origin", ForgeType::GitHub).is_none());
+    }
+
+    fn set_push_url(repo_path: &Path, name: &str, url: &str) {
+        Jujutsu::new(repo_path)
+            .expect("create Jujutsu instance")
+            .exec(["git", "remote", "set-url", name, "--push", url])
+            .expect("set push URL");
+    }
+
+    #[test]
+    fn detect_remote_with_separate_push_url() {
+        let (_temp, repo_path) = create_test_repo();
+        add_remote(&repo_path, "origin", "git@github.com:owner/repo.git");
+        set_push_url(&repo_path, "origin", "git@github.com:owner/push.git");
+        let jj = Jujutsu::new(&repo_path).expect("jj");
+        let detected = detect_project(&jj, "origin", ForgeType::GitHub).expect("detect remote");
+        assert_eq!(detected.project, "owner/repo");
+    }
+
+    #[test]
+    fn detect_fence_applies_when_upstream_has_push_url() {
+        let (_temp, repo_path) = create_test_repo();
+        add_remote(&repo_path, "origin", "git@github.com:person/fork.git");
+        add_remote(&repo_path, "upstream", "git@github.com:owner/repo.git");
+        set_push_url(&repo_path, "upstream", "DISABLE");
+        let jj = Jujutsu::new(&repo_path).expect("jj");
+        assert!(detect_project(&jj, "origin", ForgeType::GitHub).is_none());
+    }
+
+    /// Captures every tracing event at TRACE level into a shared buffer.
+    #[derive(Clone, Default)]
+    struct CapturedLogs(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLogs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("log buffer").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl CapturedLogs {
+        fn capture(&self, f: impl FnOnce()) -> String {
+            let writer = self.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::TRACE)
+                .with_writer(move || writer.clone())
+                .finish();
+            tracing::subscriber::with_default(subscriber, f);
+            String::from_utf8(self.0.lock().expect("log buffer").clone()).expect("utf-8 logs")
+        }
+    }
+
+    #[test]
+    fn detect_never_traces_remote_userinfo() {
+        let (_temp, repo_path) = create_test_repo();
+        add_remote(
+            &repo_path,
+            "origin",
+            "https://user:s3cret-token@github.com/owner/repo.git",
+        );
+        let jj = Jujutsu::new(&repo_path).expect("jj");
+
+        let logs = CapturedLogs::default().capture(|| {
+            let detected = detect_project(&jj, "origin", ForgeType::GitHub).expect("detect");
+            assert_eq!(detected.project, "owner/repo");
+        });
+
+        // The subscriber must observe the command, or the check proves nothing.
+        assert!(logs.contains("git remote list"), "trace capture is live: {logs}");
+        assert!(!logs.contains("s3cret-token"), "remote userinfo leaked: {logs}");
+    }
+
+    #[test]
+    fn detect_failure_never_traces_remote_userinfo() {
+        let (_temp, repo_path) = create_test_repo();
+        add_remote(
+            &repo_path,
+            "origin",
+            "https://user:s3cret-token@github.com/owner/repo.git",
+        );
+        let jj = Jujutsu::new(&repo_path).expect("jj");
+
+        // A forge mismatch exercises the not-derived path after listing.
+        let logs = CapturedLogs::default().capture(|| {
+            assert!(detect_project(&jj, "origin", ForgeType::GitLab).is_none());
+        });
+
+        assert!(logs.contains("git remote list"), "trace capture is live: {logs}");
+        assert!(!logs.contains("s3cret-token"), "remote userinfo leaked: {logs}");
     }
 
     #[test]
