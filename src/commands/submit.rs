@@ -238,12 +238,7 @@ pub async fn submit(config: &SubmitCommandConfig, cli_config: &CliConfig<'_>) ->
             .join(", ")
     ));
 
-    let changes = find_changes_to_submit(
-        &jj,
-        bookmarks.iter().map(BookmarkOrPending::change_id),
-        literal_bookmark_targets(&revset, &bookmarks),
-        &pending_bookmarks,
-    )?;
+    let changes = select_changes_to_submit(&jj, &revset, &bookmarks, &pending_bookmarks)?;
 
     ensure_whatever!(
         !changes.is_empty(),
@@ -426,29 +421,219 @@ pub async fn submit(config: &SubmitCommandConfig, cli_config: &CliConfig<'_>) ->
     Ok(())
 }
 
-/// Change IDs of the resolved `bookmarks` that the user named literally in
-/// `revset`: a bare or double-quoted bookmark name, alone or in a `|` union.
-/// Only these bypass the `mine()` filter. A generalized revset such as
-/// `bookmarks()` or `mine() & tracked_remote_bookmarks()` names no bookmark,
-/// so its targets stay subject to `mine()`.
+/// Resolve the full set of changes to submit for `revset` from its resolved
+/// `bookmarks`, applying the named-bookmark bypass.
+pub(crate) fn select_changes_to_submit(
+    jj: &Jujutsu,
+    revset: &str,
+    bookmarks: &[BookmarkOrPending<'_>],
+    pending_bookmarks: &HashSet<String>,
+) -> Result<Vec<crate::jj::Change>> {
+    find_changes_to_submit(
+        jj,
+        bookmarks.iter().map(BookmarkOrPending::change_id),
+        literal_bookmark_targets(revset, bookmarks),
+        pending_bookmarks,
+    )
+}
+
+/// Names of the resolved `bookmarks` that the user named literally in
+/// `revset`. Only these bypass the `mine()` filter.
+///
+/// A name counts as literal when it is a member of the revset's top-level
+/// union, spelled as a bare identifier, a `"string"`, or a `'raw string'`,
+/// optionally inside parentheses or a nested parenthesized union. Every
+/// other member — a function call, pattern, range, operator expression, or
+/// anything this recognizer does not understand — is generalized, so the
+/// bookmarks it selects stay subject to `mine()`.
 pub(crate) fn literal_bookmark_targets<'b>(
     revset: &str,
     bookmarks: &'b [BookmarkOrPending<'_>],
 ) -> impl Iterator<Item = &'b str> {
-    let literal_names: HashSet<&str> = revset
-        .split('|')
-        .map(str::trim)
-        .map(|atom| {
-            atom.strip_prefix('"')
-                .and_then(|quoted| quoted.strip_suffix('"'))
-                .unwrap_or(atom)
-        })
-        .collect();
+    let mut literal_names = HashSet::new();
+    collect_union_literals(&tokenize_revset(revset), &mut literal_names);
 
     bookmarks
         .iter()
         .filter(move |bookmark| bookmark.is_bookmark() && literal_names.contains(bookmark.name()))
-        .map(BookmarkOrPending::change_id)
+        .map(BookmarkOrPending::name)
+}
+
+/// The few revset tokens that decide whether a union member is a literal.
+#[derive(Debug, PartialEq, Eq)]
+enum RevsetToken {
+    /// A bare identifier or a decoded string literal.
+    Symbol(String),
+    LParen,
+    RParen,
+    Union,
+    /// Any other token. A member containing one is not a literal.
+    Other,
+}
+
+/// Tokenize `revset` per jj's revset grammar (`revset.pest`), only as far as
+/// recognizing symbol unions requires. Input that would not parse as a jj
+/// symbol becomes [`RevsetToken::Other`], which never yields a literal.
+fn tokenize_revset(revset: &str) -> Vec<RevsetToken> {
+    let mut tokens = Vec::new();
+    let mut chars = revset.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        let token = match c {
+            ' ' | '\t' | '\r' | '\n' | '\x0c' => continue,
+            '(' => RevsetToken::LParen,
+            ')' => RevsetToken::RParen,
+            '|' => RevsetToken::Union,
+            '"' => {
+                decode_string_literal(&mut chars).map_or(RevsetToken::Other, RevsetToken::Symbol)
+            }
+            '\'' => {
+                let mut content = String::new();
+                let mut is_closed = false;
+                for next in chars.by_ref() {
+                    if next == '\'' {
+                        is_closed = true;
+                        break;
+                    }
+                    content.push(next);
+                }
+                if is_closed {
+                    RevsetToken::Symbol(content)
+                } else {
+                    RevsetToken::Other
+                }
+            }
+            c if is_identifier_char(c) => {
+                let mut identifier = String::from(c);
+                while let Some(&next) = chars.peek()
+                    && is_identifier_char(next)
+                {
+                    identifier.push(next);
+                    chars.next();
+                }
+                if is_valid_identifier(&identifier) {
+                    RevsetToken::Symbol(identifier)
+                } else {
+                    RevsetToken::Other
+                }
+            }
+            _ => RevsetToken::Other,
+        };
+        tokens.push(token);
+    }
+
+    tokens
+}
+
+/// Characters a bare jj identifier may contain. jj allows any `XID_CONTINUE`
+/// character; this accepts the alphanumeric subset, so a rarer identifier
+/// tokenizes as [`RevsetToken::Other`] and only loses the bypass.
+fn is_identifier_char(c: char) -> bool {
+    c.is_alphanumeric() || matches!(c, '_' | '*' | '/' | '.' | '-' | '+')
+}
+
+/// jj's `identifier` rule: parts joined by `.`, a run of `-`, or `+`. Anything
+/// else (`a..b`, `a-`, `a+-`) is an operator expression, not a symbol.
+fn is_valid_identifier(identifier: &str) -> bool {
+    let is_separator = |c: char| matches!(c, '.' | '-' | '+');
+    let mut previous_separator: Option<char> = None;
+
+    for (index, c) in identifier.chars().enumerate() {
+        if is_separator(c) {
+            let joins_dashes = c == '-' && previous_separator == Some('-');
+            if index == 0 || (previous_separator.is_some() && !joins_dashes) {
+                return false;
+            }
+            previous_separator = Some(c);
+        } else {
+            previous_separator = None;
+        }
+    }
+
+    previous_separator.is_none()
+}
+
+/// Decode a `"..."` literal whose opening quote was already consumed, using
+/// jj's escapes. Returns `None` for an escape jj rejects or a missing close.
+fn decode_string_literal(chars: &mut impl Iterator<Item = char>) -> Option<String> {
+    let mut decoded = String::new();
+
+    loop {
+        match chars.next()? {
+            '"' => return Some(decoded),
+            '\\' => decoded.push(match chars.next()? {
+                't' => '\t',
+                'r' => '\r',
+                'n' => '\n',
+                '0' => '\0',
+                'e' => '\x1b',
+                '"' => '"',
+                '\\' => '\\',
+                'x' => {
+                    let hex: String = chars.by_ref().take(2).collect();
+                    let byte = u8::from_str_radix(&hex, 16).ok()?;
+                    // jj only accepts escapes that keep the string valid UTF-8.
+                    if !byte.is_ascii() {
+                        return None;
+                    }
+                    char::from(byte)
+                }
+                _ => return None,
+            }),
+            c => decoded.push(c),
+        }
+    }
+}
+
+/// Collect the literal symbols of the union in `tokens` into `literals`.
+fn collect_union_literals(tokens: &[RevsetToken], literals: &mut HashSet<String>) {
+    let mut depth = 0_usize;
+    let mut member_start = 0;
+
+    for (index, token) in tokens.iter().enumerate() {
+        match token {
+            RevsetToken::LParen => depth = depth.saturating_add(1),
+            RevsetToken::RParen => depth = depth.saturating_sub(1),
+            RevsetToken::Union if depth == 0 => {
+                collect_member_literals(&tokens[member_start..index], literals);
+                member_start = index.saturating_add(1);
+            }
+            _ => {}
+        }
+    }
+
+    collect_member_literals(&tokens[member_start..], literals);
+}
+
+/// A union member is a literal when it is one symbol, or a parenthesized
+/// symbol or union.
+fn collect_member_literals(member: &[RevsetToken], literals: &mut HashSet<String>) {
+    match member {
+        [RevsetToken::Symbol(name)] => {
+            literals.insert(name.clone());
+        }
+        [RevsetToken::LParen, inner @ .., RevsetToken::RParen] if is_balanced(inner) => {
+            collect_union_literals(inner, literals);
+        }
+        _ => {}
+    }
+}
+
+/// Whether `tokens` never closes a parenthesis it did not open, so stripping
+/// an outer pair around it removes a matching pair (rejects `(a) | (b)`).
+fn is_balanced(tokens: &[RevsetToken]) -> bool {
+    let mut depth = 0_usize;
+    for token in tokens {
+        match token {
+            RevsetToken::LParen => depth = depth.saturating_add(1),
+            RevsetToken::RParen => match depth.checked_sub(1) {
+                Some(next) => depth = next,
+                None => return false,
+            },
+            _ => {}
+        }
+    }
+    depth == 0
 }
 
 fn render_stack_link_outcome(

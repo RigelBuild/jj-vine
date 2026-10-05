@@ -11,7 +11,7 @@ use assertables::{
 
 use crate::{
     bookmark::{Bookmark, BookmarkGraph, BookmarkOrPending, BookmarkRef},
-    commands::submit::literal_bookmark_targets,
+    commands::submit::select_changes_to_submit,
     error::Result,
     submit::find_changes_to_submit,
     tests::TestRepo,
@@ -288,8 +288,8 @@ fn as_current_user(repo: &TestRepo<TestRepo<()>>) {
     repo.set_config("user.name", "Current User");
 }
 
-/// Mirrors the selection in `commands::submit::submit`: resolve the revset,
-/// find the changes to submit, and build the graph from them.
+/// Runs the production selection in `commands::submit::submit`: resolve the
+/// revset, then select the changes to submit from its bookmarks.
 fn submission_changes(
     repo: &TestRepo<TestRepo<()>>,
     revset: &str,
@@ -298,12 +298,7 @@ fn submission_changes(
     let bookmarks: Vec<_> = BookmarkOrPending::from_changes(&changes)
         .into_iter()
         .collect();
-    find_changes_to_submit(
-        &repo.jj,
-        bookmarks.iter().map(BookmarkOrPending::change_id),
-        literal_bookmark_targets(revset, &bookmarks),
-        &HashSet::<String>::new(),
-    )
+    select_changes_to_submit(&repo.jj, revset, &bookmarks, &HashSet::new())
 }
 
 fn sorted_names(changes: &[crate::jj::Change]) -> Vec<String> {
@@ -412,6 +407,120 @@ fn named_foreign_bookmark_builds_graph() -> Result<()> {
         let target = graph.find_bookmark_in_components("foreign-1").unwrap();
         assert_eq!(target.parents, vec![]);
     }
+
+    Ok(())
+}
+
+#[test]
+fn literal_spellings_of_foreign_bookmarks_bypass_mine() -> Result<()> {
+    let repo = TestRepo::with_local_remote();
+    as_current_user(&repo);
+
+    // main -> "a|b" (foreign) ; main -> foreign-2 (foreign) ; main -> x(y)
+    // (foreign)
+    repo.jj.exec(["new", "main"])?;
+    repo.create_change("p.txt", "p", "Pipe")
+        .create_bookmark("a|b");
+    make_foreign(&repo)?;
+    repo.jj.exec(["new", "main"])?;
+    repo.create_change("f.txt", "f", "Foreign")
+        .create_bookmark("foreign-2");
+    make_foreign(&repo)?;
+    repo.jj.exec(["new", "main"])?;
+    repo.create_change("x.txt", "x", "Parens")
+        .create_bookmark("x(y)");
+    make_foreign(&repo)?;
+
+    let cases: [(&str, &[&str]); 7] = [
+        (r#""a|b""#, &["a|b"]),
+        ("'a|b'", &["a|b"]),
+        ("(foreign-2)", &["foreign-2"]),
+        ("'foreign-2'", &["foreign-2"]),
+        (r#"( "a|b" | (foreign-2) )"#, &["a|b", "foreign-2"]),
+        (r#""x(y)" | foreign-2"#, &["foreign-2", "x(y)"]),
+        (r#"foreign-2 | bookmarks(exact:"a|b")"#, &["foreign-2"]),
+    ];
+    for (revset, expected) in cases {
+        let changes = submission_changes(&repo, revset)?;
+        assert_eq!(sorted_names(&changes), expected, "revset {revset}");
+    }
+
+    Ok(())
+}
+
+#[test]
+fn named_bypass_excludes_coworker_bookmark_on_same_change() -> Result<()> {
+    let repo = TestRepo::with_local_remote();
+    as_current_user(&repo);
+
+    // main -> shared (foreign), carrying both `named` and `coworker`.
+    repo.jj.exec(["new", "main"])?;
+    repo.create_change("s.txt", "s", "Shared")
+        .create_bookmark("named")
+        .create_bookmark("coworker");
+    make_foreign(&repo)?;
+
+    let changes = submission_changes(&repo, "named")?;
+    assert_eq!(sorted_names(&changes), vec!["named".to_owned()]);
+
+    let graph = BookmarkGraph::from_changes(&repo.jj, &changes, false)?;
+    assert_some!(graph.find_bookmark_in_components("named"));
+    assert_none!(graph.find_bookmark_in_components("coworker"));
+
+    Ok(())
+}
+
+#[test]
+fn generalized_selectors_of_foreign_bookmark_keep_mine_filter() -> Result<()> {
+    let repo = TestRepo::with_local_remote();
+    as_current_user(&repo);
+
+    repo.jj.exec(["new", "main"])?;
+    repo.create_change("f.txt", "f", "Foreign")
+        .create_bookmark("foreign-1");
+    make_foreign(&repo)?;
+
+    // Each selector resolves to `foreign-1` without naming it as a union member.
+    for revset in [
+        r#"bookmarks(exact:"foreign-1")"#,
+        "present(foreign-1)",
+        "foreign-1 & bookmarks()",
+        "(foreign-1 & bookmarks()) | none()",
+        "foreign-1 ~ none()",
+        "foreign-1+-",
+    ] {
+        let changes = submission_changes(&repo, revset)?;
+        assert_is_empty!(changes, "revset {revset}");
+    }
+
+    Ok(())
+}
+
+#[test]
+fn dropped_generalized_target_does_not_seed_ancestry() -> Result<()> {
+    let repo = TestRepo::with_local_remote();
+    as_current_user(&repo);
+
+    // main -> wip-x (mine) -> team-cw (foreign)
+    repo.jj.exec(["new", "main"])?;
+    repo.create_change("w.txt", "w", "Wip")
+        .create_bookmark("wip-x");
+    repo.jj.exec(["new"])?;
+    repo.create_change("t.txt", "t", "Team")
+        .create_bookmark("team-cw");
+    make_foreign(&repo)?;
+
+    // The selector resolves only to the foreign `team-cw`, which `mine()`
+    // drops; its own ancestor `wip-x` was never selected.
+    let changes = submission_changes(&repo, r#"bookmarks(glob:"team-*")"#)?;
+    assert_is_empty!(changes);
+
+    // Naming the foreign bookmark still submits it with the user's ancestors.
+    let changes = submission_changes(&repo, "team-cw")?;
+    assert_eq!(
+        sorted_names(&changes),
+        vec!["team-cw".to_owned(), "wip-x".to_owned()]
+    );
 
     Ok(())
 }
