@@ -86,7 +86,9 @@ impl core::fmt::Display for SkipReason {
 ///
 /// `existing_merge_requests` are the pull requests found at planning time
 /// (`SubmissionPlan::existing_mrs`), so a PR that execution left unchanged
-/// still takes its place in the stack.
+/// still takes its place in the stack. A stack that contains a bookmark in
+/// `result.failed_bookmarks` is never linked: its pushed head or PR base may
+/// not match the local stack.
 ///
 /// This hook never returns an error. Failures are represented as outcomes so
 /// they cannot turn a successful submit into a failed command.
@@ -151,7 +153,7 @@ fn link_stacks_with_runner(
     };
 
     let pr_map = build_pr_map(existing_merge_requests, &result.merge_requests);
-    link_from_graph(runner, github, &graph, &pr_map)
+    link_from_graph(runner, github, &graph, &pr_map, &result.failed_bookmarks)
 }
 
 struct ContiguityScan {
@@ -201,6 +203,7 @@ fn link_from_graph(
     github: &GitHubConfig,
     graph: &BookmarkGraph<'_>,
     pr_map: &BTreeMap<String, u64>,
+    failed_bookmarks: &BTreeSet<String>,
 ) -> StackLinkOutcome {
     let mut stacks = Vec::new();
     let mut warnings = Vec::new();
@@ -236,6 +239,32 @@ fn link_from_graph(
         };
         let mut ordered = leaf.downstack();
         ordered.reverse();
+        // A failed push or PR update leaves the remote out of step with the
+        // local stack, so the plan-time PR map is stale for this component.
+        let failed: Vec<&str> = ordered
+            .iter()
+            .map(BookmarkOrPending::name)
+            .filter(|name| failed_bookmarks.contains(*name))
+            .collect();
+        if !failed.is_empty() {
+            let prs: Vec<u64> = ordered
+                .iter()
+                .filter_map(|bookmark| pr_map.get(bookmark.name()).copied())
+                .collect();
+            if prs.is_empty() {
+                debug!("stack link: skipping a failed component without PRs");
+                continue;
+            }
+            let warning = format!(
+                "skipped linking a stack because submitting {} failed; unlinked PRs: {}",
+                failed.join(", "),
+                format_prs(&prs)
+            );
+            warn!("stack link: {warning}");
+            warnings.push(warning);
+            reported.extend(prs);
+            continue;
+        }
         let ContiguityScan {
             prs,
             unmapped,
@@ -251,17 +280,14 @@ fn link_from_graph(
                 )
             } else {
                 format!(
-                    "skipped linking a stack with a missing middle PR ({gap}); PRs below the gap: {}",
-                    format_prs(&prs)
+                    "skipped linking a stack with a missing middle PR ({gap}); PRs below the gap: {}; PRs above the gap: {}",
+                    format_prs(&prs),
+                    format_prs(&stranded)
                 )
             };
             warn!("stack link: {warning}");
             warnings.push(warning);
-            if prs.is_empty() {
-                reported.extend(stranded.iter().copied());
-            } else {
-                reported.extend(prs.iter().copied());
-            }
+            reported.extend(prs.iter().chain(&stranded).copied());
             continue;
         }
         if prs.len() < 2 {
@@ -639,6 +665,7 @@ mod tests {
             &github_config(),
             &graph(&changes),
             &pr_map(&[mr_update("a", "10"), mr_update("b", "20")]),
+            &BTreeSet::new(),
         );
 
         assert!(matches!(
@@ -660,6 +687,7 @@ mod tests {
                 mr_update("b", "20"),
                 mr_update("c", "30"),
             ]),
+            &BTreeSet::new(),
         );
 
         assert!(matches!(
@@ -678,10 +706,17 @@ mod tests {
             &github_config(),
             &graph(&changes),
             &pr_map(&[mr_update("a", "10"), mr_update("c", "30")]),
+            &BTreeSet::new(),
         );
 
         assert!(runner.calls().is_empty());
-        assert!(matches!(outcome, StackLinkOutcome::Failed { warning } if warning.contains("#10")));
+        assert!(
+            matches!(&outcome, StackLinkOutcome::Failed { warning }
+                if warning.contains("missing middle PR (b)")
+                    && warning.contains("PRs below the gap: #10")
+                    && warning.contains("PRs above the gap: #30")),
+            "every unlinked PR must be named, got {outcome:?}"
+        );
     }
 
     #[test]
@@ -693,6 +728,7 @@ mod tests {
             &github_config(),
             &graph(&changes),
             &pr_map(&[mr_update("a", "10"), mr_update("b", "20")]),
+            &BTreeSet::new(),
         );
 
         assert_eq!(runner.calls(), vec![vec![10, 20]]);
@@ -711,6 +747,7 @@ mod tests {
             &github_config(),
             &graph(&changes),
             &pr_map(&[mr_update("a", "1")]),
+            &BTreeSet::new(),
         );
 
         assert!(matches!(
@@ -728,6 +765,7 @@ mod tests {
             errors: vec![],
             bookmarks_pushed: vec![],
             changes: vec![],
+            failed_bookmarks: BTreeSet::new(),
         };
         let runner = RecordingRunner::new(LinkOutcome::Linked);
 
@@ -768,6 +806,7 @@ mod tests {
             errors: vec![],
             bookmarks_pushed: vec![],
             changes: vec![],
+            failed_bookmarks: BTreeSet::new(),
         };
         let runner = RecordingRunner::new(LinkOutcome::Linked);
         let mut github = github_config();
@@ -828,6 +867,7 @@ mod tests {
             &github_config(),
             &graph(&changes),
             &build_pr_map(&existing, &[mr_update("c", "30")]),
+            &BTreeSet::new(),
         );
 
         assert_eq!(runner.calls(), vec![vec![10, 20, 30]], "whole stack linked");
@@ -861,6 +901,7 @@ mod tests {
                 mr_update("c", "3"),
                 mr_update("d", "4"),
             ]),
+            &BTreeSet::new(),
         );
 
         let mut calls = runner.calls();
@@ -887,6 +928,7 @@ mod tests {
                 mr_update("b", "2"),
                 mr_update("c", "3"),
             ]),
+            &BTreeSet::new(),
         );
 
         assert!(
@@ -921,6 +963,7 @@ mod tests {
                 mr_update("x", "7"),
                 mr_update("y", "8"),
             ]),
+            &BTreeSet::new(),
         );
 
         let StackLinkOutcome::Linked {
@@ -952,6 +995,7 @@ mod tests {
             &github_config(),
             &graph(&changes),
             &pr_map(&[mr_update("b", "20"), mr_update("c", "30")]),
+            &BTreeSet::new(),
         );
 
         assert!(
@@ -982,6 +1026,7 @@ mod tests {
                 mr_update("x", "7"),
                 mr_update("y", "8"),
             ]),
+            &BTreeSet::new(),
         );
 
         assert_eq!(runner.calls(), vec![vec![7, 8]]);
@@ -1003,7 +1048,7 @@ mod tests {
 
     #[test]
     fn a_second_missing_pr_above_an_interior_gap_still_blocks_linking() {
-        let changes = linear_changes(&["a", "b", "c", "d"]);
+        let changes = linear_changes(&["a", "b", "c", "d", "e"]);
         let runner = RecordingRunner::new(LinkOutcome::Linked);
 
         let outcome = link_from_graph(
@@ -1013,12 +1058,19 @@ mod tests {
             &pr_map(&[
                 mr_update("a", "1"),
                 mr_update("c", "3"),
-                mr_update("d", "4"),
+                mr_update("e", "5"),
             ]),
+            &BTreeSet::new(),
         );
 
         assert!(runner.calls().is_empty());
-        assert!(matches!(outcome, StackLinkOutcome::Failed { .. }));
+        assert!(
+            matches!(&outcome, StackLinkOutcome::Failed { warning }
+                if warning.contains("missing middle PR (b)")
+                    && warning.contains("PRs below the gap: #1;")
+                    && warning.contains("PRs above the gap: #3 -> #5")),
+            "the first gap is named with every PR above it, got {outcome:?}"
+        );
     }
 
     #[test]
@@ -1036,6 +1088,7 @@ mod tests {
                 mr_update("b", "2"),
                 mr_update("solo", "9"),
             ]),
+            &BTreeSet::new(),
         );
 
         assert!(matches!(
@@ -1057,6 +1110,7 @@ mod tests {
             &github_config(),
             &graph(&changes),
             &pr_map(&[mr_update("solo", "9")]),
+            &BTreeSet::new(),
         );
 
         assert!(matches!(
@@ -1075,6 +1129,7 @@ mod tests {
             &github_config(),
             &graph(&changes),
             &pr_map(&[mr_update("a", "1"), mr_update("b", "2")]),
+            &BTreeSet::new(),
         );
 
         assert!(matches!(
@@ -1097,6 +1152,7 @@ mod tests {
             &github_config(),
             &graph(&changes),
             &pr_map(&[mr_update("a", "1"), mr_update("b", "2")]),
+            &BTreeSet::new(),
         );
 
         assert!(matches!(
@@ -1123,6 +1179,7 @@ mod tests {
                 mr_update("c", "3"),
                 mr_update("d", "4"),
             ]),
+            &BTreeSet::new(),
         );
 
         assert_eq!(runner.calls().len(), 2, "both components attempted");
@@ -1156,16 +1213,14 @@ mod tests {
                 mr_update("d", "4"),
                 mr_update("solo", "9"),
             ]),
+            &BTreeSet::new(),
         );
 
-        let calls = runner.calls.borrow().clone();
-        assert_eq!(calls.len(), 2, "both qualifying components attempted");
-        let (linked, failed) = (&calls[0], &calls[1]);
-        let failed_args = failed
-            .iter()
-            .map(u64::to_string)
-            .collect::<Vec<_>>()
-            .join(" ");
+        assert_eq!(
+            runner.calls.borrow().clone(),
+            vec![vec![1, 2], vec![3, 4]],
+            "components run in bookmark order"
+        );
         let StackLinkOutcome::Linked {
             stacks,
             unlinked,
@@ -1174,11 +1229,11 @@ mod tests {
         else {
             panic!("a successful component must survive a later failure, got {outcome:?}");
         };
-        assert_eq!(stacks, vec![linked.clone()], "successful stack ids kept");
+        assert_eq!(stacks, vec![vec![1, 2]], "successful stack ids kept");
         assert_eq!(warnings.len(), 1, "one warning for the failed component");
         assert!(
             warnings[0].contains("network unreachable")
-                && warnings[0].contains(&format!("gh-stack link {failed_args}")),
+                && warnings[0].contains("gh-stack link 3 4"),
             "failure warning keeps rerun command: {warnings:?}"
         );
         assert!(
@@ -1188,15 +1243,13 @@ mod tests {
         assert!(
             !unlinked
                 .iter()
-                .any(|note| failed.iter().any(|pr| note.contains(&format!("#{pr}")))),
+                .any(|note| note.contains("#3") || note.contains("#4")),
             "PRs named in a warning are not repeated as orphans: {unlinked:?}"
         );
-        if *linked == vec![1, 2] {
-            assert!(
-                unlinked.iter().any(|note| note.contains("top")),
-                "trailing-bookmark note kept: {unlinked:?}"
-            );
-        }
+        assert!(
+            unlinked.iter().any(|note| note.contains("top")),
+            "trailing-bookmark note kept: {unlinked:?}"
+        );
     }
 
     #[test]
@@ -1215,6 +1268,7 @@ mod tests {
                 mr_update("c", "3"),
                 mr_update("d", "4"),
             ]),
+            &BTreeSet::new(),
         );
 
         assert!(
@@ -1242,6 +1296,7 @@ mod tests {
                 mr_update("x", "7"),
                 mr_update("y", "8"),
             ]),
+            &BTreeSet::new(),
         );
 
         assert!(
@@ -1380,6 +1435,165 @@ mod tests {
                 .count(),
             1,
             "one tokenCommand run for two stacks"
+        );
+    }
+
+    /// Run plan → execute → stack link over a pushed `a → b → c` stack whose
+    /// PRs #10, #20, #30 already exist. `b_target` is the base of #20 on the
+    /// forge. Returns the execute errors and the stack-link outcome with the
+    /// runner calls.
+    async fn production_link_with_existing_prs(
+        b_target: &str,
+        forge: crate::forge::test::TestForge,
+        push: crate::config::RepoPushConfig,
+    ) -> (
+        Vec<crate::error::ClonableError>,
+        StackLinkOutcome,
+        Vec<Vec<u64>>,
+    ) {
+        use std::collections::HashSet;
+
+        use crate::{
+            config::{Config, ForgeType},
+            forge::ForgeImpl,
+            output::BufferedOutput,
+            submit::{
+                PlanContext,
+                RootExecuteContext,
+                execute::execute,
+                find_changes_to_submit,
+                plan::plan,
+            },
+            tests::TestRepo,
+        };
+
+        let repo = TestRepo::with_local_remote();
+        repo.create_change("a.txt", "a", "A").create_bookmark("a");
+        repo.push_bookmark("a");
+        repo.exec(["new"]);
+        repo.create_change("b.txt", "b", "B").create_bookmark("b");
+        repo.push_bookmark("b");
+        repo.exec(["new"]);
+        repo.create_change("c.txt", "c", "C").create_bookmark("c");
+        repo.push_bookmark("c");
+
+        let mut forge = forge;
+        for (id, source, target) in [("10", "a", "main"), ("20", "b", b_target), ("30", "c", "b")] {
+            forge.add_merge_request(
+                MergeRequest::builder()
+                    .id(id.to_owned())
+                    .title(format!("PR {source}"))
+                    .source_branch(source.to_owned())
+                    .target_branch(target.to_owned())
+                    .build(),
+            );
+        }
+        let forge = ForgeImpl::Test(forge);
+        let config = Config::builder()
+            .forge(ForgeType::GitHub)
+            .github(github_config())
+            .push(push)
+            .build();
+        let output = BufferedOutput::new();
+
+        let changes = find_changes_to_submit(&repo.jj, ["c"], &HashSet::<String>::new())
+            .expect("changes to submit");
+        let graph = BookmarkGraph::from_changes(&repo.jj, &changes, false).expect("graph");
+        let submission_plan = plan(PlanContext {
+            jj: &repo.jj,
+            forge: &forge,
+            config: &config,
+            output: &output,
+            bookmark_graph: &graph,
+            dry_run: false,
+        })
+        .await
+        .expect("plan");
+        let existing = submission_plan.existing_mrs.clone();
+        assert_eq!(existing.len(), 3, "every PR is found at planning time");
+
+        let result = execute(RootExecuteContext::new(
+            &repo.jj,
+            &forge,
+            &config,
+            &output,
+            false,
+            submission_plan,
+            changes.clone(),
+            false,
+            false,
+        ))
+        .await
+        .expect("execute");
+
+        let runner = RecordingRunner::new(LinkOutcome::Linked);
+        let outcome = link_stacks_with_runner(
+            &runner,
+            &github_config(),
+            &repo.jj,
+            &result,
+            &existing,
+            false,
+            false,
+            false,
+        );
+        (result.errors, outcome, runner.calls())
+    }
+
+    /// A failed push leaves every remote head stale, and the MR actions that
+    /// depend on it are skipped. The plan-time PRs must not be linked.
+    #[tokio::test]
+    async fn production_failed_push_leaves_stack_unlinked() {
+        let (errors, outcome, calls) = production_link_with_existing_prs(
+            "a",
+            crate::forge::test::TestForge::default(),
+            crate::config::RepoPushConfig::Command(vec!["false".to_owned()]),
+        )
+        .await;
+
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.message.contains("Failed to push")),
+            "the push must fail in execute: {errors:?}"
+        );
+        assert!(calls.is_empty(), "stale remote heads must not be linked");
+        assert!(
+            matches!(&outcome, StackLinkOutcome::Failed { warning }
+                if warning.contains("submitting a, b, c failed")
+                    && warning.contains("#10 -> #20 -> #30")),
+            "unexpected outcome {outcome:?}"
+        );
+    }
+
+    /// #20 targets `main` but must target `a`. When that base update fails,
+    /// #20 still has the wrong base, so the stack must not be linked.
+    #[tokio::test]
+    async fn production_failed_base_update_leaves_stack_unlinked() {
+        let (errors, outcome, calls) = production_link_with_existing_prs(
+            "main",
+            crate::forge::test::TestForge::builder()
+                .fail_update_base_for(std::collections::HashSet::from(["b".to_owned()]))
+                .build(),
+            crate::config::RepoPushConfig::default(),
+        )
+        .await;
+
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.message.contains("Failed to update MR base for b")),
+            "the base update must fail in execute: {errors:?}"
+        );
+        assert!(
+            calls.is_empty(),
+            "a PR with a stale base must not be linked"
+        );
+        assert!(
+            matches!(&outcome, StackLinkOutcome::Failed { warning }
+                if warning.contains("submitting b failed")
+                    && warning.contains("#10 -> #20 -> #30")),
+            "unexpected outcome {outcome:?}"
         );
     }
 
