@@ -225,19 +225,17 @@ pub async fn submit(config: &SubmitCommandConfig, cli_config: &CliConfig<'_>) ->
 
     ensure_whatever!(!bookmarks.is_empty(), "No bookmarks in revset {}", revset);
 
-    let changes = select_changes_to_submit_and_announce(
-        &jj,
-        &revset,
+    let changes = select_changes_to_submit(&jj, &revset, &bookmarks, &pending_bookmarks)?;
+    let bookmark_graph = BookmarkGraph::from_changes(&jj, &changes, config.revset_options.tracked)?;
+    announce_submission_graph(
+        &bookmark_graph,
         &bookmarks,
-        &pending_bookmarks,
         config.dry_run,
         config.show_plan,
         output,
     )?;
 
     let forge = ForgeImpl::new(&repo_config)?;
-
-    let bookmark_graph = BookmarkGraph::from_changes(&jj, &changes, config.revset_options.tracked)?;
 
     let submission_plan = plan::plan(PlanContext {
         jj: &jj,
@@ -426,23 +424,24 @@ pub(crate) fn select_changes_to_submit(
     )
 }
 
-pub(crate) fn select_changes_to_submit_and_announce(
-    jj: &Jujutsu,
-    revset: &str,
+pub(crate) fn announce_submission_graph(
+    bookmark_graph: &BookmarkGraph<'_>,
     bookmarks: &[BookmarkOrPending<'_>],
-    pending_bookmarks: &HashSet<String>,
     dry_run: bool,
     show_plan: bool,
     output: &impl crate::output::Output,
-) -> Result<Vec<crate::jj::Change>> {
-    let changes = select_changes_to_submit(jj, revset, bookmarks, pending_bookmarks)?;
+) -> Result<()> {
+    let bookmark_names = bookmark_graph
+        .bookmarks_with_pointers()
+        .map(|bookmark| bookmark.bookmark.to_string())
+        .join(", ");
     ensure_whatever!(
-        !changes.is_empty(),
+        !bookmark_names.is_empty(),
         "No changes to submit for bookmarks {}. Check whether each name is in trunk or resolved as a tag, and whether mine() filtered generalized selections.",
         bookmarks.iter().map(JJName::raw_name).join(", ")
     );
     output.log_message(&format!(
-        "Submitting bookmarks{}: {}",
+        "Submitting bookmarks{}: {bookmark_names}",
         if dry_run {
             " (dry run)"
         } else if show_plan {
@@ -450,12 +449,8 @@ pub(crate) fn select_changes_to_submit_and_announce(
         } else {
             ""
         },
-        BookmarkOrPending::from_changes(&changes)
-            .into_iter()
-            .map(|bookmark| bookmark.magenta().to_string())
-            .join(", ")
     ));
-    Ok(changes)
+    Ok(())
 }
 
 /// Names of the resolved `bookmarks` that the user named literally in
