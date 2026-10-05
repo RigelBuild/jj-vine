@@ -3,6 +3,7 @@ use core::fmt::Write as _;
 use std::{
     borrow::Cow,
     collections::{HashMap, HashSet},
+    sync::LazyLock,
 };
 
 use clap::Args;
@@ -13,6 +14,7 @@ use cli_table::{
 };
 use itertools::Itertools as _;
 use owo_colors::OwoColorize as _;
+use regex::Regex;
 use snafu::{ensure_whatever, whatever};
 use tracing::warn;
 use unicode_segmentation::UnicodeSegmentation as _;
@@ -242,7 +244,7 @@ pub async fn submit(config: &SubmitCommandConfig, cli_config: &CliConfig<'_>) ->
 
     ensure_whatever!(
         !changes.is_empty(),
-        "Resolved bookmark(s) {} but found no changes to submit. The bookmark(s) may already be merged into trunk (inspect with `jj log -r <bookmark>`), or none is authored by you: only a bookmark named literally in the revset bypasses the `mine()` filter. For stacked submissions, confirm the expected commits are reachable from the named target.",
+        "No changes to submit for bookmarks {}. They may already be merged into trunk. Inspect each exact name with `jj log -r <bookmark>`. The `mine()` filter found no changes to submit for bookmarks you did not author. Name each bookmark literally in the revset to include it.",
         bookmarks.iter().map(JJName::raw_name).join(", ")
     );
 
@@ -574,11 +576,15 @@ fn tokenize_revset(revset: &str) -> Vec<RevsetToken> {
     tokens
 }
 
-/// Characters a bare jj identifier may contain. jj allows any `XID_CONTINUE`
-/// character; this accepts the alphanumeric subset, so a rarer identifier
-/// tokenizes as [`RevsetToken::Other`] and only loses the bypass.
+/// Characters a bare jj identifier may contain: any `XID_CONTINUE` character,
+/// plus `_`, `*`, `/`, and revset separators `.` / `-` / `+`.
 fn is_identifier_char(c: char) -> bool {
-    c.is_alphanumeric() || matches!(c, '_' | '*' | '/' | '.' | '-' | '+')
+    static XID_CONTINUE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"\A\p{XID_Continue}\z").expect("valid XID_Continue regex"));
+
+    let mut encoded = [0; 4];
+    XID_CONTINUE.is_match(c.encode_utf8(&mut encoded))
+        || matches!(c, '_' | '*' | '/' | '.' | '-' | '+')
 }
 
 /// jj's `identifier` rule: parts joined by `.`, a run of `-`, or `+`. Anything

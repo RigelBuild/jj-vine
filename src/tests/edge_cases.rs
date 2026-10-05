@@ -587,6 +587,26 @@ fn hex_escaped_non_ascii_name_bypasses_mine() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn decomposed_foreign_bookmark_bypasses_mine_only_when_named_bare() -> Result<()> {
+    let repo = TestRepo::with_local_remote();
+    as_current_user(&repo);
+
+    let decomposed_name = "cafe\u{301}";
+    repo.jj.exec(["new", "main"])?;
+    repo.create_change("e.txt", "e", "Decomposed name")
+        .create_bookmark(decomposed_name);
+    make_foreign(&repo)?;
+
+    let changes = submission_changes(&repo, decomposed_name)?;
+    assert_eq!(sorted_names(&changes), vec![decomposed_name.to_owned()]);
+
+    let changes = submission_changes(&repo, &format!("present({decomposed_name})"))?;
+    assert_is_empty!(changes, "generalized revset for {decomposed_name}");
+
+    Ok(())
+}
+
 #[cfg(not(feature = "no-e2e-tests"))]
 mod e2e {
     use assertables::assert_contains;
