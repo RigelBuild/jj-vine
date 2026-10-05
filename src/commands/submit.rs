@@ -1,6 +1,9 @@
 #![expect(clippy::module_name_repetitions, reason = "seems fine")]
 use core::fmt::Write as _;
-use std::{borrow::Cow, collections::HashSet};
+use std::{
+    borrow::Cow,
+    collections::{HashMap, HashSet},
+};
 
 use clap::Args;
 use cli_table::{
@@ -257,6 +260,16 @@ pub async fn submit(config: &SubmitCommandConfig, cli_config: &CliConfig<'_>) ->
         return Ok(());
     }
 
+    // The stack link needs PRs that existed at planning time, including any
+    // that execution leaves unchanged; keep them before the plan is consumed.
+    let link_stack = repo_config.forge == ForgeType::GitHub;
+    let existing_mrs =
+        if link_stack && repo_config.github.link_stack && !config.dry_run && !config.no_hooks {
+            submission_plan.existing_mrs.clone()
+        } else {
+            HashMap::new()
+        };
+
     let result = execute::execute(RootExecuteContext::new(
         &jj,
         &forge,
@@ -272,11 +285,12 @@ pub async fn submit(config: &SubmitCommandConfig, cli_config: &CliConfig<'_>) ->
 
     output.finish();
 
-    if repo_config.forge == ForgeType::GitHub {
+    if link_stack {
         let outcome = stack_link::link_stacks(
             &repo_config.github,
             &jj,
             &result,
+            &existing_mrs,
             config.revset_options.tracked,
             config.dry_run,
             config.no_hooks,
@@ -407,7 +421,11 @@ fn render_stack_link_outcome(
     outcome: &StackLinkOutcome,
 ) -> core::fmt::Result {
     match outcome {
-        StackLinkOutcome::Linked { stacks, unlinked } => {
+        StackLinkOutcome::Linked {
+            stacks,
+            unlinked,
+            warnings,
+        } => {
             for stack in stacks {
                 let chain = stack
                     .iter()
@@ -418,6 +436,9 @@ fn render_stack_link_outcome(
             }
             for note in unlinked {
                 writeln!(output, "{}", format!("Note: {note}").yellow())?;
+            }
+            for warning in warnings {
+                writeln!(output, "{}", format!("Warning: {warning}").yellow())?;
             }
         }
         StackLinkOutcome::Failed { warning } => {
@@ -439,15 +460,41 @@ mod tests {
         let outcome = StackLinkOutcome::Linked {
             stacks: vec![vec![10, 20, 30]],
             unlinked: vec![],
+            warnings: vec![],
         };
 
         render_stack_link_outcome(&mut output, &outcome).unwrap();
 
-        assert!(output.contains("#10 → #20 → #30"));
+        assert!(
+            output.contains("#10 → #20 → #30"),
+            "chain rendered: {output}"
+        );
     }
 
     #[test]
-    fn failed_stack_link_renders_warning_without_changing_submit_result() {
+    fn mixed_stack_link_renders_stacks_notes_and_warnings() {
+        let mut output = String::new();
+        let outcome = StackLinkOutcome::Linked {
+            stacks: vec![vec![1, 2]],
+            unlinked: vec!["solo left out".to_owned()],
+            warnings: vec!["failed to link stack #3 -> #4".to_owned()],
+        };
+
+        render_stack_link_outcome(&mut output, &outcome).unwrap();
+
+        assert!(output.contains("#1 → #2"), "linked stack kept: {output}");
+        assert!(
+            output.contains("Note: solo left out"),
+            "note kept: {output}"
+        );
+        assert!(
+            output.contains("Warning: failed to link stack #3 -> #4"),
+            "warning kept: {output}"
+        );
+    }
+
+    #[test]
+    fn failed_stack_link_renders_warning() {
         let mut output = String::new();
         let outcome = StackLinkOutcome::Failed {
             warning: "gh-stack failed".to_owned(),
@@ -455,7 +502,10 @@ mod tests {
 
         render_stack_link_outcome(&mut output, &outcome).unwrap();
 
-        assert!(output.contains("Warning: gh-stack failed"));
+        assert!(
+            output.contains("Warning: gh-stack failed"),
+            "warning rendered: {output}"
+        );
     }
 
     #[test]

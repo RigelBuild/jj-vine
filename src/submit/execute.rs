@@ -590,33 +590,83 @@ fn targets_unpushed_bookmark(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use super::*;
+    use crate::{
+        config::{Config, ForgeType},
+        forge::{ForgeImpl, test::TestForge},
+        jj::BookmarkInfo,
+        output::BufferedOutput,
+        submit::{PlanContext, find_changes_to_submit, plan::plan},
+        tests::TestRepo,
+    };
 
-    #[test]
-    fn submission_result_changes_carry_solidified_bookmark_names() {
-        let change_id = "abcd1234ef";
-        let mut change = Change::mock_from_change_id(change_id);
-        change.pending_bookmark = true;
-        assert!(change.bookmarks.is_empty());
+    #[tokio::test]
+    async fn submission_result_changes_carry_solidified_bookmark_names() {
+        let repo = TestRepo::with_local_remote();
+        repo.create_change("new.txt", "new", "New change");
+        let change_id = repo
+            .jj
+            .log("@")
+            .expect("read change")
+            .into_iter()
+            .next()
+            .expect("change exists")
+            .change_id;
+        let pending = HashSet::from([change_id.clone()]);
+        // `main` contributes nothing past trunk; the pending change is the target.
+        let changes =
+            find_changes_to_submit(&repo.jj, ["main"], &pending).expect("changes to submit");
+        assert!(
+            changes.iter().all(|change| change.bookmarks.is_empty()),
+            "the change starts without a bookmark"
+        );
 
-        let pending_display = change_id_to_temp_bookmark_name(change_id);
-        assert_eq!(pending_display, "(new bookmark for abcd1234)");
+        let forge = ForgeImpl::Test(TestForge::default());
+        let config = Config::builder().forge(ForgeType::Forgejo).build();
+        let output = BufferedOutput::new();
+        let graph = BookmarkGraph::from_changes(&repo.jj, &changes, false).expect("graph");
+        let submission_plan = plan(PlanContext {
+            jj: &repo.jj,
+            forge: &forge,
+            config: &config,
+            output: &output,
+            bookmark_graph: &graph,
+            dry_run: false,
+        })
+        .await
+        .expect("plan");
 
-        let solidified = "feature-real-name";
-        change.solidify_bookmark(solidified);
-        let result = SubmissionResult {
-            merge_requests: vec![],
-            errors: vec![],
-            bookmarks_pushed: vec![],
-            changes: vec![change],
-        };
+        let result = execute(RootExecuteContext::new(
+            &repo.jj,
+            &forge,
+            &config,
+            &output,
+            false,
+            submission_plan,
+            changes.clone(),
+            false,
+            false,
+        ))
+        .await
+        .expect("execute");
 
-        let names: Vec<&str> = result
+        let pushed = result
+            .bookmarks_pushed
+            .first()
+            .expect("the push created a bookmark");
+        let change = result
             .changes
             .iter()
-            .flat_map(|change| change.bookmarks.iter().map(BookmarkInfo::name))
-            .collect();
-        assert_eq!(names, vec![solidified]);
-        assert!(!result.changes[0].pending_bookmark);
+            .find(|change| change.change_id == change_id)
+            .expect("change returned in result");
+        let names: Vec<&str> = change.bookmarks.iter().map(BookmarkInfo::name).collect();
+        assert_eq!(
+            names,
+            vec![pushed.as_str()],
+            "result carries the created name"
+        );
+        assert!(!change.pending_bookmark, "the change is no longer pending");
     }
 }

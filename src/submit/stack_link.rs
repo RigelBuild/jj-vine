@@ -1,7 +1,8 @@
 //! Register submitted GitHub pull requests as native stacks.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
+    ffi::OsString,
     path::{Path, PathBuf},
 };
 
@@ -10,7 +11,7 @@ use tracing::{debug, warn};
 use crate::{
     bookmark::{BookmarkGraph, BookmarkOrPending},
     config::GitHubConfig,
-    forge::MergeRequestLike as _,
+    forge::{AnyForgeMergeRequest, MergeRequestLike as _},
     jj::Jujutsu,
     submit::execute::{MRUpdate, SubmissionResult},
 };
@@ -22,10 +23,12 @@ const STACK_LINK_TIMEOUT: core::time::Duration = core::time::Duration::from_secs
 pub enum StackLinkOutcome {
     /// No stack link was attempted.
     Skipped(SkipReason),
-    /// One or more stacks were linked, in bottom-to-top order.
+    /// One or more stacks were linked, in bottom-to-top order. `warnings`
+    /// lists components that could not be linked in the same run.
     Linked {
         stacks: Vec<Vec<u64>>,
         unlinked: Vec<String>,
+        warnings: Vec<String>,
     },
     /// Stack linking failed. Submit itself remains successful.
     Failed { warning: String },
@@ -67,6 +70,10 @@ impl core::fmt::Display for SkipReason {
 
 /// Link the submitted pull requests into GitHub-native stacks.
 ///
+/// `existing_merge_requests` are the pull requests found at planning time
+/// (`SubmissionPlan::existing_mrs`), so a PR that execution left unchanged
+/// still takes its place in the stack.
+///
 /// This hook never returns an error. Failures are represented as outcomes so
 /// they cannot turn a successful submit into a failed command.
 #[must_use]
@@ -74,21 +81,37 @@ pub fn link_stacks(
     github: &GitHubConfig,
     jj: &Jujutsu,
     result: &SubmissionResult,
+    existing_merge_requests: &HashMap<String, AnyForgeMergeRequest>,
     tracked: bool,
     dry_run: bool,
     no_hooks: bool,
 ) -> StackLinkOutcome {
     let runner = GhStackRunner {
         cwd: jj.cwd().to_path_buf(),
+        search_path: std::env::var_os("PATH"),
     };
-    link_stacks_with_runner(&runner, github, jj, result, tracked, dry_run, no_hooks)
+    link_stacks_with_runner(
+        &runner,
+        github,
+        jj,
+        result,
+        existing_merge_requests,
+        tracked,
+        dry_run,
+        no_hooks,
+    )
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirrors link_stacks plus the runner seam"
+)]
 fn link_stacks_with_runner(
     runner: &dyn StackLinkRunner,
     github: &GitHubConfig,
     jj: &Jujutsu,
     result: &SubmissionResult,
+    existing_merge_requests: &HashMap<String, AnyForgeMergeRequest>,
     tracked: bool,
     dry_run: bool,
     no_hooks: bool,
@@ -112,7 +135,8 @@ fn link_stacks_with_runner(
         }
     };
 
-    link_from_graph(runner, github, &graph, &result.merge_requests)
+    let pr_map = build_pr_map(existing_merge_requests, &result.merge_requests);
+    link_from_graph(runner, github, &graph, &pr_map)
 }
 
 struct ContiguityScan {
@@ -152,12 +176,13 @@ fn link_from_graph(
     runner: &dyn StackLinkRunner,
     github: &GitHubConfig,
     graph: &BookmarkGraph<'_>,
-    merge_requests: &[MRUpdate],
+    pr_map: &BTreeMap<String, u64>,
 ) -> StackLinkOutcome {
-    let pr_map = build_pr_map(merge_requests);
     let mut stacks = Vec::new();
     let mut warnings = Vec::new();
     let mut notes = Vec::new();
+    // PRs already named in a warning, so they are not listed again as orphans.
+    let mut reported = BTreeSet::new();
 
     for component in graph.components() {
         if !component.is_linear() {
@@ -173,7 +198,7 @@ fn link_from_graph(
             prs,
             trailing_unmapped,
             interior_gap,
-        } = scan_contiguous_run(&ordered, &pr_map);
+        } = scan_contiguous_run(&ordered, pr_map);
 
         if interior_gap {
             let warning = format!(
@@ -182,6 +207,7 @@ fn link_from_graph(
             );
             warn!("stack link: {warning}");
             warnings.push(warning);
+            reported.extend(prs.iter().copied());
             continue;
         }
         if prs.len() < 2 {
@@ -202,35 +228,47 @@ fn link_from_graph(
                 }
                 stacks.push(prs);
             }
-            LinkOutcome::NotEnabled => warnings.push(format!(
-                "stacked PRs are not enabled for {}; enable them or set github.linkStack = false",
-                github.target_project()
-            )),
-            LinkOutcome::MissingBinary => {
-                return StackLinkOutcome::Skipped(SkipReason::MissingBinary);
+            LinkOutcome::NotEnabled => {
+                warnings.push(format!(
+                    "stacked PRs are not enabled for {}; enable them or set github.linkStack = false",
+                    github.target_project()
+                ));
+                reported.extend(prs.iter().copied());
             }
-            LinkOutcome::Failed { detail } => warnings.push(format!(
-                "failed to link stack {} ({detail}); rerun by hand: gh-stack link {}",
-                format_prs(&prs),
-                prs.iter().map(u64::to_string).collect::<Vec<_>>().join(" ")
-            )),
+            LinkOutcome::MissingBinary => {
+                if stacks.is_empty() && warnings.is_empty() {
+                    return StackLinkOutcome::Skipped(SkipReason::MissingBinary);
+                }
+                warnings.push(
+                    "gh-stack is no longer on PATH; remaining stacks were not linked".to_owned(),
+                );
+                break;
+            }
+            LinkOutcome::Failed { detail } => {
+                warnings.push(format!(
+                    "failed to link stack {} ({detail}); rerun by hand: gh-stack link {}",
+                    format_prs(&prs),
+                    prs.iter().map(u64::to_string).collect::<Vec<_>>().join(" ")
+                ));
+                reported.extend(prs.iter().copied());
+            }
         }
     }
 
-    if !warnings.is_empty() {
+    if stacks.is_empty() {
+        if warnings.is_empty() {
+            return StackLinkOutcome::Skipped(SkipReason::NoQualifyingStack);
+        }
         return StackLinkOutcome::Failed {
             warning: warnings.join("; "),
         };
-    }
-    if stacks.is_empty() {
-        return StackLinkOutcome::Skipped(SkipReason::NoQualifyingStack);
     }
 
     let linked: BTreeSet<u64> = stacks.iter().flatten().copied().collect();
     let mut orphans: Vec<u64> = pr_map
         .values()
         .copied()
-        .filter(|pr| !linked.contains(pr))
+        .filter(|pr| !linked.contains(pr) && !reported.contains(pr))
         .collect();
     orphans.sort_unstable();
     orphans.dedup();
@@ -246,21 +284,32 @@ fn link_from_graph(
     StackLinkOutcome::Linked {
         stacks,
         unlinked: notes,
+        warnings,
     }
 }
 
-fn build_pr_map(merge_requests: &[MRUpdate]) -> BTreeMap<String, u64> {
+/// Map each bookmark to its PR number: PRs found at planning time, overlaid
+/// with the PRs execution created or updated.
+fn build_pr_map(
+    existing_merge_requests: &HashMap<String, AnyForgeMergeRequest>,
+    merge_requests: &[MRUpdate],
+) -> BTreeMap<String, u64> {
+    let existing = existing_merge_requests
+        .iter()
+        .map(|(bookmark, mr)| (bookmark, mr));
+    let updated = merge_requests
+        .iter()
+        .map(|update| (&update.bookmark, &update.mr));
+
     let mut map = BTreeMap::new();
-    for update in merge_requests {
-        let iid = update.mr.iid();
-        match iid.parse::<u64>() {
+    for (bookmark, mr) in existing.chain(updated) {
+        match mr.iid().parse::<u64>() {
             Ok(pr) => {
-                map.entry(update.bookmark.clone()).or_insert(pr);
+                map.insert(bookmark.clone(), pr);
             }
-            Err(_) => debug!(
-                "stack link: ignoring non-numeric pull request id for bookmark {}",
-                update.bookmark
-            ),
+            Err(_) => {
+                debug!("stack link: ignoring non-numeric pull request id for bookmark {bookmark}")
+            }
         }
     }
     map
@@ -287,6 +336,8 @@ trait StackLinkRunner {
 
 struct GhStackRunner {
     cwd: PathBuf,
+    /// The `PATH` searched for `gh-stack`.
+    search_path: Option<OsString>,
 }
 
 impl GhStackRunner {
@@ -327,11 +378,11 @@ impl GhStackRunner {
             Ok(None) => LinkOutcome::Failed {
                 detail: format!("gh-stack timed out after {}s", STACK_LINK_TIMEOUT.as_secs()),
             },
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                LinkOutcome::MissingBinary
-            }
+            // The binary was found on PATH, so a spawn failure here (including
+            // NotFound for a missing interpreter or a racing uninstall) is a
+            // real failure the user should see, not a silent skip.
             Err(error) => LinkOutcome::Failed {
-                detail: format!("could not run gh-stack: {error}"),
+                detail: format!("could not run gh-stack at {}: {error}", binary.display()),
             },
         }
     }
@@ -339,9 +390,8 @@ impl GhStackRunner {
 
 impl StackLinkRunner for GhStackRunner {
     fn run(&self, prs: &[u64], github: &GitHubConfig) -> LinkOutcome {
-        let binary = match which::which("gh-stack") {
-            Ok(binary) => binary,
-            Err(_) => return LinkOutcome::MissingBinary,
+        let Ok(binary) = which::which_in("gh-stack", self.search_path.as_ref(), &self.cwd) else {
+            return LinkOutcome::MissingBinary;
         };
         self.run_with_binary(&binary, prs, github)
     }
@@ -384,6 +434,39 @@ mod tests {
         }
     }
 
+    /// Answers each call with the next queued outcome, in call order.
+    struct SequencedRunner {
+        calls: RefCell<Vec<Vec<u64>>>,
+        responses: RefCell<std::collections::VecDeque<LinkOutcome>>,
+    }
+
+    impl SequencedRunner {
+        fn new(responses: impl IntoIterator<Item = LinkOutcome>) -> Self {
+            Self {
+                calls: RefCell::new(Vec::new()),
+                responses: RefCell::new(responses.into_iter().collect()),
+            }
+        }
+    }
+
+    impl StackLinkRunner for SequencedRunner {
+        fn run(&self, prs: &[u64], _github: &GitHubConfig) -> LinkOutcome {
+            self.calls.borrow_mut().push(prs.to_vec());
+            self.responses
+                .borrow_mut()
+                .pop_front()
+                .expect("a queued response for every runner call")
+        }
+    }
+
+    fn pr_map(updates: &[MRUpdate]) -> BTreeMap<String, u64> {
+        build_pr_map(&HashMap::new(), updates)
+    }
+
+    fn existing_mr(bookmark: &str, iid: &str) -> (String, AnyForgeMergeRequest) {
+        (bookmark.to_owned(), mr_update(bookmark, iid).mr)
+    }
+
     fn mr_update(bookmark: &str, iid: &str) -> MRUpdate {
         let mr = MergeRequest::builder()
             .id(iid.to_owned())
@@ -424,16 +507,37 @@ mod tests {
     }
 
     #[test]
-    fn missing_binary_is_a_silent_skip() {
+    fn binary_absent_from_path_is_a_silent_skip() {
         let temp = tempfile::tempdir().expect("temporary directory");
         let runner = GhStackRunner {
             cwd: temp.path().to_path_buf(),
+            search_path: Some(temp.path().as_os_str().to_owned()),
         };
-        let missing_binary = temp.path().join("missing-gh-stack");
 
-        let outcome = runner.run_with_binary(&missing_binary, &[1, 2], &github_config());
+        let outcome = runner.run(&[1, 2], &github_config());
 
-        assert_eq!(outcome, LinkOutcome::MissingBinary);
+        assert_eq!(
+            outcome,
+            LinkOutcome::MissingBinary,
+            "nothing named gh-stack on PATH"
+        );
+    }
+
+    #[test]
+    fn spawn_not_found_after_lookup_is_a_warning() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let runner = GhStackRunner {
+            cwd: temp.path().to_path_buf(),
+            search_path: None,
+        };
+        let vanished_binary = temp.path().join("gh-stack");
+
+        let outcome = runner.run_with_binary(&vanished_binary, &[1, 2], &github_config());
+
+        assert!(
+            matches!(&outcome, LinkOutcome::Failed { detail } if detail.contains("could not run gh-stack")),
+            "a binary found on PATH that fails to spawn must warn, got {outcome:?}"
+        );
     }
 
     #[test]
@@ -445,7 +549,7 @@ mod tests {
             &runner,
             &github_config(),
             &graph(&changes),
-            &[mr_update("a", "10"), mr_update("b", "20")],
+            &pr_map(&[mr_update("a", "10"), mr_update("b", "20")]),
         );
 
         assert!(matches!(
@@ -462,11 +566,11 @@ mod tests {
             &runner,
             &github_config(),
             &graph(&changes),
-            &[
+            &pr_map(&[
                 mr_update("a", "10"),
                 mr_update("b", "20"),
                 mr_update("c", "30"),
-            ],
+            ]),
         );
 
         assert!(matches!(
@@ -484,7 +588,7 @@ mod tests {
             &runner,
             &github_config(),
             &graph(&changes),
-            &[mr_update("a", "10"), mr_update("c", "30")],
+            &pr_map(&[mr_update("a", "10"), mr_update("c", "30")]),
         );
 
         assert!(runner.calls().is_empty());
@@ -499,7 +603,7 @@ mod tests {
             &runner,
             &github_config(),
             &graph(&changes),
-            &[mr_update("a", "10"), mr_update("b", "20")],
+            &pr_map(&[mr_update("a", "10"), mr_update("b", "20")]),
         );
 
         assert_eq!(runner.calls(), vec![vec![10, 20]]);
@@ -517,7 +621,7 @@ mod tests {
             &runner,
             &github_config(),
             &graph(&changes),
-            &[mr_update("a", "1")],
+            &pr_map(&[mr_update("a", "1")]),
         );
 
         assert!(matches!(
@@ -539,11 +643,29 @@ mod tests {
         let runner = RecordingRunner::new(LinkOutcome::Linked);
 
         assert!(matches!(
-            link_stacks_with_runner(&runner, &github_config(), &jj, &result, false, true, false),
+            link_stacks_with_runner(
+                &runner,
+                &github_config(),
+                &jj,
+                &result,
+                &HashMap::new(),
+                false,
+                true,
+                false
+            ),
             StackLinkOutcome::Skipped(SkipReason::DryRun)
         ));
         assert!(matches!(
-            link_stacks_with_runner(&runner, &github_config(), &jj, &result, false, false, true),
+            link_stacks_with_runner(
+                &runner,
+                &github_config(),
+                &jj,
+                &result,
+                &HashMap::new(),
+                false,
+                false,
+                true
+            ),
             StackLinkOutcome::Skipped(SkipReason::NoHooks)
         ));
         assert!(runner.calls().is_empty());
@@ -563,7 +685,16 @@ mod tests {
         github.link_stack = false;
 
         assert!(matches!(
-            link_stacks_with_runner(&runner, &github, &jj, &result, false, false, false),
+            link_stacks_with_runner(
+                &runner,
+                &github,
+                &jj,
+                &result,
+                &HashMap::new(),
+                false,
+                false,
+                false
+            ),
             StackLinkOutcome::Skipped(SkipReason::Disabled)
         ));
         assert!(runner.calls().is_empty());
@@ -571,12 +702,50 @@ mod tests {
 
     #[test]
     fn merge_request_map_deduplicates_and_ignores_non_numeric_ids() {
-        let map = build_pr_map(&[
+        let map = pr_map(&[
             mr_update("a", "5"),
             mr_update("a", "5"),
             mr_update("b", "not-a-number"),
         ]);
         assert_eq!(map, BTreeMap::from([("a".to_owned(), 5)]));
+    }
+
+    #[test]
+    fn merge_request_map_includes_unchanged_existing_pull_requests() {
+        let existing = HashMap::from([existing_mr("a", "10"), existing_mr("b", "20")]);
+
+        let map = build_pr_map(&existing, &[mr_update("c", "30")]);
+
+        assert_eq!(
+            map,
+            BTreeMap::from([
+                ("a".to_owned(), 10),
+                ("b".to_owned(), 20),
+                ("c".to_owned(), 30),
+            ]),
+            "planned PRs that execution left alone must still map"
+        );
+    }
+
+    #[test]
+    fn unchanged_existing_middle_pull_request_does_not_create_a_gap() {
+        let changes = linear_changes(&["a", "b", "c"]);
+        let runner = RecordingRunner::new(LinkOutcome::Linked);
+        // With descriptions disabled, `b` already has a PR and gets no action.
+        let existing = HashMap::from([existing_mr("a", "10"), existing_mr("b", "20")]);
+
+        let outcome = link_from_graph(
+            &runner,
+            &github_config(),
+            &graph(&changes),
+            &build_pr_map(&existing, &[mr_update("c", "30")]),
+        );
+
+        assert_eq!(runner.calls(), vec![vec![10, 20, 30]], "whole stack linked");
+        assert!(
+            matches!(&outcome, StackLinkOutcome::Linked { stacks, .. } if *stacks == vec![vec![10, 20, 30]]),
+            "unexpected outcome {outcome:?}"
+        );
     }
 
     #[test]
@@ -597,12 +766,12 @@ mod tests {
             &runner,
             &github_config(),
             &graph(&changes),
-            &[
+            &pr_map(&[
                 mr_update("a", "1"),
                 mr_update("b", "2"),
                 mr_update("c", "3"),
                 mr_update("d", "4"),
-            ],
+            ]),
         );
 
         let mut calls = runner.calls();
@@ -624,11 +793,11 @@ mod tests {
             &runner,
             &github_config(),
             &graph(&changes),
-            &[
+            &pr_map(&[
                 mr_update("a", "1"),
                 mr_update("b", "2"),
                 mr_update("c", "3"),
-            ],
+            ]),
         );
 
         assert!(matches!(
@@ -647,7 +816,7 @@ mod tests {
             &runner,
             &github_config(),
             &graph(&changes),
-            &[mr_update("b", "20"), mr_update("c", "30")],
+            &pr_map(&[mr_update("b", "20"), mr_update("c", "30")]),
         );
 
         assert_eq!(runner.calls(), vec![vec![20, 30]]);
@@ -663,11 +832,11 @@ mod tests {
             &runner,
             &github_config(),
             &graph(&changes),
-            &[
+            &pr_map(&[
                 mr_update("a", "1"),
                 mr_update("c", "3"),
                 mr_update("d", "4"),
-            ],
+            ]),
         );
 
         assert!(runner.calls().is_empty());
@@ -684,16 +853,16 @@ mod tests {
             &runner,
             &github_config(),
             &graph(&changes),
-            &[
+            &pr_map(&[
                 mr_update("a", "1"),
                 mr_update("b", "2"),
                 mr_update("solo", "9"),
-            ],
+            ]),
         );
 
         assert!(matches!(
             outcome,
-            StackLinkOutcome::Linked { stacks, unlinked }
+            StackLinkOutcome::Linked { stacks, unlinked, .. }
                 if stacks == vec![vec![1, 2]]
                     && unlinked.len() == 1
                     && unlinked[0].contains("#9")
@@ -709,7 +878,7 @@ mod tests {
             &runner,
             &github_config(),
             &graph(&changes),
-            &[mr_update("solo", "9")],
+            &pr_map(&[mr_update("solo", "9")]),
         );
 
         assert!(matches!(
@@ -727,7 +896,7 @@ mod tests {
             &runner,
             &github_config(),
             &graph(&changes),
-            &[mr_update("a", "1"), mr_update("b", "2")],
+            &pr_map(&[mr_update("a", "1"), mr_update("b", "2")]),
         );
 
         assert!(matches!(
@@ -749,7 +918,7 @@ mod tests {
             &runner,
             &github_config(),
             &graph(&changes),
-            &[mr_update("a", "1"), mr_update("b", "2")],
+            &pr_map(&[mr_update("a", "1"), mr_update("b", "2")]),
         );
 
         assert!(matches!(
@@ -770,20 +939,111 @@ mod tests {
             &runner,
             &github_config(),
             &graph(&changes),
-            &[
+            &pr_map(&[
                 mr_update("a", "1"),
                 mr_update("b", "2"),
                 mr_update("c", "3"),
                 mr_update("d", "4"),
-            ],
+            ]),
         );
 
-        assert_eq!(runner.calls().len(), 2);
+        assert_eq!(runner.calls().len(), 2, "both components attempted");
         assert!(matches!(
             outcome,
             StackLinkOutcome::Failed { warning }
                 if warning.matches("not enabled").count() == 2
         ));
+    }
+
+    #[test]
+    fn mixed_outcomes_keep_linked_stacks_notes_and_warnings() {
+        let mut changes = linear_changes(&["a", "b", "top"]);
+        changes.extend(linear_changes(&["c", "d"]));
+        changes.extend(linear_changes(&["solo"]));
+        let runner = SequencedRunner::new([
+            LinkOutcome::Linked,
+            LinkOutcome::Failed {
+                detail: "network unreachable".to_owned(),
+            },
+        ]);
+
+        let outcome = link_from_graph(
+            &runner,
+            &github_config(),
+            &graph(&changes),
+            &pr_map(&[
+                mr_update("a", "1"),
+                mr_update("b", "2"),
+                mr_update("c", "3"),
+                mr_update("d", "4"),
+                mr_update("solo", "9"),
+            ]),
+        );
+
+        let calls = runner.calls.borrow().clone();
+        assert_eq!(calls.len(), 2, "both qualifying components attempted");
+        let (linked, failed) = (&calls[0], &calls[1]);
+        let failed_args = failed
+            .iter()
+            .map(u64::to_string)
+            .collect::<Vec<_>>()
+            .join(" ");
+        let StackLinkOutcome::Linked {
+            stacks,
+            unlinked,
+            warnings,
+        } = outcome
+        else {
+            panic!("a successful component must survive a later failure, got {outcome:?}");
+        };
+        assert_eq!(stacks, vec![linked.clone()], "successful stack ids kept");
+        assert_eq!(warnings.len(), 1, "one warning for the failed component");
+        assert!(
+            warnings[0].contains("network unreachable")
+                && warnings[0].contains(&format!("gh-stack link {failed_args}")),
+            "failure warning keeps rerun command: {warnings:?}"
+        );
+        assert!(
+            unlinked.iter().any(|note| note.contains("#9")),
+            "standalone PR is still reported: {unlinked:?}"
+        );
+        assert!(
+            !unlinked
+                .iter()
+                .any(|note| failed.iter().any(|pr| note.contains(&format!("#{pr}")))),
+            "PRs named in a warning are not repeated as orphans: {unlinked:?}"
+        );
+        if *linked == vec![1, 2] {
+            assert!(
+                unlinked.iter().any(|note| note.contains("top")),
+                "trailing-bookmark note kept: {unlinked:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn binary_vanishing_mid_run_keeps_earlier_stacks() {
+        let mut changes = linear_changes(&["a", "b"]);
+        changes.extend(linear_changes(&["c", "d"]));
+        let runner = SequencedRunner::new([LinkOutcome::Linked, LinkOutcome::MissingBinary]);
+
+        let outcome = link_from_graph(
+            &runner,
+            &github_config(),
+            &graph(&changes),
+            &pr_map(&[
+                mr_update("a", "1"),
+                mr_update("b", "2"),
+                mr_update("c", "3"),
+                mr_update("d", "4"),
+            ]),
+        );
+
+        assert!(
+            matches!(&outcome, StackLinkOutcome::Linked { stacks, warnings, .. }
+                if stacks.len() == 1 && warnings.len() == 1 && warnings[0].contains("no longer on PATH")),
+            "unexpected outcome {outcome:?}"
+        );
     }
 
     #[cfg(unix)]
@@ -806,6 +1066,7 @@ mod tests {
 
         let outcome = GhStackRunner {
             cwd: temp.path().to_path_buf(),
+            search_path: None,
         }
         .run_with_binary(&binary, &[1, 2], &github_config());
 
@@ -814,5 +1075,143 @@ mod tests {
             LinkOutcome::Failed { detail }
                 if detail.contains("[redacted]") && !detail.contains("test-token")
         ));
+    }
+
+    /// Drive the real plan → execute → stack-link handoff with descriptions
+    /// and title sync disabled, so unchanged existing PRs get no MR action and
+    /// the top of the stack is a new bookmark created by the push.
+    #[tokio::test]
+    async fn production_handoff_links_unchanged_existing_and_created_pull_requests() {
+        use std::collections::HashSet;
+
+        use crate::{
+            config::{Config, DescriptionConfig, ForgeType, TitleConfig},
+            forge::{ForgeImpl, test::TestForge},
+            output::BufferedOutput,
+            submit::{
+                PlanContext,
+                RootExecuteContext,
+                execute::execute,
+                find_changes_to_submit,
+                plan::plan,
+            },
+            tests::TestRepo,
+        };
+
+        let repo = TestRepo::with_local_remote();
+        repo.create_change("a.txt", "a", "A").create_bookmark("a");
+        repo.push_bookmark("a");
+        repo.exec(["new"]);
+        repo.create_change("b.txt", "b", "B").create_bookmark("b");
+        repo.push_bookmark("b");
+        repo.exec(["new"]);
+        repo.create_change("c.txt", "c", "C");
+        let pending_change = repo
+            .jj
+            .log("@")
+            .expect("read top change")
+            .into_iter()
+            .next()
+            .expect("top change exists")
+            .change_id;
+
+        let mut forge = TestForge::builder().build();
+        for (id, source, target) in [("10", "a", "main"), ("20", "b", "a")] {
+            forge.add_merge_request(
+                MergeRequest::builder()
+                    .id(id.to_owned())
+                    .title(format!("PR {source}"))
+                    .source_branch(source.to_owned())
+                    .target_branch(target.to_owned())
+                    .build(),
+            );
+        }
+        let forge = ForgeImpl::Test(forge);
+        let config = Config::builder()
+            .forge(ForgeType::GitHub)
+            .description(DescriptionConfig {
+                enabled: false,
+                ..DescriptionConfig::default()
+            })
+            .title(TitleConfig {
+                sync_single_revision: false,
+                sync_multiple_revisions: false,
+                ..TitleConfig::default()
+            })
+            .github(github_config())
+            .build();
+        let output = BufferedOutput::new();
+
+        let pending = HashSet::from([pending_change]);
+        let changes =
+            find_changes_to_submit(&repo.jj, ["a", "b"], &pending).expect("changes to submit");
+        let graph = BookmarkGraph::from_changes(&repo.jj, &changes, false).expect("graph");
+        let submission_plan = plan(PlanContext {
+            jj: &repo.jj,
+            forge: &forge,
+            config: &config,
+            output: &output,
+            bookmark_graph: &graph,
+            dry_run: false,
+        })
+        .await
+        .expect("plan");
+        let existing = submission_plan.existing_mrs.clone();
+
+        let result = execute(RootExecuteContext::new(
+            &repo.jj,
+            &forge,
+            &config,
+            &output,
+            false,
+            submission_plan,
+            changes.clone(),
+            false,
+            false,
+        ))
+        .await
+        .expect("execute");
+        assert!(
+            result.errors.is_empty(),
+            "execute errors: {:?}",
+            result.errors
+        );
+        assert_eq!(
+            result.merge_requests.len(),
+            1,
+            "only the new PR gets an MR action: {:?}",
+            result
+                .merge_requests
+                .iter()
+                .map(|u| &u.bookmark)
+                .collect::<Vec<_>>()
+        );
+
+        let runner = RecordingRunner::new(LinkOutcome::Linked);
+        let outcome = link_stacks_with_runner(
+            &runner,
+            &github_config(),
+            &repo.jj,
+            &result,
+            &existing,
+            false,
+            false,
+            false,
+        );
+
+        let created: u64 = result.merge_requests[0]
+            .mr
+            .iid()
+            .parse()
+            .expect("numeric id");
+        assert_eq!(
+            runner.calls(),
+            vec![vec![10, 20, created]],
+            "whole stack linked"
+        );
+        assert!(
+            matches!(&outcome, StackLinkOutcome::Linked { warnings, .. } if warnings.is_empty()),
+            "unexpected outcome {outcome:?}"
+        );
     }
 }
