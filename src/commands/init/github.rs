@@ -4,8 +4,9 @@ use dialoguer::{Input, Password};
 use owo_colors::OwoColorize as _;
 
 use crate::{
-    commands::init::{Remotes, get_config, parse_forge_url, set_config},
+    commands::init::{Remotes, get_config, set_config},
     error::Result,
+    remote::parse_forge_url,
 };
 
 /// Initialize GitHub-specific configuration.
