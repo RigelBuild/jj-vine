@@ -225,28 +225,15 @@ pub async fn submit(config: &SubmitCommandConfig, cli_config: &CliConfig<'_>) ->
 
     ensure_whatever!(!bookmarks.is_empty(), "No bookmarks in revset {}", revset);
 
-    output.log_message(&format!(
-        "Submitting bookmarks{}: {}",
-        if config.dry_run {
-            " (dry run)"
-        } else if config.show_plan {
-            " (plan only)"
-        } else {
-            ""
-        },
-        bookmarks
-            .iter()
-            .map(|bookmark| bookmark.magenta().to_string())
-            .join(", ")
-    ));
-
-    let changes = select_changes_to_submit(&jj, &revset, &bookmarks, &pending_bookmarks)?;
-
-    ensure_whatever!(
-        !changes.is_empty(),
-        "No changes to submit for bookmarks {}. They may already be merged into trunk. Inspect each exact name with `jj log -r <bookmark>`. The `mine()` filter found no changes to submit for bookmarks you did not author. Name each bookmark literally in the revset to include it.",
-        bookmarks.iter().map(JJName::raw_name).join(", ")
-    );
+    let changes = select_changes_to_submit_and_announce(
+        &jj,
+        &revset,
+        &bookmarks,
+        &pending_bookmarks,
+        config.dry_run,
+        config.show_plan,
+        output,
+    )?;
 
     let forge = ForgeImpl::new(&repo_config)?;
 
@@ -437,6 +424,38 @@ pub(crate) fn select_changes_to_submit(
         literal_bookmark_targets(jj, revset, bookmarks)?,
         pending_bookmarks,
     )
+}
+
+pub(crate) fn select_changes_to_submit_and_announce(
+    jj: &Jujutsu,
+    revset: &str,
+    bookmarks: &[BookmarkOrPending<'_>],
+    pending_bookmarks: &HashSet<String>,
+    dry_run: bool,
+    show_plan: bool,
+    output: &impl crate::output::Output,
+) -> Result<Vec<crate::jj::Change>> {
+    let changes = select_changes_to_submit(jj, revset, bookmarks, pending_bookmarks)?;
+    ensure_whatever!(
+        !changes.is_empty(),
+        "No changes to submit for bookmarks {}. Check whether each name is in trunk or resolved as a tag, and whether mine() filtered generalized selections.",
+        bookmarks.iter().map(JJName::raw_name).join(", ")
+    );
+    output.log_message(&format!(
+        "Submitting bookmarks{}: {}",
+        if dry_run {
+            " (dry run)"
+        } else if show_plan {
+            " (plan only)"
+        } else {
+            ""
+        },
+        BookmarkOrPending::from_changes(&changes)
+            .into_iter()
+            .map(|bookmark| bookmark.magenta().to_string())
+            .join(", ")
+    ));
+    Ok(changes)
 }
 
 /// Names of the resolved `bookmarks` that the user named literally in
