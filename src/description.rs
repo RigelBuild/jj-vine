@@ -585,7 +585,8 @@ pub struct FormatContext<'a, 'forge, 'lookup, S: BuildHasher = RandomState> {
     pub format_merge_request: &'forge ForgeImpl,
 }
 
-/// Generate a new description with stack visualization and user content.
+/// Replace the marked stack block, moving it to `placement` on resubmission.
+/// User text is retained, but text on either side of an old block may reorder.
 #[must_use]
 #[expect(clippy::module_name_repetitions, reason = "is sentence")]
 pub fn insert_stack_into_description(
