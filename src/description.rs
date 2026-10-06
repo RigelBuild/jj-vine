@@ -883,12 +883,13 @@ mod tests {
     }
 
     #[test]
-    fn parse_preserves_user_content_after_markers() {
+    fn bottom_stack_placement_follows_unmarked_user_content() {
         assert_str_eq!(
             insert_stack_into_description("Stack info", "User content", StackPlacement::Bottom),
             format!("User content\n\n{START_MARKER}\nStack info\n{END_MARKER}")
         );
     }
+
     #[test]
     fn top_stack_placement_precedes_user_content() {
         assert_str_eq!(
