@@ -116,12 +116,8 @@ fn github_remote_projects(remotes: Option<&Remotes>) -> (Option<String>, Option<
         .as_deref()
         .unwrap_or(&remotes.origin);
     let source_project = parse_forge_url(source_url).map(|forge| forge.project);
-    let target_project = remotes.target_forge.as_ref().map(|forge| {
-        forge
-            .target_project
-            .clone()
-            .unwrap_or_else(|| forge.project.clone())
-    });
+    let target_url = remotes.upstream.as_deref().unwrap_or(&remotes.origin);
+    let target_project = parse_forge_url(target_url).map(|forge| forge.project);
 
     (source_project, target_project)
 }
@@ -199,7 +195,9 @@ fn save_github_token(
     token: Option<&str>,
     token_command_configured: bool,
 ) -> Result<()> {
-    if !token_command_configured && let Some(token) = token {
+    if token_command_configured {
+        set_config(repo_path, "jj-vine.github.token", "")?;
+    } else if let Some(token) = token {
         set_config(repo_path, "jj-vine.github.token", token)?;
     }
     Ok(())
@@ -259,34 +257,122 @@ mod tests {
     }
 
     #[test]
-    fn token_command_skips_prompt_and_preserves_token_command() {
+    fn target_project_uses_upstream_fetch_url_when_selected() {
+        let remotes = Remotes {
+            origin: "git@github.com:person/fork.git".to_owned(),
+            source_push_url: None,
+            upstream: Some("git@github.com:owner/repo.git".to_owned()),
+            target_forge: None,
+        };
+
+        assert_eq!(
+            github_remote_projects(Some(&remotes)),
+            (
+                Some("person/fork".to_owned()),
+                Some("owner/repo".to_owned())
+            )
+        );
+    }
+
+    #[test]
+    fn inherited_token_command_clears_inherited_literal_token() {
         let directory = tempfile::TempDir::new().expect("temp directory");
         let repo_path = directory.path().join("repo");
+        let user_config_path = directory.path().join("user-config.toml");
         std::fs::create_dir_all(&repo_path).expect("create repo");
-        let jj = crate::jj::Jujutsu::new(&repo_path).expect("jj");
-        jj.exec(["git", "init", "--colocate"]).expect("init repo");
-        jj.exec([
-            "config",
-            "set",
-            "--repo",
-            "jj-vine.github.tokenCommand",
-            "[\"printf\", \"command-token\"]",
-        ])
-        .expect("configure token command");
+        std::fs::write(
+            &user_config_path,
+            "[jj-vine]\nforge = \"github\"\n\n[jj-vine.github]\nhost = \"https://api.github.com\"\nproject = \"owner/repo\"\ntoken = \"inherited-fixture-token\"\ntokenCommand = [\"printf\", \"command-token\"]\n",
+        )
+        .expect("write inherited token configuration");
 
-        let token_command_configured =
-            get_config(&repo_path, "jj-vine.github.tokenCommand").is_some();
+        let jj = crate::jj::Jujutsu::new_isolated(&repo_path, &user_config_path).expect("jj");
+        jj.exec(["git", "init", "--colocate"]).expect("init repo");
+        for (key, value) in [
+            ("jj-vine.forge", "github"),
+            ("jj-vine.github.host", "https://api.github.com"),
+            ("jj-vine.github.project", "owner/repo"),
+            (
+                "jj-vine.github.tokenCommand",
+                "[\"printf\", \"command-token\"]",
+            ),
+        ] {
+            jj.exec(["config", "set", "--repo", key, value])
+                .expect("configure repo");
+        }
+        let token_command_configured = jj
+            .exec_redacted(["config", "get", "jj-vine.github.tokenCommand"])
+            .is_ok();
+        assert!(token_command_configured);
+
+        save_github_token(&repo_path, None, token_command_configured)
+            .expect("override inherited literal token");
+
+        let config = crate::config::Config::load(&repo_path).expect("load effective config");
+        assert!(config.github.token.is_empty());
+        assert_eq!(config.github.token_command, ["printf", "command-token"]);
+    }
+
+    #[test]
+    fn token_command_clears_inherited_literal_token() {
+        let directory = tempfile::TempDir::new().expect("temp directory");
+        let repo_path = directory.path().join("repo");
+        let user_config_path = directory.path().join("user-config.toml");
+        std::fs::create_dir_all(&repo_path).expect("create repo");
+        std::fs::write(
+            &user_config_path,
+            "[jj-vine.github]\ntoken = \"inherited-fixture-token\"\n",
+        )
+        .expect("write inherited user token");
+
+        let jj = crate::jj::Jujutsu::new_isolated(&repo_path, &user_config_path).expect("jj");
+        jj.exec(["git", "init", "--colocate"]).expect("init repo");
+        for (key, value) in [
+            ("jj-vine.forge", "github"),
+            ("jj-vine.github.host", "https://api.github.com"),
+            ("jj-vine.github.project", "owner/repo"),
+            (
+                "jj-vine.github.tokenCommand",
+                "[\"printf\", \"command-token\"]",
+            ),
+        ] {
+            jj.exec(["config", "set", "--repo", key, value])
+                .expect("configure repository");
+        }
+
+        let token_command_configured = jj
+            .exec_redacted(["config", "get", "jj-vine.github.tokenCommand"])
+            .is_ok();
         let token = prompt_for_github_token(
-            get_config(&repo_path, "jj-vine.github.token"),
+            Some("inherited-fixture-token".to_owned()),
             token_command_configured,
             "https://api.github.com",
         )
         .expect("skip token prompt");
         save_github_token(&repo_path, token.as_deref(), token_command_configured)
-            .expect("preserve token command");
+            .expect("override inherited literal token");
 
+        let effective_config = jj
+            .exec_redacted(["config", "list"])
+            .expect("read effective config");
+        let effective_config: toml::Value =
+            toml::from_str(&effective_config.stdout).expect("parse effective config");
+        let github = effective_config
+            .get("jj-vine")
+            .and_then(|value| value.get("github"))
+            .expect("GitHub config");
+        assert_eq!(github.get("token").and_then(toml::Value::as_str), Some(""));
+        assert_eq!(
+            github.get("tokenCommand").and_then(toml::Value::as_array),
+            Some(&vec![
+                toml::Value::String("printf".to_owned()),
+                toml::Value::String("command-token".to_owned())
+            ])
+        );
+
+        let config = crate::config::Config::load(&repo_path).expect("load effective repo config");
+        assert!(config.github.token.is_empty());
+        assert_eq!(config.github.token_command, ["printf", "command-token"]);
         assert_eq!(token, None);
-        assert_eq!(get_config(&repo_path, "jj-vine.github.token"), None);
-        assert!(token_command_configured);
     }
 }
