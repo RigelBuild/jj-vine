@@ -1,0 +1,46 @@
+# Unwired: no moon workspace includes this repo and CI runs the justfile.
+# Local `moon run jj-vine-fork:ci` runs fmt, clippy (warnings only), build and test.
+# yaml-language-server: $schema=https://moonrepo.dev/schemas/project.json
+
+id: 'jj-vine-fork'
+layer: 'application'
+language: 'rust'
+tags: ['oss', 'static-runner']
+
+workspace:
+  inheritedTasks:
+    exclude: ['install', 'lint', 'format']
+
+fileGroups:
+  sources: ['**/*']
+  build-config: ['/.cargo/config.toml', '/rust-toolchain.toml']
+
+tasks:
+  fmt:
+    command: 'cargo fmt --check'
+    options:
+      cache: false
+    inputs: ['@group(sources)']
+
+  clippy:
+    command: 'cargo clippy --locked --tests --features no-e2e-tests'
+    options:
+      cache: false
+    inputs: ['@group(sources)', '@group(build-config)']
+
+  build:
+    command: 'cargo build --locked'
+    options:
+      cache: false
+    inputs: ['@group(sources)', '@group(build-config)']
+
+  test:
+    command: 'cargo test --locked --features no-e2e-tests'
+    options:
+      cache: false
+    inputs: ['@group(sources)', '@group(build-config)']
+
+  ci:
+    deps: ['fmt', 'clippy', 'build', 'test']
+    options:
+      cache: false
