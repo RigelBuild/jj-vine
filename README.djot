@@ -285,14 +285,20 @@ Required when `jj-vine.forge` is set to `github`.
 
 | Setting | Description | Type | Required | Default |
 |---------|-------------|------|----------|---------|
-| `github.host` | GitHub API URL; derived from the configured Git remote when no non-empty repository- or workspace-level value is set | String | No | Remote host, else global value, else `https://api.github.com` |
+| `github.host` | GitHub API URL; derived from the configured Git remote when no non-empty repository- or workspace-level value is set | String | No | Derived API host, else global value, else `https://api.github.com` |
 | `github.project` | Repository where branches are pushed in `owner/repo` format; derived from the configured Git remote when no non-empty repository- or workspace-level value is set | String | Yes, unless derived from a remote or set globally | Remote push project, else global value |
 | `github.token` | Personal access token. Classic PATs need the `repo` scope. Fine-grained PATs need **Contents: Read and Write** and **Pull requests: Read and Write**. Repos in an organization also need **Members: Read**. | String | Yes, unless `github.tokenCommand` is set | - |
 | `github.targetProject` | Target repository for pull requests (e.g., `upstream-owner/repo`). Use if you are using a fork. | String | No | (same as `github.project`) |
 | `github.tokenCommand` | Full command argv (array of strings) whose trimmed stdout supplies the token when `github.token` is empty. The command must be non-interactive: it gets stdin from the null device and, on Unix, runs in a new session with no controlling terminal, so a prompt for terminal input fails. When the command exits or is cancelled, processes remaining in its Unix process group or Windows job are killed. A Unix descendant that starts its own session or process group can escape this cleanup. Only the first 1 MiB of stdout is kept; excess bytes are dropped and a truncated UTF-8 character is an error. A non-zero exit, empty output, or a run longer than 10 seconds is an error. | String[] | Yes, if `github.token` is empty | - |
 | `github.linkStack` | Link submitted GitHub.com pull requests as a native stack when `gh-stack` is installed; Enterprise hosts, `--no-hooks`, and dry runs skip linking. One 60-second deadline covers the entire linking phase, including the `jj` commands that rebuild the stack graph and all stacks; a command still running at the deadline is killed. Stacks with failed pushes or base updates, missing PRs, or non-linear ancestry warn and are not linked. Helper failures and timeouts warn without failing submit. | Boolean | No | true |
 
-If no non-empty repository- or workspace-level `github.host` or `github.project` is set, jj-vine derives each value from the push URL of `remoteName` (or its fetch URL when no separate push URL exists). The clone value takes precedence over global configuration; a repository- or workspace-level value takes precedence over derivation. When no host is configured or derived, `github.host` defaults to `https://api.github.com`. If neither derivation nor global configuration supplies `github.project`, set it explicitly or configuration loading fails. Detection is disabled for fork workflows with a separate `upstream` remote, or `fork` beside `origin`; set `github.project` explicitly in these layouts. An HTTP Enterprise remote cannot supply an authenticated API host.
+Unless non-empty repository- or workspace-level `github.host` or `github.project` is set, jj-vine derives missing values from the push URL of `remoteName` (or its fetch URL when no separate push URL exists). Configured repository- or workspace-level values take precedence over derivation. Derived values take precedence over global configuration. If `github.project` is not configured, derived, or set globally, configuration loading fails. If `github.host` is not configured or derived, it defaults to `https://api.github.com`.
+
+Remote URLs using `github.com`, `www.github.com`, or `ssh.github.com` derive `https://api.github.com`, including SSH connections to `ssh.github.com` on port 443. Other detected GitHub Enterprise HTTPS and SSH remotes derive an API URL under their HTTPS origin. Plain HTTP GitHub Enterprise remotes do not derive a host because the API token could be sent over an unencrypted connection. Public GitHub HTTP remotes still map to the HTTPS API.
+
+The fork-side selection fence applies only to remote-derived `github.host` and `github.project`. When a separate `upstream` remote exists, only `upstream` is eligible. When `fork` and `origin` coexist, only `origin` is eligible. This fence does not disable fork workflows; configured and global values remain available when derivation is skipped.
+
+SSH host derivation does not inspect SSH config. A dotted alias with an alphabetic final label can look like a DNS hostname, so configure `github.host` explicitly when the distinction matters.
 
 #### Forgejo/Codeberg/Gitea{#forgejo-codeberg-gitea}
 
@@ -630,7 +636,7 @@ Some examples:
 
 ## Forks{#forks}
 
-`jj-vine` will work on forked repositories on all forges.
+`jj-vine` will work on forked repositories on all forges. For GitHub, remote-derived `github.host` and `github.project` follow the fork-side selection rule in the GitHub configuration section; this rule only affects derivation, not fork support itself.
 
 However, there is one main caveat: because none of the forges support the concept of stacked pull/merge requests when using forks, _all pull/merge requests must be created on the upstream, pointed to the first request's base branch_. This means that when viewing the diff page of stacked requests, the diff for all the requests lower in the stack will also be shown. To alleviate this somewhat, **Compare** links will be added to the generated stack description showing the diff between the actual base branch, and the source branch.
 

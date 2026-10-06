@@ -1,6 +1,6 @@
 //! Forge detection from a clone's Git remotes.
 //!
-//! URL parsing is shared by initialization and runtime config derivation.
+//! URL parsing derives runtime configuration from remote URLs.
 
 use itertools::Itertools as _;
 use tracing::debug;
@@ -101,7 +101,9 @@ impl<'a> RemoteUrl<'a> {
 
     /// Whether the hostname may be an SSH config `Host` alias rather than a
     /// DNS name, as in `github.com-work` or `github-work`. A DNS name ends in
-    /// an alphabetic top-level label; an alias often does not.
+    /// an alphabetic top-level label; an alias often does not. A dotted alias
+    /// with an alphabetic final label is indistinguishable from DNS syntax
+    /// without reading the SSH config.
     fn is_possible_ssh_alias(&self) -> bool {
         self.transport == Transport::Ssh
             && self.hostname.rsplit_once('.').is_none_or(|(_, tld)| {
@@ -143,7 +145,8 @@ fn project_path(path: &str) -> Option<&str> {
 pub(crate) fn parse_forge_url(url: &str) -> Option<DetectedForge> {
     let remote = RemoteUrl::parse(url)?;
     let is_public_github_host = remote.hostname.eq_ignore_ascii_case("github.com")
-        || remote.hostname.eq_ignore_ascii_case("www.github.com");
+        || remote.hostname.eq_ignore_ascii_case("www.github.com")
+        || remote.hostname.eq_ignore_ascii_case("ssh.github.com");
     let forge_type = if is_public_github_host {
         ForgeType::GitHub
     } else {
@@ -219,8 +222,9 @@ pub(crate) fn parse_remote_list_line(line: &str) -> Option<RemoteListEntry<'_>> 
 
 /// Derive forge details for the configured remote from the URL branches are
 /// pushed to. Returns `None` for an absent or unrecognized remote, a
-/// different forge type, or a fork workflow: a separate `upstream` remote, or
-/// `fork` beside `origin` (the layouts `jj-vine init` treats as forks).
+/// different forge type, or a fork-side selection: a separate `upstream`
+/// remote when the configured remote is not `upstream`, or `fork` beside
+/// `origin` when the configured remote is not `origin`.
 /// Detection is best-effort so config validation can report a missing
 /// project instead of failing on remote inspection.
 ///
@@ -292,6 +296,15 @@ mod tests {
     #[test]
     fn parse_github_ssh_url() {
         let detected = parse_forge_url("git@github.com:owner/repo.git").expect("GitHub URL");
+        assert_eq!(detected.forge_type, ForgeType::GitHub);
+        assert_eq!(detected.host.as_deref(), Some("https://api.github.com"));
+        assert_eq!(detected.project, "owner/repo");
+    }
+
+    #[test]
+    fn parse_github_ssh_over_443_maps_to_public_api() {
+        let detected = parse_forge_url("ssh://git@ssh.github.com:443/owner/repo.git")
+            .expect("GitHub SSH-over-443 URL");
         assert_eq!(detected.forge_type, ForgeType::GitHub);
         assert_eq!(detected.host.as_deref(), Some("https://api.github.com"));
         assert_eq!(detected.project, "owner/repo");
@@ -572,8 +585,7 @@ mod tests {
         assert_eq!(detected.project, "person/push");
     }
 
-    /// `fork` beside `origin` is the layout init treats as a fork workflow
-    /// with origin as the canonical target.
+    /// `fork` beside `origin` keeps origin eligible as the canonical target.
     #[test]
     fn detect_fork_remote_beside_origin_returns_none() {
         let (_temp, repo_path) = create_test_repo();
