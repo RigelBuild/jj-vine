@@ -446,7 +446,6 @@ pub struct Jujutsu {
     default_branch: OnceCell<Result<String, Error>>,
 }
 
-/// Assemble the full argv for pushing bookmarks with the selected command.
 pub(crate) fn build_push_argv(
     push_argv: &[String],
     remote: Option<&str>,
@@ -465,7 +464,6 @@ pub(crate) fn build_push_argv(
     args
 }
 
-/// Assemble the full argv for pushing changes and creating their bookmarks.
 pub(crate) fn build_push_create_argv(
     push_argv: &[String],
     remote: Option<&str>,
