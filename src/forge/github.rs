@@ -404,7 +404,11 @@ mod token_config_tests {
     /// layer configured it. An empty host has no scheme and is rejected too.
     #[test]
     fn validate_config_rejects_non_https_host() {
-        for host in ["http://github.example.com/api/v3", "HTTP://api.github.com", ""] {
+        for host in [
+            "http://github.example.com/api/v3",
+            "HTTP://api.github.com",
+            "",
+        ] {
             let config = Config::builder()
                 .forge(crate::config::ForgeType::GitHub)
                 .github(crate::config::GitHubConfig {
@@ -416,7 +420,10 @@ mod token_config_tests {
                 .build();
 
             let error = validate_config(&config).expect_err("non-HTTPS host is rejected");
-            assert!(error.to_string().contains("https:// API URL"), "{host}: {error}");
+            assert!(
+                error.to_string().contains("https:// API URL"),
+                "{host}: {error}"
+            );
         }
     }
 

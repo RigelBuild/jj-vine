@@ -1490,7 +1490,7 @@ mod tests {
             .expect("Failed to set push URL");
     }
 
-    /// RIG-4670: a remote that fetches the canonical repository and pushes to
+    /// A remote that fetches the canonical repository and pushes to
     /// another one on the same host is a fork workflow. A global
     /// `targetProject` is superseded, like global `project` and `host`.
     #[test]
