@@ -585,7 +585,7 @@ pub struct FormatContext<'a, 'forge, 'lookup, S: BuildHasher = RandomState> {
     pub format_merge_request: &'forge ForgeImpl,
 }
 
-/// Replace the marked stack block, moving it to `placement` on resubmission.
+/// Insert or replace the marked stack block at `placement`.
 /// User text is retained, but text on either side of an old block may reorder.
 #[must_use]
 #[expect(clippy::module_name_repetitions, reason = "is sentence")]
