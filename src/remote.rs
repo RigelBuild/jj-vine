@@ -157,7 +157,7 @@ pub(crate) fn parse_forge_url(url: &str) -> Option<DetectedForge> {
 
 /// One `jj git remote list` entry: `<name> <fetch-url>`, optionally followed
 /// by ` (push: <push-url>)`. Returns the name and the fetch URL.
-fn parse_remote_list_line(line: &str) -> Option<(&str, &str)> {
+pub(crate) fn parse_remote_list_line(line: &str) -> Option<(&str, &str)> {
     let mut fields = line.split_whitespace();
     let name = fields.next()?;
     let fetch_url = fields.next()?;
