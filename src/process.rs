@@ -21,8 +21,9 @@
 //! disposition is restored and the signal is raised again, so the process ends
 //! as it would have with no child running. The default is restored only where
 //! this module's handler is still installed: a handler other code installed
-//! during the run is kept, and a caught signal is then raised to it. On
-//! Windows, a console Ctrl-C reaches the child directly, and the job's
+//! during the run is kept, and a caught signal is then raised to it. If that
+//! handler returns, the signal is consumed and later runs are not cancelled.
+//! On Windows, a console Ctrl-C reaches the child directly, and the job's
 //! kill-on-close limit kills the tree when this process exits.
 //!
 //! Limits: a Unix descendant that leaves the process group on purpose
@@ -46,8 +47,8 @@ const DRAIN_GRACE: Duration = Duration::from_millis(500);
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 /// Run `command` to completion with a wall-clock `timeout`. Returns `Ok(None)`
-/// if the child overran the deadline. The exit is checked only while the
-/// deadline has not passed; an exit first seen after it is an overrun, so a
+/// if the child overran the deadline. The clock is read after each exit
+/// check, so an exit first seen at or after the deadline is an overrun and a
 /// late child cannot return output.
 ///
 /// The child and descendants still in its process group or job are killed when
@@ -84,6 +85,31 @@ fn append_capped(buf: &mut Vec<u8>, bytes: &[u8]) {
     }
 }
 
+/// The result of one exit check, judged against the deadline.
+enum Check<T> {
+    /// The child exited before the deadline.
+    Exited(T),
+    /// The child is running; this much time is left.
+    Running(Duration),
+    /// The deadline passed, whether or not the child has exited.
+    Overrun,
+}
+
+/// Run the exit check `observe`, then read the clock. Reading it after the
+/// check makes an exit seen at or after the deadline an overrun.
+fn check_exit<T>(
+    start: std::time::Instant,
+    timeout: Duration,
+    observe: impl FnOnce() -> std::io::Result<Option<T>>,
+) -> std::io::Result<Check<T>> {
+    let exited = observe()?;
+    let remaining = timeout.saturating_sub(start.elapsed());
+    if remaining.is_zero() {
+        return Ok(Check::Overrun);
+    }
+    Ok(exited.map_or(Check::Running(remaining), Check::Exited))
+}
+
 #[cfg(unix)]
 mod platform {
     use core::{
@@ -98,7 +124,7 @@ mod platform {
         time::Instant,
     };
 
-    use super::{DRAIN_GRACE, POLL_INTERVAL, append_capped};
+    use super::{Check, DRAIN_GRACE, POLL_INTERVAL, append_capped, check_exit};
 
     pub(super) fn run(mut command: Command, timeout: Duration) -> io::Result<Option<Output>> {
         // A new session: the child leads a new process group, whose id is its
@@ -138,10 +164,8 @@ mod platform {
 
         let start = Instant::now();
         let status = loop {
-            // Read the clock before the exit check: a child seen exited only
-            // after the deadline is an overrun, not a success.
-            let elapsed = start.elapsed();
-            if elapsed < timeout && tree.has_exited()? {
+            let check = check_exit(start, timeout, || Ok(tree.has_exited()?.then_some(())))?;
+            if matches!(check, Check::Exited(())) {
                 break tree.kill_and_reap()?;
             }
             if CANCEL_SIGNAL.load(Ordering::Acquire) != 0_i32 {
@@ -151,11 +175,11 @@ mod platform {
                     "cancelled by signal",
                 ));
             }
-            if elapsed >= timeout {
+            let Check::Running(remaining) = check else {
                 tree.kill_and_reap()?;
                 return Ok(None);
-            }
-            streams.pump(POLL_INTERVAL.min(timeout.saturating_sub(elapsed)))?;
+            };
+            streams.pump(POLL_INTERVAL.min(remaining))?;
         };
 
         // The tree is dead, so its pipe ends are closed and EOF follows the
@@ -180,7 +204,7 @@ mod platform {
     const CANCEL_SIGNALS: [libc::c_int; 3] = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP];
 
     /// The first cancellation signal caught while a run was active, or 0.
-    /// Never reset: the process ends when the last run returns.
+    /// The last run to end takes it and raises it again.
     static CANCEL_SIGNAL: AtomicI32 = AtomicI32::new(0);
 
     /// Active runs and the signals whose handler this module installed.
@@ -205,10 +229,10 @@ mod platform {
     /// Catches the cancellation signals while at least one run is active.
     /// Only a signal whose disposition is the default on entry is caught, so
     /// an ignored signal or a handler installed by other code is left alone.
-    struct CancelGuard;
+    pub(super) struct CancelGuard;
 
     impl CancelGuard {
-        fn enter() -> Self {
+        pub(super) fn enter() -> Self {
             let mut state = CANCEL_STATE.lock().unwrap_or_else(PoisonError::into_inner);
             if state.active == 0 {
                 for (signal, installed) in CANCEL_SIGNALS.iter().zip(state.installed.iter_mut()) {
@@ -232,7 +256,9 @@ mod platform {
                     restore_default_if_ours(*signal);
                 }
             }
-            let pending = CANCEL_SIGNAL.load(Ordering::Acquire);
+            // Take the signal, so a handler that returns does not cancel
+            // later runs. A signal recorded after this swap stays recorded.
+            let pending = CANCEL_SIGNAL.swap(0_i32, Ordering::AcqRel);
             if pending != 0_i32 {
                 // Only a signal this module caught is recorded. Its
                 // disposition is the default again, so this ends the process
@@ -489,7 +515,7 @@ mod platform {
         },
     };
 
-    use super::{DRAIN_GRACE, POLL_INTERVAL, append_capped};
+    use super::{Check, DRAIN_GRACE, POLL_INTERVAL, append_capped, check_exit};
 
     pub(super) fn run(mut command: Command, timeout: Duration) -> io::Result<Option<Output>> {
         // Start suspended so the child cannot create a process before it is
@@ -517,26 +543,24 @@ mod platform {
 
         let start = Instant::now();
         let status = loop {
-            // Read the clock before the exit check: a child seen exited only
-            // after the deadline is an overrun, not a success.
-            let elapsed = start.elapsed();
-            if elapsed < timeout {
-                match child.try_wait() {
-                    Ok(Some(status)) => break status,
-                    Ok(None) => {}
-                    Err(error) => {
-                        terminate(&job, &mut child).ok();
-                        finish(stdout, stderr, Duration::ZERO);
-                        return Err(error);
-                    }
+            let check = match check_exit(start, timeout, || child.try_wait()) {
+                Ok(check) => check,
+                Err(error) => {
+                    terminate(&job, &mut child).ok();
+                    finish(stdout, stderr, Duration::ZERO);
+                    return Err(error);
                 }
-            } else {
-                let killed = terminate(&job, &mut child);
-                finish(stdout, stderr, Duration::ZERO);
-                killed?;
-                return Ok(None);
+            };
+            match check {
+                Check::Exited(status) => break status,
+                Check::Running(remaining) => std::thread::sleep(POLL_INTERVAL.min(remaining)),
+                Check::Overrun => {
+                    let killed = terminate(&job, &mut child);
+                    finish(stdout, stderr, Duration::ZERO);
+                    killed?;
+                    return Ok(None);
+                }
             }
-            std::thread::sleep(POLL_INTERVAL.min(timeout.saturating_sub(elapsed)));
         };
 
         // The child has exited; its descendants are killed even though the
@@ -1107,6 +1131,84 @@ mod tests {
             Some(handler),
             "the run must not reset a handler installed while it ran"
         );
+    }
+
+    #[test]
+    fn check_exit_treats_exit_seen_at_deadline_as_overrun() {
+        let start = std::time::Instant::now();
+        let timeout = core::time::Duration::from_millis(1);
+        let check = check_exit(start, timeout, || {
+            std::thread::sleep(core::time::Duration::from_millis(5));
+            Ok(Some(()))
+        })
+        .expect("the exit check must not error");
+        assert!(
+            matches!(check, Check::Overrun),
+            "an exit first observed after the deadline must not return output"
+        );
+    }
+
+    #[test]
+    fn output_with_timeout_consumes_signal_taken_by_returning_handler() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut parent = spawn_isolated("isolated_returning_handler_child", dir.path());
+        let start = std::time::Instant::now();
+        let status = loop {
+            if let Some(status) = parent.try_wait().expect("try_wait must not error") {
+                break status;
+            }
+            if start.elapsed() > core::time::Duration::from_secs(30) {
+                parent.kill().ok();
+                parent.wait().ok();
+                panic!("the child-mode test did not finish");
+            }
+            std::thread::sleep(core::time::Duration::from_millis(20));
+        };
+        assert!(
+            status.success(),
+            "a signal raised to a returning handler must not cancel a later run; \
+             child-mode test failed with {status:?}"
+        );
+    }
+
+    /// Child mode for
+    /// `output_with_timeout_consumes_signal_taken_by_returning_handler`: catch
+    /// SIGTERM, hand it to a returning embedder handler, then run a helper.
+    #[test]
+    #[ignore = "child mode; run only by output_with_timeout_consumes_signal_taken_by_returning_handler"]
+    fn isolated_returning_handler_child() {
+        if std::env::var_os(CHILD_DIR_ENV).is_none() {
+            return;
+        }
+        assert!(
+            platform::set_disposition(libc::SIGTERM, libc::SIG_DFL),
+            "SIGTERM must start at the default disposition"
+        );
+        let handler: extern "C" fn(libc::c_int) = embedder_handler;
+        let handler = handler as libc::sighandler_t;
+        let guard = platform::CancelGuard::enter();
+        assert_ne!(
+            platform::current_disposition(libc::SIGTERM),
+            Some(libc::SIG_DFL),
+            "the guard must catch SIGTERM, or this test proves nothing"
+        );
+        // SAFETY: raise has no memory-safety preconditions. It signals
+        // this thread, so the module's handler runs before it returns.
+        assert_eq!(unsafe { libc::raise(libc::SIGTERM) }, 0_i32);
+        assert!(
+            platform::set_disposition(libc::SIGTERM, handler),
+            "the embedder handler must install"
+        );
+        drop(guard);
+        // Dropping the guard raised SIGTERM to the embedder handler, which
+        // returned. The helper outlives the first exit check, so a stale
+        // signal would cancel it.
+        let mut command = std::process::Command::new("sh");
+        command.args(["-c", "sleep 0.2; printf after-signal"]);
+        let output = output_with_timeout(command, core::time::Duration::from_secs(20))
+            .expect("a consumed signal must not cancel a later run")
+            .expect("the helper exits before the deadline");
+        assert_eq!(output.stdout, b"after-signal");
     }
 }
 
