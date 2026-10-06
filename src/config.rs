@@ -924,6 +924,13 @@ impl Config {
             ForgeType::AzureDevOps => crate::forge::azure::validate_config(self),
         }?;
 
+        if matches!(&self.push, RepoPushConfig::Command(argv) if argv.is_empty()) {
+            return Err(ConfigSnafu {
+                message: "jj-vine.push must be a boolean or a non-empty command array".to_owned(),
+            }
+            .build());
+        }
+
         Ok(())
     }
 }
@@ -1891,6 +1898,42 @@ mod tests {
             config.push,
             RepoPushConfig::Command(vec!["custom-push".to_owned(), "push".to_owned()])
         );
+        Ok(())
+    }
+
+    #[test]
+    fn push_config_rejects_empty_command() -> Result<()> {
+        let (_temp, repo_path) = create_test_repo();
+        let jj = isolated_jj(&repo_path)?;
+        jj.exec(["config", "set", "--repo", "jj-vine.forge", "forgejo"])?;
+        jj.exec([
+            "config",
+            "set",
+            "--repo",
+            "jj-vine.forgejo.host",
+            "https://forgejo.example",
+        ])?;
+        jj.exec([
+            "config",
+            "set",
+            "--repo",
+            "jj-vine.forgejo.project",
+            "owner/repository",
+        ])?;
+        jj.exec([
+            "config",
+            "set",
+            "--repo",
+            "jj-vine.forgejo.token",
+            "test-token",
+        ])?;
+        jj.exec(["config", "set", "--repo", "jj-vine.push", "[]"])?;
+
+        let message = load_isolated(&repo_path)
+            .expect_err("an empty push command is rejected")
+            .to_string();
+
+        assert!(message.contains("jj-vine.push"), "{message}");
         Ok(())
     }
 }

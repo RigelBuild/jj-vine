@@ -364,22 +364,27 @@ fn stale_and_synced_stacks() -> (TestRepo<TestRepo<()>>, ForgeImpl) {
     (repo, forge)
 }
 
-/// Plans and executes a submission of `child` and `synced`, as `submit` does.
+/// Submission revset for [`stale_and_synced_stacks`].
+const STALE_AND_SYNCED: &str = "child | synced";
+
+/// Plans and executes a submission of `revset`, as `submit` does. Changes in
+/// `pending` get bookmarks created, as with `submit --create`.
 async fn plan_and_execute(
     repo: &TestRepo<TestRepo<()>>,
     forge: &ForgeImpl,
     push: RepoPushConfig,
     dry_run: bool,
+    revset: &str,
+    pending: &HashSet<String>,
 ) -> (SubmissionResult, String) {
     let config = Config::builder()
         .forge(ForgeType::Forgejo)
         .push(push)
         .build();
     let output = BufferedOutput::new();
-    let pending = HashSet::new();
     let targets = repo
         .jj
-        .log("child | synced")
+        .log_with_pending_bookmarks(revset, pending)
         .expect("read submission targets");
     let bookmarks: Vec<_> = BookmarkOrPending::from_changes(&targets)
         .into_iter()
@@ -387,7 +392,7 @@ async fn plan_and_execute(
     let changes = find_changes_to_submit(
         &repo.jj,
         bookmarks.iter().map(BookmarkOrPending::change_id),
-        &pending,
+        pending,
     )
     .expect("find changes to submit");
     let graph = BookmarkGraph::from_changes(&repo.jj, &changes, false).expect("build graph");
@@ -446,8 +451,15 @@ async fn disabled_push_skips_mr_actions_on_unpushed_heads() {
     let (repo, forge) = stale_and_synced_stacks();
     let stale_description = mr_description(&forge, "stale").await;
 
-    let (result, output) =
-        plan_and_execute(&repo, &forge, RepoPushConfig::Enabled(false), false).await;
+    let (result, output) = plan_and_execute(
+        &repo,
+        &forge,
+        RepoPushConfig::Enabled(false),
+        false,
+        STALE_AND_SYNCED,
+        &HashSet::new(),
+    )
+    .await;
 
     assert!(
         result.errors.is_empty(),
@@ -486,8 +498,15 @@ async fn disabled_push_skips_mr_actions_on_unpushed_heads() {
 async fn disabled_push_dry_run_reports_skipped_mr_actions() {
     let (repo, forge) = stale_and_synced_stacks();
 
-    let (result, output) =
-        plan_and_execute(&repo, &forge, RepoPushConfig::Enabled(false), true).await;
+    let (result, output) = plan_and_execute(
+        &repo,
+        &forge,
+        RepoPushConfig::Enabled(false),
+        true,
+        STALE_AND_SYNCED,
+        &HashSet::new(),
+    )
+    .await;
 
     assert!(result.errors.is_empty(), "{:?}", result.errors);
     assert!(output.contains("Would skip because pushing is disabled"));
@@ -512,6 +531,8 @@ async fn failed_push_still_fails_dependent_mr_actions() {
         &forge,
         RepoPushConfig::Command(vec!["false".to_owned()]),
         false,
+        STALE_AND_SYNCED,
+        &HashSet::new(),
     )
     .await;
 
@@ -524,4 +545,177 @@ async fn failed_push_still_fails_dependent_mr_actions() {
         result.errors
     );
     assert_eq!(mr_target(&forge, "child").await, None);
+}
+
+/// A repository with a second remote, `mirror`, beside the configured push
+/// remote `origin`:
+///
+/// - `missing` is tracked and synced on `mirror` but was never pushed to
+///   `origin`.
+/// - `stale` was pushed to `origin`, then rewritten and pushed to `mirror`
+///   only, so it is synced on `mirror` and stale on `origin`.
+///
+/// Both have an MR targeting an old base. Returns the repository, the
+/// `mirror` remote (kept alive for the test), and the forge.
+fn synced_only_on_other_remote() -> (TestRepo<TestRepo<()>>, TestRepo<()>, ForgeImpl) {
+    let repo = TestRepo::with_local_remote();
+    let mirror = TestRepo::new();
+    repo.exec([
+        "git",
+        "remote",
+        "add",
+        "mirror",
+        mirror.path.to_str().expect("UTF-8 temp path"),
+    ]);
+
+    repo.create_change("missing.txt", "missing", "Missing commit")
+        .create_bookmark("missing")
+        .exec(["bookmark", "track", "missing", "--remote", "mirror"])
+        .exec(["git", "push", "--remote", "mirror", "--bookmark", "missing"]);
+
+    repo.new_on("main")
+        .create_change("stale.txt", "stale", "Stale commit")
+        .create_and_push_bookmark("stale")
+        .exec(["describe", "-r", "stale", "-m", "Stale commit, rewritten"])
+        .exec(["bookmark", "track", "stale", "--remote", "mirror"])
+        .exec(["git", "push", "--remote", "mirror", "--bookmark", "stale"]);
+    repo.new_on("main");
+
+    let forge = ForgeImpl::Test(
+        TestForge::builder()
+            .merge_requests(HashMap::from([
+                (
+                    "1".to_owned(),
+                    MergeRequest::builder()
+                        .id("1".to_owned())
+                        .title("Missing commit".to_owned())
+                        .source_branch("missing".to_owned())
+                        .target_branch("old-base".to_owned())
+                        .build(),
+                ),
+                (
+                    "2".to_owned(),
+                    MergeRequest::builder()
+                        .id("2".to_owned())
+                        .title("Stale commit".to_owned())
+                        .source_branch("stale".to_owned())
+                        .target_branch("old-base".to_owned())
+                        .build(),
+                ),
+            ]))
+            .build(),
+    );
+
+    (repo, mirror, forge)
+}
+
+#[tokio::test]
+async fn disabled_push_ignores_sync_with_a_remote_other_than_the_push_remote() {
+    let (repo, _mirror, forge) = synced_only_on_other_remote();
+
+    let (result, output) = plan_and_execute(
+        &repo,
+        &forge,
+        RepoPushConfig::Enabled(false),
+        false,
+        "missing | stale",
+        &HashSet::new(),
+    )
+    .await;
+
+    assert!(result.errors.is_empty(), "{:?}", result.errors);
+    assert!(result.bookmarks_pushed.is_empty());
+    assert!(
+        result.merge_requests.is_empty(),
+        "no MR changes for heads missing or stale on the push remote: {:?}",
+        result.merge_requests
+    );
+    assert!(output.contains("Skipping because pushing is disabled"));
+    assert_eq!(
+        mr_target(&forge, "missing").await.as_deref(),
+        Some("old-base"),
+        "sync with mirror does not make a head missing on origin pushed"
+    );
+    assert_eq!(
+        mr_target(&forge, "stale").await.as_deref(),
+        Some("old-base"),
+        "sync with mirror does not make a stale head on origin pushed"
+    );
+}
+
+/// A repository with one unbookmarked change on `main`, as `submit --create`
+/// would bookmark. Returns the repository and the change ID.
+fn unbookmarked_change() -> (TestRepo<TestRepo<()>>, String) {
+    let repo = TestRepo::with_local_remote();
+    repo.create_change("new.txt", "new", "New commit");
+    let change_id = repo
+        .jj
+        .log("@")
+        .expect("read new change")
+        .into_iter()
+        .next()
+        .expect("new change exists")
+        .change_id;
+    repo.new_on("main");
+
+    (repo, change_id)
+}
+
+#[tokio::test]
+async fn disabled_push_create_skips_mr_creation() {
+    let (repo, change_id) = unbookmarked_change();
+    let forge = ForgeImpl::Test(TestForge::default());
+
+    let (result, output) = plan_and_execute(
+        &repo,
+        &forge,
+        RepoPushConfig::Enabled(false),
+        false,
+        &change_id,
+        &HashSet::from([change_id.clone()]),
+    )
+    .await;
+
+    assert!(result.errors.is_empty(), "{:?}", result.errors);
+    assert!(result.bookmarks_pushed.is_empty());
+    assert!(result.merge_requests.is_empty(), "no MR is created");
+    assert!(output.contains("Skipping because pushing is disabled"));
+    let change = repo
+        .jj
+        .log(&change_id)
+        .expect("read change")
+        .into_iter()
+        .next()
+        .expect("change exists");
+    assert!(
+        change.bookmarks.is_empty(),
+        "no bookmark is created when pushing is disabled: {:?}",
+        change.bookmarks
+    );
+}
+
+#[tokio::test]
+async fn disabled_push_create_dry_run_promises_no_push_or_mr() {
+    let (repo, change_id) = unbookmarked_change();
+    let forge = ForgeImpl::Test(TestForge::default());
+
+    let (result, output) = plan_and_execute(
+        &repo,
+        &forge,
+        RepoPushConfig::Enabled(false),
+        true,
+        &change_id,
+        &HashSet::from([change_id.clone()]),
+    )
+    .await;
+
+    assert!(result.errors.is_empty(), "{:?}", result.errors);
+    assert!(result.bookmarks_pushed.is_empty());
+    assert!(result.merge_requests.is_empty());
+    assert!(output.contains("Would skip creating and pushing bookmarks"));
+    assert!(output.contains("Would skip because pushing is disabled"));
+    assert!(
+        !output.contains("Would create"),
+        "dry-run promises neither a bookmark push nor an MR: {output}"
+    );
 }

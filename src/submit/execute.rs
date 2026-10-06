@@ -5,7 +5,7 @@ pub mod sync_dependent_merge_requests;
 pub mod update_mr_base;
 pub mod update_mr_title_description;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use bon::bon;
 use enum_dispatch::enum_dispatch;
@@ -24,7 +24,6 @@ use crate::{
     },
     error::{ClonableError, Error, Result},
     forge::AnyForgeMergeRequest,
-    jj::BookmarkInfo,
     submit::{
         ExecuteContext,
         RootExecuteContext,
@@ -410,11 +409,13 @@ pub async fn execute(mut ctx: RootExecuteContext<'_>) -> Result<SubmissionResult
     })
 }
 
-/// Planned push targets whose remote head will not match the local head
-/// because pushing is disabled. Empty unless pushing is disabled.
+/// Planned push targets whose head on the push remote will not match the local
+/// head because pushing is disabled. Empty unless pushing is disabled.
 ///
-/// A tracked bookmark already in sync with its remote does not depend on the
-/// push, so merge request actions for it still run.
+/// A bookmark already tracked and in sync on the push action's own remote
+/// does not depend on the push, so merge request actions for it still run.
+/// Sync with any other remote does not count. When the push remote's state
+/// cannot be read, every bookmark counts as unpushed.
 fn unpushed_push_targets(ctx: &RootExecuteContext<'_>) -> Vec<BookmarkNameOrPendingChangeId> {
     let mut targets = Vec::new();
 
@@ -422,31 +423,31 @@ fn unpushed_push_targets(ctx: &RootExecuteContext<'_>) -> Vec<BookmarkNameOrPend
         return targets;
     }
 
-    let is_synced = |name: &str| {
-        ctx.changes
-            .iter()
-            .flat_map(|change| &change.bookmarks)
-            .any(|info| {
-                matches!(
-                    info,
-                    BookmarkInfo::Local {
-                        name: local_name,
-                        remote_different_from_local: false,
-                        tracked: true,
-                    } if local_name == name
-                )
-            })
-    };
-
     for action in ctx.plan.actions.iter().flatten() {
         match action {
-            Action::Push(push) => targets.extend(
-                push.bookmarks
-                    .iter()
-                    .filter(|name| !is_synced(name))
-                    .cloned()
-                    .map(BookmarkNameOrPendingChangeId::Bookmark),
-            ),
+            Action::Push(push) => {
+                let synced = ctx
+                    .jj
+                    .bookmarks_synced_with_remote(
+                        push.bookmarks.iter().map(String::as_str),
+                        &push.remote,
+                    )
+                    .unwrap_or_else(|error| {
+                        debug!(
+                            "Could not read bookmark state on remote {}; treating all as unpushed: {error}",
+                            push.remote
+                        );
+                        HashSet::new()
+                    });
+
+                targets.extend(
+                    push.bookmarks
+                        .iter()
+                        .filter(|name| !synced.contains(*name))
+                        .cloned()
+                        .map(BookmarkNameOrPendingChangeId::Bookmark),
+                );
+            }
             Action::PushCreate(push_create) => targets.extend(
                 push_create
                     .change_ids

@@ -772,6 +772,50 @@ impl Jujutsu {
             .collect())
     }
 
+    /// Returns the subset of `bookmarks` whose local target matches the
+    /// tracked bookmark on `remote`.
+    ///
+    /// A bookmark that is untracked, missing, or stale on `remote` is left out,
+    /// even when it is synced with another remote.
+    pub fn bookmarks_synced_with_remote<'a>(
+        &self,
+        bookmarks: impl IntoIterator<Item = &'a str>,
+        remote: &str,
+    ) -> Result<HashSet<String>> {
+        let name_patterns: Vec<_> = bookmarks
+            .into_iter()
+            .map(|name| format!("exact:{}", revset_string_literal(name)))
+            .collect();
+        if name_patterns.is_empty() {
+            return Ok(HashSet::new());
+        }
+
+        let remote_pattern = format!("exact:{}", revset_string_literal(remote));
+        let output = self.exec(
+            [
+                "bookmark",
+                "list",
+                "--remote",
+                remote_pattern.as_str(),
+                "--template",
+                r#"if(remote && tracked && synced, json(name) ++ "\n")"#,
+            ]
+            .into_iter()
+            .chain(name_patterns.iter().map(String::as_str)),
+        )?;
+
+        output
+            .stdout
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| {
+                serde_json::from_str(line).context(JsonSnafu {
+                    json: line.to_owned(),
+                })
+            })
+            .collect()
+    }
+
     /// Check if a bookmark exists on a remote.
     pub fn remote_bookmark_exists(&self, bookmark: &str, remote: Option<&str>) -> Result<bool> {
         let output = self.exec([
@@ -830,6 +874,13 @@ impl Jujutsu {
             .as_ref().map_err::<Error, _>(|e| make_whatever!("{}", e.to_string()))?
             .as_str())
     }
+}
+
+/// Quotes `value` as a jj string literal. JSON and jj share the escapes for
+/// quotes, backslashes, and common whitespace; jj rejects other JSON control
+/// escapes, so such a name fails the command instead of matching wrongly.
+fn revset_string_literal(value: &str) -> String {
+    serde_json::Value::String(value.to_owned()).to_string()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
