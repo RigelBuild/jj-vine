@@ -556,12 +556,16 @@ impl Jujutsu {
             .build());
         };
 
-        let bin_path = which::which(bin).map_err(|_| {
-            ConfigSnafu {
-                message: "push command executable not found in PATH".to_owned(),
-            }
-            .build()
-        })?;
+        let bin_path = if bin.contains(std::path::is_separator) {
+            self.cwd.join(bin)
+        } else {
+            which::which(bin).map_err(|_| {
+                ConfigSnafu {
+                    message: "push command executable not found in PATH".to_owned(),
+                }
+                .build()
+            })?
+        };
         trace!("Running configured push command");
 
         let mut command = Command::new(bin_path);
@@ -1124,6 +1128,27 @@ mod tests {
         let error = jj.exec_argv(&[]).expect_err("empty argv must be rejected");
 
         assert!(error.to_string().contains("push command must not be empty"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exec_argv_resolves_relative_binary_in_selected_repo() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let repo = TempDir::new().expect("selected repository");
+        let script = repo.path().join("push-command");
+        std::fs::write(&script, "#!/bin/sh\nprintf selected-repo").expect("write command");
+        let mut permissions = std::fs::metadata(&script)
+            .expect("command metadata")
+            .permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&script, permissions).expect("mark command executable");
+
+        let jj = Jujutsu::new(repo.path()).expect("jj instance");
+        let output = jj
+            .exec_argv(&argv(&["./push-command"]))
+            .expect("resolve the configured command under the selected repository");
+        assert_eq!(output.stdout, "selected-repo");
     }
 
     #[test]
