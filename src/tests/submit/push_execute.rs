@@ -679,9 +679,9 @@ async fn disabled_push_skips_pushed_child_mr_when_parent_creation_is_skipped() {
         !requests.iter().any(|request| {
             request.line.starts_with(&format!("POST {MR_API} "))
                 && serde_json::from_str::<Value>(&request.body)
-                    .is_ok_and(|body| body["source_branch"] == "c")
+                    .is_ok_and(|body| body["source_branch"] == "p" || body["source_branch"] == "c")
         }),
-        "c's pushed head must not get an MR while its pushed target p has no MR: {requests:?}"
+        "neither p nor c may get an MR when p's pending target has no MR: {requests:?}"
     );
 }
 
