@@ -109,14 +109,9 @@ async fn named_target_on_foreign_bookmark_fails_before_push() -> Result<()> {
         .clone();
     assert_ne!(local_target, remote_before);
 
-    let error = repo
-        .try_run(["submit", "b"])
-        .await
-        .unwrap_err()
-        .to_string();
+    let error = repo.try_run(["submit", "b"]).await.unwrap_err().to_string();
 
     assert_contains!(error, "`b` stacks on `c`");
-    assert_contains!(error, "jj-vine submit 'b | c'");
     let remote_after = remote_bookmark()?;
     assert_eq!(remote_after, remote_before);
 
@@ -187,8 +182,7 @@ fn tracked_announcement_omits_untracked_local_ancestor() -> Result<()> {
     let bookmarks: Vec<_> = BookmarkOrPending::from_changes(&changes)
         .into_iter()
         .collect();
-    let selected =
-        select_changes_to_submit(&repo.jj, &revset, &bookmarks, &HashSet::new())?;
+    let selected = select_changes_to_submit(&repo.jj, &revset, &bookmarks, &HashSet::new())?;
     let bookmark_graph = BookmarkGraph::from_changes(&repo.jj, &selected, true)?;
     let descendant = bookmark_graph
         .find_bookmark_in_components("tracked-descendant")

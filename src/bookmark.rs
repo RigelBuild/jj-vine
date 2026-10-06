@@ -672,7 +672,8 @@ impl<'a> BookmarkGraph<'a> {
             .filter_map(|b| b.as_pending().map(|c| c.change_id.clone()))
             .collect();
 
-        // Walking past an excluded foreign parent would submit its changes under this bookmark.
+        // Walking past an excluded foreign parent would submit its changes under this
+        // bookmark.
         let included_names: HashSet<String> = local_bookmarks
             .iter()
             .map(|b| b.name().to_owned())
@@ -901,9 +902,9 @@ impl<'a> BookmarkGraph<'a> {
                     })
                     .map(BookmarkInfo::name)
                     .collect();
-                let Some(first) = excluded.first() else {
+                if excluded.is_empty() {
                     return Ok(());
-                };
+                }
                 if jj.any_in_revset(format!("{} & mine()", parent.commit_id))? {
                     return Ok(());
                 }
@@ -911,7 +912,7 @@ impl<'a> BookmarkGraph<'a> {
                 let child = bookmark.name();
                 InvalidGraphSnafu {
                     message: format!(
-                        "`{child}` stacks on {}, which another author owns and mine() excludes. Rebase `{child}` onto trunk or a bookmark you own, or name `{first}` explicitly to submit it too, e.g. `jj-vine submit '{child} | {first}'`.",
+                        "`{child}` stacks on {}, which another author owns and mine() excludes. Rebase onto trunk or a bookmark you own, or explicitly select the parent bookmark alongside the child to submit both.",
                         excluded.iter().map(|name| format!("`{name}`")).join(", "),
                     ),
                 }
