@@ -1,10 +1,10 @@
 //! Shared bounded-subprocess helpers.
 //!
 //! `output_by_deadline` runs a non-interactive child process to completion
-//! by an absolute wall-clock deadline, and `output_with_timeout` does the
-//! same for a timeout that starts at the call. Both capture stdout/stderr into
-//! capped buffers, so a helper that fills a pipe cannot deadlock. The child
-//! gets null stdin.
+//! by an absolute wall-clock deadline, capturing stdout/stderr into capped
+//! buffers, so a helper that fills a pipe cannot deadlock. The child gets null
+//! stdin. Tests also use `output_with_timeout`, whose timeout starts at the
+//! call.
 //!
 //! Containment: the child runs in a new session and process group on Unix, or
 //! in a job object on Windows. When the child exits (with any status),
@@ -59,11 +59,14 @@ const POLL_INTERVAL: Duration = Duration::from_millis(10);
 /// Run `command` to completion with a wall-clock `timeout`. Returns `Ok(None)`
 /// if the child overran the deadline. The timeout starts when this function
 /// is called; see [`output_by_deadline`] for the rest of the contract.
+/// Production callers pass an absolute deadline instead, so time spent before
+/// the call (such as a `PATH` lookup) counts against their budget.
 ///
 /// # Errors
 ///
 /// As [`output_by_deadline`]; also an error if `timeout` is too large to add
 /// to the current time.
+#[cfg(test)]
 pub(crate) fn output_with_timeout(
     command: Command,
     timeout: Duration,
@@ -1365,10 +1368,28 @@ mod tests {
         let mut command = std::process::Command::new("sh");
         command.args(["-c", "printf late"]);
         // SAFETY: the hook runs in the forked child before exec and calls
-        // only nanosleep, which is async-signal-safe.
+        // only nanosleep, which is async-signal-safe. It touches no heap and
+        // takes no lock, so it is sound in the child of a multithreaded
+        // parent.
         unsafe {
             command.pre_exec(|| {
-                std::thread::sleep(core::time::Duration::from_millis(300));
+                let mut request = libc::timespec {
+                    tv_sec: 0,
+                    tv_nsec: 300_000_000,
+                };
+                let mut remaining = libc::timespec {
+                    tv_sec: 0,
+                    tv_nsec: 0,
+                };
+                // A signal can cut the sleep short; sleep out the remainder.
+                // `last_os_error` only reads errno; it does not allocate.
+                while libc::nanosleep(&request, &mut remaining) == -1_i32 {
+                    let error = std::io::Error::last_os_error();
+                    if error.raw_os_error() != Some(libc::EINTR) {
+                        return Err(error);
+                    }
+                    request = remaining;
+                }
                 Ok(())
             })
         };

@@ -548,12 +548,14 @@ impl GhStackRunner {
 
     fn run_with_binary(&self, binary: &Path, prs: &[u64], github: &GitHubConfig) -> LinkOutcome {
         // A token command must not start, or run, past the shared deadline.
-        let Some(remaining) = self.remaining() else {
+        // The absolute deadline, not a sampled remainder, also bounds the
+        // binary lookup that precedes the spawn.
+        if self.remaining().is_none() {
             return self.deadline_passed();
-        };
+        }
         let token = match self.token.get_or_init(|| {
             github
-                .resolved_token_with_timeout(remaining.min(crate::config::TOKEN_COMMAND_TIMEOUT))
+                .resolved_token_by_deadline(self.deadline)
                 .map_err(|error| format!("could not resolve GH_TOKEN: {error}"))
         }) {
             Ok(token) => token,
