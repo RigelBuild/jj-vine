@@ -143,9 +143,6 @@ pub(crate) fn parse_forge_url(url: &str) -> Option<DetectedForge> {
 
     let host = match forge_type {
         ForgeType::GitHub if remote.hostname == "github.com" => "https://api.github.com".to_owned(),
-        // RIG-4484 (open): this derives a token-bearing API host from any
-        // remote host that ForgeType::detect_from_host classifies as GitHub,
-        // including HTTP. Not a trusted credential endpoint until decided.
         ForgeType::GitHub => format!("{}/api/v3", remote.web_origin()),
         ForgeType::GitLab | ForgeType::Forgejo | ForgeType::AzureDevOps => remote.web_origin(),
     };
@@ -244,10 +241,7 @@ mod tests {
         assert_eq!(detected.project, "owner/repo");
     }
 
-    /// Pins remote-derived GitHub Enterprise API hosts, which receive the
-    /// configured token. Whether that host may be trusted is undecided.
     #[test]
-    #[ignore = "RIG-4484: GHE token-host trust undecided; not a safety claim"]
     fn parse_github_enterprise_url() {
         let detected = parse_forge_url("https://github.example.com/owner/repo.git")
             .expect("GitHub Enterprise URL");
@@ -275,7 +269,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "RIG-4484: GHE token-host trust undecided; not a safety claim"]
     fn parse_github_enterprise_ssh() {
         let detected = parse_forge_url("git@github.example.com:owner/repo.git")
             .expect("GitHub Enterprise SSH URL");
@@ -322,8 +315,7 @@ mod tests {
         assert_eq!(detected.project, "owner/repo");
     }
 
-    /// Policy-independent: userinfo never reaches the derived host, whatever
-    /// RIG-4484 decides about trusting that host.
+    /// Userinfo never reaches the derived API host.
     #[test]
     fn parse_https_enterprise_userinfo_never_reaches_api_host() {
         let detected = parse_forge_url("https://token@github.example.com:8443/owner/repo.git")
