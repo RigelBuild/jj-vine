@@ -23,6 +23,7 @@ mod gitlab;
 #[derive(Debug, Clone)]
 struct Remotes {
     origin: String,
+    source_push_url: Option<String>,
     upstream: Option<String>,
     target_forge: Option<DetectedForge>,
 }
@@ -195,21 +196,9 @@ fn set_config(repo_path: impl Into<PathBuf>, key: &str, value: impl AsRef<str>) 
     Ok(())
 }
 
-fn parse_init_remote_line(line: &str) -> Result<(&str, &str)> {
+fn parse_init_remote_line(line: &str) -> Result<remote::RemoteListEntry<'_>> {
     remote::parse_remote_list_line(line)
-        .map(|entry| (entry.name, entry.fetch_url))
-        .ok_or_else(|| {
-            let name = line.split_whitespace().next().filter(|name| {
-                !name.is_empty()
-                    && name
-                        .bytes()
-                        .all(|byte| byte.is_ascii_alphanumeric() || b"._-/".contains(&byte))
-            });
-            make_whatever!(
-                "Failed to parse remote line for {}",
-                name.unwrap_or("<unknown>")
-            )
-        })
+        .ok_or_else(|| make_whatever!("Failed to parse remote line for <unknown>"))
 }
 
 #[expect(clippy::single_call_fn, reason = "seems fine")]
@@ -219,34 +208,34 @@ fn detect_remotes(jj: &Jujutsu) -> Result<Option<Remotes>> {
         .stdout
         .lines()
         .map(parse_init_remote_line)
+        .map(|entry| entry.map(|entry| (entry.name, entry)))
         .collect::<Result<_>>()?;
 
     let origin = remotes.get("origin");
 
-    if let Some(upstream) = remotes.get("upstream")
-        && let Some(origin) = origin
-    {
+    if let (Some(origin), Some(upstream)) = (origin, remotes.get("upstream")) {
         return Ok(Some(Remotes {
-            origin: origin.to_string(),
-            target_forge: remote::parse_forge_url(upstream),
-            upstream: Some(upstream.to_string()),
+            origin: origin.fetch_url.to_owned(),
+            source_push_url: origin.push_url.map(str::to_owned),
+            target_forge: remote::parse_forge_url(upstream.fetch_url),
+            upstream: Some(upstream.fetch_url.to_owned()),
         }));
     }
 
-    if let Some(fork) = remotes.get("fork")
-        && let Some(origin) = origin
-    {
+    if let (Some(origin), Some(fork)) = (origin, remotes.get("fork")) {
         return Ok(Some(Remotes {
-            origin: fork.to_string(),
-            target_forge: remote::parse_forge_url(origin),
-            upstream: Some(origin.to_string()),
+            origin: fork.fetch_url.to_owned(),
+            source_push_url: fork.push_url.map(str::to_owned),
+            target_forge: remote::parse_forge_url(origin.fetch_url),
+            upstream: Some(origin.fetch_url.to_owned()),
         }));
     }
 
     if let Some(origin) = origin {
         return Ok(Some(Remotes {
-            target_forge: remote::parse_forge_url(origin),
-            origin: origin.to_string(),
+            target_forge: remote::parse_forge_url(origin.fetch_url),
+            origin: origin.fetch_url.to_owned(),
+            source_push_url: origin.push_url.map(str::to_owned),
             upstream: None,
         }));
     }
@@ -313,46 +302,24 @@ mod tests {
     }
 
     #[test]
-    fn detect_remotes_uses_fetch_url_when_push_url_differs() {
+    fn detect_remotes_keeps_fetch_target_and_push_source_urls() {
         let (_temp, repo_path) = create_test_repo();
-        add_remote(&repo_path, "origin", "git@github.com:owner/repo.git");
-        set_push_url(
-            &repo_path,
-            "origin",
-            "git@github.com:attacker/push-destination.git",
-        );
+        add_remote(&repo_path, "origin", "git@github.com:target/repo.git");
+        set_push_url(&repo_path, "origin", "git@github.com:source/repo.git");
 
         let jj = Jujutsu::new(&repo_path).expect("jj");
         let remotes = detect_remotes(&jj)
             .expect("detect remotes")
             .expect("origin");
 
-        assert_eq!(remotes.origin, "git@github.com:owner/repo.git");
+        assert_eq!(remotes.origin, "git@github.com:target/repo.git");
         assert_eq!(
-            remotes.target_forge.expect("target forge").project,
-            "owner/repo"
-        );
-    }
-
-    #[test]
-    fn detect_remotes_selects_origin_or_upstream() {
-        let (_temp, repo_path) = create_test_repo();
-        add_remote(&repo_path, "origin", "git@github.com:person/fork.git");
-        add_remote(&repo_path, "upstream", "git@github.com:owner/repo.git");
-
-        let jj = Jujutsu::new(&repo_path).expect("jj");
-        let remotes = detect_remotes(&jj)
-            .expect("detect remotes")
-            .expect("origin");
-
-        assert_eq!(remotes.origin, "git@github.com:person/fork.git");
-        assert_eq!(
-            remotes.upstream.as_deref(),
-            Some("git@github.com:owner/repo.git")
+            remotes.source_push_url.as_deref(),
+            Some("git@github.com:source/repo.git")
         );
         assert_eq!(
             remotes.target_forge.expect("target forge").project,
-            "owner/repo"
+            "target/repo"
         );
     }
 
@@ -368,6 +335,7 @@ mod tests {
             .expect("origin");
 
         assert_eq!(remotes.origin, "git@github.com:person/fork.git");
+        assert_eq!(remotes.source_push_url, None);
         assert_eq!(
             remotes.upstream.as_deref(),
             Some("git@github.com:owner/repo.git")
@@ -409,16 +377,12 @@ mod tests {
     }
 
     #[test]
-    fn malformed_remote_line_names_only_safe_remote_identifier() {
-        let error = parse_init_remote_line("origin <no URL> (push: git@github.com:o/r.git) extra")
-            .expect_err("extra field must fail");
-        assert!(error.to_string().contains("origin"));
-        assert!(!error.to_string().contains("github.com"));
-
+    fn malformed_remote_line_uses_fixed_redacted_diagnostic() {
         let error = parse_init_remote_line("user:fixture-token@evil <no URL> extra")
             .expect_err("malformed credential-shaped name must fail");
         assert!(error.to_string().contains("<unknown>"));
         assert!(!error.to_string().contains("fixture-token"));
+        assert!(!error.to_string().contains("evil"));
     }
 
     #[test]
@@ -432,6 +396,7 @@ mod tests {
             .expect("origin");
 
         assert_eq!(remotes.origin, "git@github.com:owner/repo.git");
+        assert_eq!(remotes.source_push_url, None);
         assert_eq!(remotes.upstream, None);
         assert_eq!(
             remotes.target_forge.expect("target forge").project,
