@@ -25,7 +25,7 @@ pub fn init(repo_path: impl Into<PathBuf>, remotes: Option<&Remotes>) -> Result<
 
     let remotes = remotes.as_ref();
     let target_forge = remotes.and_then(|r| r.target_forge.as_ref());
-    let (source_remote_project, target_remote_project) = github_remote_projects(remotes);
+    let (source_remote_project, target_remote_project) = github_remote_projects(remotes.copied());
     let default_host = github_default_host(existing_host, target_forge);
     let default_project = existing_project.or(source_remote_project);
 
