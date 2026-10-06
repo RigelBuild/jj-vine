@@ -51,6 +51,15 @@ pub(crate) enum ApiHost {
     PlaintextEnterprise,
 }
 
+impl ApiHost {
+    pub(crate) fn derived(&self) -> Option<&str> {
+        match self {
+            Self::Derived(host) => Some(host),
+            Self::Unknown | Self::PlaintextEnterprise => None,
+        }
+    }
+}
+
 /// Transport of a parsed remote URL.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Transport {
@@ -425,15 +434,6 @@ impl<'a> ApiEndpoint<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    impl ApiHost {
-        fn derived(&self) -> Option<&str> {
-            match self {
-                Self::Derived(host) => Some(host),
-                Self::Unknown | Self::PlaintextEnterprise => None,
-            }
-        }
-    }
 
     #[test]
     fn parse_forgejo_url() {

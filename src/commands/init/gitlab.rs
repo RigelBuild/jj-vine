@@ -28,8 +28,11 @@ pub fn init(repo_path: impl Into<PathBuf>, remotes: Option<&Remotes>) -> Result<
             .or_else(|| parse_forge_url(&r.origin))
     });
 
-    let default_host =
-        existing_host.or_else(|| target_forge.as_ref().and_then(|forge| forge.host.clone()));
+    let default_host = existing_host.or_else(|| {
+        target_forge
+            .as_ref()
+            .and_then(|forge| forge.host.derived().map(str::to_owned))
+    });
     let default_project = existing_project.or(source_forge
         .as_ref()
         .or(target_forge.as_ref())
