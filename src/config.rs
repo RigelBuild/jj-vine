@@ -1865,7 +1865,10 @@ mod tests {
             .to_string();
 
         assert!(message.contains("timed out"), "got {message}");
-        assert!(!marker.exists(), "the helper must not spawn after the deadline");
+        assert!(
+            !marker.exists(),
+            "the helper must not spawn after the deadline"
+        );
     }
 
     #[cfg(unix)]
@@ -1885,7 +1888,10 @@ mod tests {
             .to_string();
 
         assert!(message.contains("timed out"), "got {message}");
-        assert!(!marker.exists(), "the helper must not spawn after its timeout");
+        assert!(
+            !marker.exists(),
+            "the helper must not spawn after its timeout"
+        );
     }
 
     #[cfg(unix)]
