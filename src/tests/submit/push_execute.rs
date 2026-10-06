@@ -528,7 +528,9 @@ async fn disabled_push_skips_dependent_mr_actions_after_skipped_parent() {
             "dependent-MR sync must not call the GitLab dependency API: {requests:?}"
         );
         assert!(
-            !requests.iter().any(|request| request.contains("/merge_requests/1 ")),
+            !requests
+                .iter()
+                .any(|request| request.contains("/merge_requests/1 ")),
             "the skipped parent base update must not call the GitLab update API: {requests:?}"
         );
 
@@ -561,7 +563,9 @@ fn pending_parent_synced_stacks() -> (TestRepo<TestRepo<()>>, String) {
     repo.jj.exec(["new", "p"]).expect("start child stack");
     repo.create_change("child.txt", "child", "Child commit")
         .create_and_push_bookmark("c");
-    repo.jj.exec(["new", "main"]).expect("start independent stack");
+    repo.jj
+        .exec(["new", "main"])
+        .expect("start independent stack");
     repo.create_change("synced.txt", "synced", "Synced commit")
         .create_and_push_bookmark("synced");
     repo.new_on("main");
