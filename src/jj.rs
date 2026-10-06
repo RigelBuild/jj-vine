@@ -1473,19 +1473,21 @@ mod tests {
         false
     }
 
-    /// Write a fake `jj` into `bin` that records its pid and its descendant's
-    /// pid in `pids`, then hangs.
+    /// Environment variable naming the directory where the fake `jj` records
+    /// pids. The script reads it, so no path is spliced into shell source.
     #[cfg(unix)]
-    fn write_hung_jj(bin: &Path, pids: &Path) -> std::io::Result<()> {
+    const HUNG_JJ_PID_DIR: &str = "JJ_VINE_TEST_PID_DIR";
+
+    /// Write a fake `jj` into `bin` that records its pid and its descendant's
+    /// pid in the directory named by [`HUNG_JJ_PID_DIR`], then hangs.
+    #[cfg(unix)]
+    fn write_hung_jj(bin: &Path) -> std::io::Result<()> {
         std::fs::create_dir_all(bin)?;
         write_executable(
             &bin.join("jj"),
-            &format!(
-                "#!/bin/sh\necho $$ > '{pids}/jj.pid'\n\
-                 sh -c 'echo $$ > \"$1\"; exec sleep 30' _ '{pids}/descendant.pid' &\n\
-                 exec sleep 30\n",
-                pids = pids.display()
-            ),
+            "#!/bin/sh\necho $$ > \"$JJ_VINE_TEST_PID_DIR/jj.pid\"\n\
+             sh -c 'echo $$ > \"$JJ_VINE_TEST_PID_DIR/descendant.pid\"; exec sleep 30' &\n\
+             exec sleep 30\n",
         )
     }
 
@@ -1495,9 +1497,11 @@ mod tests {
     fn path_with_first(dir: &Path) -> std::io::Result<std::ffi::OsString> {
         let mut path = dir.as_os_str().to_owned();
         path.push(":");
-        path.push(std::env::var_os("PATH").ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::NotFound, "PATH is not set")
-        })?);
+        path.push(
+            std::env::var_os("PATH").ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::NotFound, "PATH is not set")
+            })?,
+        );
         Ok(path)
     }
 
@@ -1507,13 +1511,20 @@ mod tests {
         const CHILD_MODE: &str = "JJ_VINE_TEST_HUNG_JJ";
         const REPO_DIR: &str = "JJ_VINE_TEST_REPO_DIR";
         if std::env::var_os(CHILD_MODE).is_some() {
-            let repo = std::env::var_os(REPO_DIR).map(PathBuf::from).ok_or_else(|| {
-                std::io::Error::new(std::io::ErrorKind::NotFound, "repository directory missing")
-            })?;
+            let repo = std::env::var_os(REPO_DIR)
+                .map(PathBuf::from)
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "repository directory missing",
+                    )
+                })?;
             let jj = Jujutsu::new(repo)?
                 .with_deadline(Instant::now() + core::time::Duration::from_millis(300));
             let start = Instant::now();
-            let error = jj.log("@").expect_err("a hung jj must fail at the deadline");
+            let error = jj
+                .log("@")
+                .expect_err("a hung jj must fail at the deadline");
             assert!(
                 start.elapsed() < core::time::Duration::from_secs(5),
                 "a hung jj must not be waited out, took {:?}",
@@ -1529,11 +1540,15 @@ mod tests {
 
         let temp = TempDir::new()?;
         let bin = temp.path().join("bin");
-        write_hung_jj(&bin, temp.path())?;
+        write_hung_jj(&bin)?;
         let output = std::process::Command::new(std::env::current_exe()?)
-            .args(["--exact", "jj::tests::bounded_exec_kills_hung_jj_tree_at_deadline"])
+            .args([
+                "--exact",
+                "jj::tests::bounded_exec_kills_hung_jj_tree_at_deadline",
+            ])
             .env(CHILD_MODE, "1")
             .env(REPO_DIR, temp.path())
+            .env(HUNG_JJ_PID_DIR, temp.path())
             .env("PATH", path_with_first(&bin)?)
             .output()?;
         assert!(
@@ -1557,9 +1572,14 @@ mod tests {
         const CHILD_MODE: &str = "JJ_VINE_TEST_EXPIRED_JJ";
         const REPO_DIR: &str = "JJ_VINE_TEST_REPO_DIR";
         if std::env::var_os(CHILD_MODE).is_some() {
-            let repo = std::env::var_os(REPO_DIR).map(PathBuf::from).ok_or_else(|| {
-                std::io::Error::new(std::io::ErrorKind::NotFound, "repository directory missing")
-            })?;
+            let repo = std::env::var_os(REPO_DIR)
+                .map(PathBuf::from)
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "repository directory missing",
+                    )
+                })?;
             let jj = Jujutsu::new(repo)?.with_deadline(Instant::now());
             let error = jj.log("@").expect_err("an expired deadline must fail");
             assert!(
@@ -1572,11 +1592,12 @@ mod tests {
 
         let temp = TempDir::new()?;
         let bin = temp.path().join("bin");
-        write_hung_jj(&bin, temp.path())?;
+        write_hung_jj(&bin)?;
         let output = std::process::Command::new(std::env::current_exe()?)
             .args(["--exact", "jj::tests::expired_deadline_never_spawns_jj"])
             .env(CHILD_MODE, "1")
             .env(REPO_DIR, temp.path())
+            .env(HUNG_JJ_PID_DIR, temp.path())
             .env("PATH", path_with_first(&bin)?)
             .output()?;
         assert!(

@@ -1631,16 +1631,14 @@ mod tests {
         let temp = tempfile::tempdir().expect("temporary directory");
         let bin = temp.path().join("bin");
         std::fs::create_dir_all(&bin).expect("bin directory");
-        let pids = temp.path();
-        // `fake_gh_stack` writes an executable script; rename it to `jj`.
+        // `fake_gh_stack` writes an executable script; rename it to `jj`. The
+        // script reads the pid directory from the environment, so no path is
+        // spliced into shell source.
         let script = fake_gh_stack(
             &bin,
-            &format!(
-                "echo $$ > '{pids}/jj.pid'\n\
-                 sh -c 'echo $$ > \"$1\"; exec sleep 30' _ '{pids}/descendant.pid' &\n\
-                 exec sleep 30",
-                pids = pids.display()
-            ),
+            "echo $$ > \"$JJ_VINE_TEST_PID_DIR/jj.pid\"\n\
+             sh -c 'echo $$ > \"$JJ_VINE_TEST_PID_DIR/descendant.pid\"; exec sleep 30' &\n\
+             exec sleep 30",
         );
         std::fs::rename(script, bin.join("jj")).expect("install fake jj");
         let mut path = bin.as_os_str().to_owned();
@@ -1654,6 +1652,7 @@ mod tests {
             ])
             .env(CHILD_MODE, "1")
             .env(REPO_DIR, temp.path())
+            .env("JJ_VINE_TEST_PID_DIR", temp.path())
             .env("PATH", path)
             .output()
             .expect("run child test");
