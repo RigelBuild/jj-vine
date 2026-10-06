@@ -254,6 +254,58 @@ async fn no_hooks_uses_builtin_push_command() {
 }
 
 #[tokio::test]
+async fn no_hooks_runs_builtin_push_instead_of_configured_command() {
+    let repo = TestRepo::with_local_remote();
+    repo.create_change("feature-a.txt", "feature", "Feature")
+        .create_bookmark("feature-a");
+    let marker = repo.path.join("custom-push-ran");
+    let config = Config::builder()
+        .forge(ForgeType::Forgejo)
+        .push(RepoPushConfig::Command(vec![
+            "sh".to_owned(),
+            "-c".to_owned(),
+            "touch \"$0\"".to_owned(),
+            marker.to_string_lossy().into_owned(),
+        ]))
+        .build();
+    let forge = ForgeImpl::Test(TestForge::default());
+    let output = BufferedOutput::new();
+    let graph = BookmarkGraph::from_lookups(BTreeMap::new(), &BTreeMap::new());
+    let plan = SubmissionPlan {
+        actions: Vec::new(),
+        existing_mrs: HashMap::new(),
+    };
+    let ctx = ExecuteActionContext {
+        execute: ExecuteContext {
+            jj: &repo.jj,
+            forge: &forge,
+            config: &config,
+            output: &output,
+            bookmark_graph: &graph,
+            dry_run: false,
+            no_hooks: true,
+            plan: &plan,
+        },
+        current_results: Vec::new(),
+    };
+
+    let result = push_action()
+        .execute(ctx)
+        .await
+        .expect("built-in push succeeds");
+    assert!(pushed(result).2);
+    assert!(!marker.exists(), "configured command must not run");
+    assert_eq!(
+        repo.upstream()
+            .jj
+            .log("feature-a")
+            .expect("remote bookmark exists")[0]
+            .description,
+        "Feature\n"
+    );
+}
+
+#[tokio::test]
 async fn disabled_push_is_not_reported_even_with_no_hooks() {
     let (result, output) =
         run_action(push_action(), RepoPushConfig::Enabled(false), true, true).await;
