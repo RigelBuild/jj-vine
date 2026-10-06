@@ -1,0 +1,5 @@
+[jobs.build]
+command = ["cargo", "build"]
+
+[jobs.test]
+command = ["cargo", "test"]

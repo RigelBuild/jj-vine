@@ -17,7 +17,8 @@ use crate::{
     submit::execute::{MRUpdate, SubmissionResult},
 };
 
-/// Wall-clock budget for the whole optional stack-link phase, shared by every
+/// Wall-clock budget for the whole optional stack-link phase, shared by the
+/// jj commands that rebuild the bookmark graph, token resolution, and every
 /// `gh-stack link` call in one submit.
 const STACK_LINK_TIMEOUT: core::time::Duration = core::time::Duration::from_secs(60);
 
@@ -118,8 +119,10 @@ pub fn link_stacks(
         gh_extensions_dir(|name| std::env::var_os(name)),
         STACK_LINK_TIMEOUT,
     );
+    let deadline = runner.deadline;
     link_stacks_with_runner(
         &runner,
+        deadline,
         github,
         jj,
         result,
@@ -132,10 +135,11 @@ pub fn link_stacks(
 
 #[expect(
     clippy::too_many_arguments,
-    reason = "mirrors link_stacks plus the runner seam"
+    reason = "mirrors link_stacks plus the runner and deadline seams"
 )]
 fn link_stacks_with_runner(
     runner: &dyn StackLinkRunner,
+    deadline: std::time::Instant,
     github: &GitHubConfig,
     jj: &Jujutsu,
     result: &SubmissionResult,
@@ -154,7 +158,10 @@ fn link_stacks_with_runner(
         return StackLinkOutcome::Skipped(SkipReason::Disabled);
     }
 
-    let graph = match BookmarkGraph::from_changes(jj, &result.changes, tracked) {
+    // The graph rebuild runs jj, so it shares the stack-link deadline: a slow
+    // or hung jj command is killed at the deadline and only warns.
+    let jj = jj.with_deadline(deadline);
+    let graph = match BookmarkGraph::from_changes(&jj, &result.changes, tracked) {
         Ok(graph) => graph,
         Err(error) => {
             return StackLinkOutcome::Failed {
@@ -724,6 +731,11 @@ mod tests {
         )
     }
 
+    /// A stack-link deadline no test reaches.
+    fn far_deadline() -> std::time::Instant {
+        std::time::Instant::now() + STACK_LINK_TIMEOUT
+    }
+
     #[test]
     fn binary_absent_from_path_is_a_silent_skip() {
         let temp = tempfile::tempdir().expect("temporary directory");
@@ -874,6 +886,7 @@ mod tests {
         assert!(matches!(
             link_stacks_with_runner(
                 &runner,
+                far_deadline(),
                 &github_config(),
                 &jj,
                 &result,
@@ -887,6 +900,7 @@ mod tests {
         assert!(matches!(
             link_stacks_with_runner(
                 &runner,
+                far_deadline(),
                 &github_config(),
                 &jj,
                 &result,
@@ -917,6 +931,7 @@ mod tests {
         assert!(matches!(
             link_stacks_with_runner(
                 &runner,
+                far_deadline(),
                 &github,
                 &jj,
                 &result,
@@ -1554,6 +1569,112 @@ mod tests {
         );
     }
 
+    /// Whether `pid` names a process that exists and is not a zombie.
+    #[cfg(unix)]
+    fn is_running(pid: &str) -> bool {
+        let output = std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", pid])
+            .stderr(std::process::Stdio::null())
+            .output()
+            .expect("ps must run");
+        let state = String::from_utf8_lossy(&output.stdout);
+        let state = state.trim();
+        !state.is_empty() && !state.starts_with('Z')
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hung_jj_during_graph_rebuild_warns_at_the_shared_deadline() {
+        const CHILD_MODE: &str = "JJ_VINE_TEST_HUNG_GRAPH_JJ";
+        const REPO_DIR: &str = "JJ_VINE_TEST_REPO_DIR";
+        if std::env::var_os(CHILD_MODE).is_some() {
+            let repo = std::env::var_os(REPO_DIR).expect("repository directory");
+            let jj = Jujutsu::new(PathBuf::from(repo)).expect("fake jj on PATH");
+            let result = SubmissionResult {
+                merge_requests: vec![mr_update("a", "1"), mr_update("b", "2")],
+                errors: vec![],
+                bookmarks_pushed: vec![],
+                changes: linear_changes(&["a", "b"])
+                    .into_iter()
+                    .map(|(_, change)| change)
+                    .collect(),
+                failed_bookmarks: BTreeSet::new(),
+            };
+            let runner = RecordingRunner::new(LinkOutcome::Linked);
+            let start = std::time::Instant::now();
+            let outcome = link_stacks_with_runner(
+                &runner,
+                start + core::time::Duration::from_millis(300),
+                &github_config(),
+                &jj,
+                &result,
+                &HashMap::new(),
+                false,
+                false,
+                false,
+            );
+            assert!(
+                start.elapsed() < core::time::Duration::from_secs(5),
+                "a hung jj must not hold the phase past its deadline, took {:?}",
+                start.elapsed()
+            );
+            assert!(
+                matches!(&outcome, StackLinkOutcome::Failed { warning }
+                    if warning.contains("could not rebuild bookmark graph")
+                        && warning.contains("deadline")),
+                "a hung graph rebuild must warn, got {outcome:?}"
+            );
+            assert!(runner.calls().is_empty(), "gh-stack must not run");
+            return;
+        }
+
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let bin = temp.path().join("bin");
+        std::fs::create_dir_all(&bin).expect("bin directory");
+        let pids = temp.path();
+        // `fake_gh_stack` writes an executable script; rename it to `jj`.
+        let script = fake_gh_stack(
+            &bin,
+            &format!(
+                "echo $$ > '{pids}/jj.pid'\n\
+                 sh -c 'echo $$ > \"$1\"; exec sleep 30' _ '{pids}/descendant.pid' &\n\
+                 exec sleep 30",
+                pids = pids.display()
+            ),
+        );
+        std::fs::rename(script, bin.join("jj")).expect("install fake jj");
+        let mut path = bin.as_os_str().to_owned();
+        path.push(":");
+        path.push(std::env::var_os("PATH").expect("PATH is set"));
+
+        let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                "submit::stack_link::tests::hung_jj_during_graph_rebuild_warns_at_the_shared_deadline",
+            ])
+            .env(CHILD_MODE, "1")
+            .env(REPO_DIR, temp.path())
+            .env("PATH", path)
+            .output()
+            .expect("run child test");
+        assert!(
+            output.status.success(),
+            "child test failed: {}",
+            String::from_utf8_lossy(&output.stdout),
+        );
+        for name in ["jj.pid", "descendant.pid"] {
+            let pid = std::fs::read_to_string(temp.path().join(name)).expect("fake jj ran");
+            let start = std::time::Instant::now();
+            while is_running(pid.trim()) && start.elapsed() < core::time::Duration::from_secs(5) {
+                std::thread::sleep(core::time::Duration::from_millis(20));
+            }
+            assert!(
+                !is_running(pid.trim()),
+                "{name}: the graph rebuild must not leave a jj process running"
+            );
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn non_github_com_host_never_runs_the_helper() {
@@ -1887,6 +2008,7 @@ mod tests {
         let runner = RecordingRunner::new(LinkOutcome::Linked);
         let outcome = link_stacks_with_runner(
             &runner,
+            far_deadline(),
             &github_config(),
             &repo.jj,
             &result,
@@ -2050,6 +2172,7 @@ mod tests {
         let runner = RecordingRunner::new(LinkOutcome::Linked);
         let outcome = link_stacks_with_runner(
             &runner,
+            far_deadline(),
             &github_config(),
             &repo.jj,
             &result,
@@ -2184,6 +2307,7 @@ mod tests {
         let runner = RecordingRunner::new(LinkOutcome::Linked);
         let outcome = link_stacks_with_runner(
             &runner,
+            far_deadline(),
             &github_config(),
             &repo.jj,
             &result,
