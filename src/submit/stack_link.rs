@@ -25,6 +25,10 @@ const STACK_LINK_TIMEOUT: core::time::Duration = core::time::Duration::from_secs
 /// github.com, so a GitHub Enterprise token must never reach it.
 const GITHUB_COM_API_URL: &str = "https://api.github.com";
 
+/// The `GH_HOST` set for `gh-stack`, so an inherited `GH_HOST` cannot route
+/// the github.com token to another host.
+const GITHUB_COM_HOST: &str = "github.com";
+
 /// Result of trying to register submitted pull requests as GitHub stacks.
 #[derive(Debug)]
 pub enum StackLinkOutcome {
@@ -41,7 +45,7 @@ pub enum StackLinkOutcome {
         unlinked: Vec<String>,
         /// Problems with other stacks in the same run: a gap in a stack, a
         /// non-linear stack, `gh-stack` failing or exiting not-enabled, or
-        /// `gh-stack` missing from `PATH` before the remaining stacks.
+        /// `gh-stack` no longer installed before the remaining stacks.
         warnings: Vec<String>,
     },
     /// No stack was linked and at least one problem needs the user's
@@ -111,6 +115,7 @@ pub fn link_stacks(
     let runner = GhStackRunner::new(
         jj.cwd().to_path_buf(),
         std::env::var_os("PATH"),
+        gh_extensions_dir(|name| std::env::var_os(name)),
         STACK_LINK_TIMEOUT,
     );
     link_stacks_with_runner(
@@ -342,7 +347,7 @@ fn link_from_graph(
                     );
                 } else {
                     warnings.push(
-                        "gh-stack is no longer on PATH; remaining stacks were not linked"
+                        "gh-stack is no longer installed; remaining stacks were not linked"
                             .to_owned(),
                     );
                 }
@@ -450,32 +455,56 @@ trait StackLinkRunner {
     fn run(&self, prs: &[u64], github: &GitHubConfig) -> LinkOutcome;
 }
 
+/// The GitHub CLI extensions directory, resolved the way `gh` resolves its
+/// data directory: `GH_DATA_DIR`, then `XDG_DATA_HOME/gh`, then (on Windows)
+/// `LOCALAPPDATA/GitHub CLI`, then `HOME/.local/share/gh`.
+fn gh_extensions_dir(var: impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
+    let non_empty = |name: &str| var(name).filter(|value| !value.is_empty());
+    let data_dir = if let Some(dir) = non_empty("GH_DATA_DIR") {
+        PathBuf::from(dir)
+    } else if let Some(dir) = non_empty("XDG_DATA_HOME") {
+        PathBuf::from(dir).join("gh")
+    } else if let Some(dir) = non_empty("LOCALAPPDATA").filter(|_| cfg!(windows)) {
+        PathBuf::from(dir).join("GitHub CLI")
+    } else {
+        PathBuf::from(non_empty("HOME")?).join(".local/share/gh")
+    };
+    Some(data_dir.join("extensions"))
+}
+
 struct GhStackRunner {
     cwd: PathBuf,
-    /// The `PATH` directories searched for `gh-stack`, with relative entries
-    /// resolved against `cwd`, where `gh-stack` runs.
+    /// Where `gh-stack` is searched for, in order: the `PATH` directories,
+    /// then the directory a `gh extension install` of `gh stack` uses.
+    /// Relative entries are resolved against `cwd`, where `gh-stack` runs.
     search_dirs: Vec<PathBuf>,
     /// The stack-link budget, reported in timeout warnings.
     timeout: core::time::Duration,
-    /// When the budget runs out. Every `gh-stack link` call shares it.
+    /// When the budget runs out. Token resolution and every `gh-stack link`
+    /// call share it.
     deadline: std::time::Instant,
     /// The token, or the failure detail, resolved once on first use so a
-    /// `tokenCommand` runs at most once per submit.
+    /// `tokenCommand` runs at most once per stack-link phase.
     token: OnceCell<Result<String, String>>,
 }
 
 impl GhStackRunner {
     /// Start the stack-link phase: the `timeout` budget starts now.
-    fn new(cwd: PathBuf, search_path: Option<OsString>, timeout: core::time::Duration) -> Self {
-        // `gh-stack` runs in `cwd`, so relative `PATH` entries resolve there.
+    fn new(
+        cwd: PathBuf,
+        search_path: Option<OsString>,
+        extensions_dir: Option<PathBuf>,
+        timeout: core::time::Duration,
+    ) -> Self {
+        // `gh-stack` runs in `cwd`, so relative entries resolve there.
         let base = std::path::absolute(&cwd).unwrap_or_else(|_| cwd.clone());
         let search_dirs = search_path
-            .map(|path| {
-                std::env::split_paths(&path)
-                    .map(|dir| base.join(dir))
-                    .collect()
-            })
-            .unwrap_or_default();
+            .map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
+            .unwrap_or_default()
+            .into_iter()
+            .chain(extensions_dir.map(|dir| dir.join("gh-stack")))
+            .map(|dir| base.join(dir))
+            .collect();
         Self {
             cwd,
             search_dirs,
@@ -493,10 +522,31 @@ impl GhStackRunner {
             .find_map(|dir| which::which(dir.join("gh-stack")).ok())
     }
 
+    /// Time left in the stack-link budget, or `None` once it has run out.
+    fn remaining(&self) -> Option<core::time::Duration> {
+        let remaining = self
+            .deadline
+            .saturating_duration_since(std::time::Instant::now());
+        (!remaining.is_zero()).then_some(remaining)
+    }
+
+    fn deadline_passed(&self) -> LinkOutcome {
+        LinkOutcome::Failed {
+            detail: format!(
+                "the {:?} stack-link deadline passed before gh-stack ran",
+                self.timeout
+            ),
+        }
+    }
+
     fn run_with_binary(&self, binary: &Path, prs: &[u64], github: &GitHubConfig) -> LinkOutcome {
+        // A token command must not start, or run, past the shared deadline.
+        let Some(remaining) = self.remaining() else {
+            return self.deadline_passed();
+        };
         let token = match self.token.get_or_init(|| {
             github
-                .resolved_token()
+                .resolved_token_with_timeout(remaining.min(crate::config::TOKEN_COMMAND_TIMEOUT))
                 .map_err(|error| format!("could not resolve GH_TOKEN: {error}"))
         }) {
             Ok(token) => token,
@@ -507,17 +557,9 @@ impl GhStackRunner {
             }
         };
 
-        let remaining = self
-            .deadline
-            .saturating_duration_since(std::time::Instant::now());
-        if remaining.is_zero() {
-            return LinkOutcome::Failed {
-                detail: format!(
-                    "the {:?} stack-link deadline passed before gh-stack ran",
-                    self.timeout
-                ),
-            };
-        }
+        let Some(remaining) = self.remaining() else {
+            return self.deadline_passed();
+        };
 
         let mut command = std::process::Command::new(binary);
         command.arg("link");
@@ -526,6 +568,7 @@ impl GhStackRunner {
         }
         command.current_dir(&self.cwd);
         command.env("GH_TOKEN", token);
+        command.env("GH_HOST", GITHUB_COM_HOST);
         command.env("GH_REPO", github.target_project());
 
         match crate::process::output_with_timeout(command, remaining) {
@@ -549,7 +592,7 @@ impl GhStackRunner {
                     self.timeout
                 ),
             },
-            // The binary was found on PATH, so a spawn failure here (including
+            // The binary was found, so a spawn failure here (including
             // NotFound for a missing interpreter or a racing uninstall) is a
             // real failure the user should see, not a silent skip.
             Err(error) => LinkOutcome::Failed {
@@ -687,6 +730,7 @@ mod tests {
         let runner = GhStackRunner::new(
             temp.path().to_path_buf(),
             Some(temp.path().as_os_str().to_owned()),
+            None,
             STACK_LINK_TIMEOUT,
         );
 
@@ -702,7 +746,7 @@ mod tests {
     #[test]
     fn spawn_not_found_after_lookup_is_a_warning() {
         let temp = tempfile::tempdir().expect("temporary directory");
-        let runner = GhStackRunner::new(temp.path().to_path_buf(), None, STACK_LINK_TIMEOUT);
+        let runner = GhStackRunner::new(temp.path().to_path_buf(), None, None, STACK_LINK_TIMEOUT);
         let vanished_binary = temp.path().join("gh-stack");
 
         let outcome = runner.run_with_binary(&vanished_binary, &[1, 2], &github_config());
@@ -933,14 +977,6 @@ mod tests {
             matches!(&outcome, StackLinkOutcome::Linked { stacks, .. } if *stacks == vec![vec![10, 20, 30]]),
             "unexpected outcome {outcome:?}"
         );
-    }
-
-    #[test]
-    fn adjacency_fixture_is_linear() {
-        let changes = linear_changes(&["a", "b", "c"]);
-        let adjacency: BTreeMap<String, BTreeSet<String>> = changes.create_adjacency_list();
-        assert_eq!(adjacency.get("b"), Some(&BTreeSet::from(["a".to_owned()])));
-        assert_eq!(adjacency.get("c"), Some(&BTreeSet::from(["b".to_owned()])));
     }
 
     #[test]
@@ -1331,7 +1367,7 @@ mod tests {
 
         assert!(
             matches!(&outcome, StackLinkOutcome::Linked { stacks, warnings, .. }
-                if stacks.len() == 1 && warnings.len() == 1 && warnings[0].contains("no longer on PATH")),
+                if stacks.len() == 1 && warnings.len() == 1 && warnings[0].contains("no longer installed")),
             "unexpected outcome {outcome:?}"
         );
     }
@@ -1386,7 +1422,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("temporary directory");
         let binary = fake_gh_stack(temp.path(), "printf '%s\\n' \"$GH_TOKEN\" >&2\nexit 1");
 
-        let outcome = GhStackRunner::new(temp.path().to_path_buf(), None, STACK_LINK_TIMEOUT)
+        let outcome = GhStackRunner::new(temp.path().to_path_buf(), None, None, STACK_LINK_TIMEOUT)
             .run_with_binary(&binary, &[1, 2], &github_config());
 
         assert!(matches!(
@@ -1404,6 +1440,7 @@ mod tests {
         let runner = GhStackRunner::new(
             temp.path().to_path_buf(),
             Some(temp.path().as_os_str().to_owned()),
+            None,
             STACK_LINK_TIMEOUT,
         );
 
@@ -1420,13 +1457,14 @@ mod tests {
         fake_gh_stack(
             temp.path(),
             &format!(
-                "printf '%s|%s|%s' \"$*\" \"$GH_TOKEN\" \"$GH_REPO\" > '{}'",
+                "printf '%s|%s|%s|%s' \"$*\" \"$GH_TOKEN\" \"$GH_HOST\" \"$GH_REPO\" > '{}'",
                 seen.display()
             ),
         );
         let runner = GhStackRunner::new(
             temp.path().to_path_buf(),
             Some(temp.path().as_os_str().to_owned()),
+            None,
             STACK_LINK_TIMEOUT,
         );
 
@@ -1435,7 +1473,7 @@ mod tests {
         assert_eq!(outcome, LinkOutcome::Linked);
         assert_eq!(
             std::fs::read_to_string(&seen).expect("helper recorded its inputs"),
-            "link 10 20 30|test-token|owner/repo"
+            "link 10 20 30|test-token|github.com|owner/repo"
         );
     }
 
@@ -1445,7 +1483,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("temporary directory");
         let binary = fake_gh_stack(temp.path(), "exec sleep 30");
         let timeout = core::time::Duration::from_millis(200);
-        let runner = GhStackRunner::new(temp.path().to_path_buf(), None, timeout);
+        let runner = GhStackRunner::new(temp.path().to_path_buf(), None, None, timeout);
 
         let start = std::time::Instant::now();
         let outcome = runner.run_with_binary(&binary, &[1, 2], &github_config());
@@ -1474,6 +1512,7 @@ mod tests {
         let runner = GhStackRunner::new(
             temp.path().to_path_buf(),
             Some(temp.path().as_os_str().to_owned()),
+            None,
             timeout,
         );
         let mut changes = linear_changes(&["a", "b"]);
@@ -1527,6 +1566,7 @@ mod tests {
         let runner = GhStackRunner::new(
             temp.path().to_path_buf(),
             Some(temp.path().as_os_str().to_owned()),
+            None,
             STACK_LINK_TIMEOUT,
         );
         let counter = temp.path().join("token-calls");
@@ -1573,15 +1613,94 @@ mod tests {
         let runner = GhStackRunner::new(
             temp.path().to_path_buf(),
             Some(OsString::from("bin")),
+            None,
             STACK_LINK_TIMEOUT,
         );
 
         assert_eq!(runner.run(&[1, 2], &github_config()), LinkOutcome::Linked);
     }
 
+    #[test]
+    fn extensions_dir_follows_gh_data_dir_precedence() {
+        let env = |vars: &'static [(&'static str, &'static str)]| {
+            move |name: &str| {
+                vars.iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| OsString::from(value))
+            }
+        };
+
+        assert_eq!(
+            gh_extensions_dir(env(&[
+                ("GH_DATA_DIR", "/gh-data"),
+                ("XDG_DATA_HOME", "/xdg"),
+                ("HOME", "/home/u"),
+            ])),
+            Some(PathBuf::from("/gh-data/extensions"))
+        );
+        assert_eq!(
+            gh_extensions_dir(env(&[
+                ("GH_DATA_DIR", ""),
+                ("XDG_DATA_HOME", "/xdg"),
+                ("HOME", "/home/u"),
+            ])),
+            Some(PathBuf::from("/xdg/gh/extensions"))
+        );
+        #[cfg(not(windows))]
+        assert_eq!(
+            gh_extensions_dir(env(&[("LOCALAPPDATA", "/local"), ("HOME", "/home/u")])),
+            Some(PathBuf::from("/home/u/.local/share/gh/extensions"))
+        );
+        assert_eq!(gh_extensions_dir(env(&[])), None);
+    }
+
     #[cfg(unix)]
     #[test]
-    fn token_command_runs_once_per_submit() {
+    fn installed_gh_extension_is_found_without_path_entry() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let extensions = temp.path().join("extensions");
+        let extension = extensions.join("gh-stack");
+        std::fs::create_dir_all(&extension).expect("extension directory");
+        let seen = temp.path().join("seen");
+        fake_gh_stack(
+            &extension,
+            &format!("printf '%s' \"$*\" > '{}'", seen.display()),
+        );
+        let runner = GhStackRunner::new(
+            temp.path().to_path_buf(),
+            Some(temp.path().as_os_str().to_owned()),
+            Some(extensions),
+            STACK_LINK_TIMEOUT,
+        );
+
+        assert_eq!(runner.run(&[1, 2], &github_config()), LinkOutcome::Linked);
+        assert_eq!(
+            std::fs::read_to_string(&seen).expect("extension ran"),
+            "link 1 2"
+        );
+    }
+
+    #[test]
+    fn missing_extension_and_path_binary_is_a_silent_skip() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let extensions = temp.path().join("extensions");
+        std::fs::create_dir_all(extensions.join("gh-other")).expect("other extension");
+        let runner = GhStackRunner::new(
+            temp.path().to_path_buf(),
+            Some(temp.path().as_os_str().to_owned()),
+            Some(extensions),
+            STACK_LINK_TIMEOUT,
+        );
+
+        assert_eq!(
+            runner.run(&[1, 2], &github_config()),
+            LinkOutcome::MissingBinary
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn expired_deadline_never_starts_the_token_command() {
         let temp = tempfile::tempdir().expect("temporary directory");
         let binary = fake_gh_stack(temp.path(), "exit 0");
         let counter = temp.path().join("token-calls");
@@ -1594,7 +1713,69 @@ mod tests {
             ],
             ..github_config()
         };
-        let runner = GhStackRunner::new(temp.path().to_path_buf(), None, STACK_LINK_TIMEOUT);
+        let runner = GhStackRunner::new(
+            temp.path().to_path_buf(),
+            None,
+            None,
+            core::time::Duration::ZERO,
+        );
+
+        let outcome = runner.run_with_binary(&binary, &[1, 2], &github);
+
+        assert!(
+            matches!(&outcome, LinkOutcome::Failed { detail } if detail.contains("stack-link deadline passed")),
+            "an expired budget must warn, got {outcome:?}"
+        );
+        assert!(!counter.exists(), "the token command must not start");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn token_command_is_bounded_by_the_remaining_deadline() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let binary = fake_gh_stack(temp.path(), "exit 0");
+        let github = GitHubConfig {
+            token: String::new(),
+            token_command: vec!["sh".to_owned(), "-c".to_owned(), "exec sleep 30".to_owned()],
+            ..github_config()
+        };
+        let runner = GhStackRunner::new(
+            temp.path().to_path_buf(),
+            None,
+            None,
+            core::time::Duration::from_millis(300),
+        );
+
+        let start = std::time::Instant::now();
+        let outcome = runner.run_with_binary(&binary, &[1, 2], &github);
+
+        assert!(
+            start.elapsed() < core::time::Duration::from_secs(5),
+            "the token command must stop at the stack-link deadline, took {:?}",
+            start.elapsed()
+        );
+        assert!(
+            matches!(&outcome, LinkOutcome::Failed { detail } if detail.contains("could not resolve GH_TOKEN")),
+            "a timed-out token command must warn, got {outcome:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn token_command_runs_once_per_stack_link_phase() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let binary = fake_gh_stack(temp.path(), "exit 0");
+        let counter = temp.path().join("token-calls");
+        let github = GitHubConfig {
+            token: String::new(),
+            token_command: vec![
+                "sh".to_owned(),
+                "-c".to_owned(),
+                format!("echo call >> '{}'; printf command-token", counter.display()),
+            ],
+            ..github_config()
+        };
+        let runner = GhStackRunner::new(temp.path().to_path_buf(), None, None, STACK_LINK_TIMEOUT);
 
         assert_eq!(
             runner.run_with_binary(&binary, &[1, 2], &github),

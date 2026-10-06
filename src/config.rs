@@ -524,7 +524,7 @@ pub struct GitHubConfig {
 }
 
 /// Maximum wall-clock time to wait for a `tokenCommand` helper.
-const TOKEN_COMMAND_TIMEOUT: core::time::Duration = core::time::Duration::from_secs(10);
+pub(crate) const TOKEN_COMMAND_TIMEOUT: core::time::Duration = core::time::Duration::from_secs(10);
 
 impl GitHubConfig {
     /// Get the repository where PRs target.
@@ -570,7 +570,10 @@ impl GitHubConfig {
 
     /// Resolve the token with a caller-supplied timeout for deterministic
     /// tests.
-    fn resolved_token_with_timeout(&self, timeout: core::time::Duration) -> Result<String> {
+    pub(crate) fn resolved_token_with_timeout(
+        &self,
+        timeout: core::time::Duration,
+    ) -> Result<String> {
         let literal = self.token.trim();
         if !literal.is_empty() {
             return Ok(literal.to_owned());
