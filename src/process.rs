@@ -110,8 +110,8 @@ mod platform {
                     return Err(io::Error::last_os_error());
                 }
                 Ok(())
-            });
-        }
+            })
+        };
         // Declared before `tree`, so it drops after the tree is reaped.
         let _cancel = CancelGuard::enter();
         let mut child = command.spawn()?;
