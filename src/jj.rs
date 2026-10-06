@@ -562,37 +562,50 @@ impl Jujutsu {
             .build());
         };
 
-        // Resolve relative paths before the child changes cwd to the repository.
+        // Resolve bare names before asking for the caller's cwd. An absolute
+        // PATH result does not depend on that cwd, which may no longer exist.
         let has_bin_path = bin.contains(std::path::is_separator);
-        let caller_cwd = if self.cwd.is_absolute() && has_bin_path {
+        let resolved_bin = if has_bin_path {
             None
         } else {
+            Some(which::which(bin).map_err(|_| {
+                ConfigSnafu {
+                    message: "push command executable not found in PATH".to_owned(),
+                }
+                .build()
+            })?)
+        };
+        let caller_cwd = if !self.cwd.is_absolute()
+            || resolved_bin
+                .as_ref()
+                .is_some_and(|bin_path| bin_path.is_relative())
+        {
             Some(std::env::current_dir()?)
+        } else {
+            None
         };
         let selected_cwd = match caller_cwd.as_ref() {
             Some(caller_cwd) if !self.cwd.is_absolute() => Cow::Owned(caller_cwd.join(&self.cwd)),
             _ => Cow::Borrowed(self.cwd.as_path()),
         };
-        let bin_path = if has_bin_path {
-            let bin_path = Path::new(bin);
-            if bin_path.is_absolute() {
-                bin_path.to_path_buf()
-            } else {
-                selected_cwd.join(bin_path)
-            }
-        } else {
-            let bin_path = which::which(bin).map_err(|_| {
-                ConfigSnafu {
-                    message: "push command executable not found in PATH".to_owned(),
-                }
-                .build()
-            })?;
-            if bin_path.is_absolute() {
-                bin_path
-            } else {
-                match caller_cwd.as_ref() {
-                    Some(caller_cwd) => caller_cwd.join(bin_path),
-                    None => std::env::current_dir()?.join(bin_path),
+        let bin_path = match resolved_bin {
+            Some(bin_path) if bin_path.is_absolute() => bin_path,
+            Some(bin_path) => caller_cwd
+                .as_ref()
+                .map(|caller_cwd| caller_cwd.join(bin_path))
+                .ok_or_else(|| {
+                    ConfigSnafu {
+                        message: "relative PATH executable requires caller working directory"
+                            .to_owned(),
+                    }
+                    .build()
+                })?,
+            None => {
+                let bin_path = Path::new(bin);
+                if bin_path.is_absolute() {
+                    bin_path.to_path_buf()
+                } else {
+                    selected_cwd.join(bin_path)
                 }
             }
         };
@@ -1261,6 +1274,73 @@ mod tests {
             ])
             .current_dir(&caller)
             .env(CHILD_MODE, "1")
+            .env("PATH", path)
+            .output()?;
+        assert!(
+            output.status.success(),
+            "child test failed: {}",
+            String::from_utf8_lossy(&output.stderr),
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exec_argv_resolves_absolute_path_binary_after_caller_cwd_is_deleted() -> Result<()> {
+        const CHILD_MODE: &str = "JJ_VINE_TEST_DELETED_CALLER_CWD";
+        const CALLER_DIR: &str = "JJ_VINE_TEST_CALLER_DIR";
+        const REPO_DIR: &str = "JJ_VINE_TEST_REPO_DIR";
+        if std::env::var_os(CHILD_MODE).is_some() {
+            let caller = std::env::var_os(CALLER_DIR)
+                .map(PathBuf::from)
+                .ok_or_else(|| {
+                    std::io::Error::new(std::io::ErrorKind::NotFound, "caller directory missing")
+                })?;
+            let repo = std::env::var_os(REPO_DIR)
+                .map(PathBuf::from)
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "repository directory missing",
+                    )
+                })?;
+            std::fs::remove_dir(caller)?;
+
+            let jj = Jujutsu {
+                cwd: repo,
+                config_override: Some(PathBuf::new()),
+                default_branch: OnceCell::new(),
+            };
+            let output = jj.exec_argv(&argv(&["push-command"]))?;
+            assert_eq!(output.stdout, "absolute-path");
+            return Ok(());
+        }
+
+        let temp = TempDir::new()?;
+        let caller = temp.path().join("caller");
+        let repo = temp.path().join("repo");
+        let bin = temp.path().join("bin");
+        std::fs::create_dir_all(&caller)?;
+        std::fs::create_dir_all(&repo)?;
+        std::fs::create_dir_all(&bin)?;
+        write_executable(&bin.join("push-command"), "#!/bin/sh\nprintf absolute-path")?;
+
+        let mut path = bin.as_os_str().to_owned();
+        path.push(":");
+        path.push(
+            std::env::var_os("PATH").ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::NotFound, "PATH is not set")
+            })?,
+        );
+        let output = std::process::Command::new(std::env::current_exe()?)
+            .args([
+                "--exact",
+                "jj::tests::exec_argv_resolves_absolute_path_binary_after_caller_cwd_is_deleted",
+            ])
+            .current_dir(&caller)
+            .env(CHILD_MODE, "1")
+            .env(CALLER_DIR, &caller)
+            .env(REPO_DIR, &repo)
             .env("PATH", path)
             .output()?;
         assert!(

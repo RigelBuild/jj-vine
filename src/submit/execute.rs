@@ -115,7 +115,8 @@ pub enum ActionResultData {
     MRCreated(MRUpdate),
     MRUpdated(MRUpdate),
     DryRun,
-    /// Skipped because pushing is disabled or a required merge request action was skipped.
+    /// Skipped because pushing is disabled or a required merge request action
+    /// was skipped.
     Skipped,
 }
 
