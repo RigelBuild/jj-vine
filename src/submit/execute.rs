@@ -115,7 +115,7 @@ pub enum ActionResultData {
     MRCreated(MRUpdate),
     MRUpdated(MRUpdate),
     DryRun,
-    /// Skipped because pushing is disabled and the action depends on a push.
+    /// Skipped because pushing is disabled or a required merge request action was skipped.
     Skipped,
 }
 
@@ -267,6 +267,7 @@ pub async fn execute(mut ctx: RootExecuteContext<'_>) -> Result<SubmissionResult
     let mut merge_requests = Vec::new();
     let mut errors = Vec::new();
     let mut bookmarks_pushed = Vec::new();
+    let mut skipped_mr_bookmarks = HashSet::new();
     let mut current_results: Vec<ActionResult> = Vec::new();
 
     let mut bookmark_graph =
@@ -312,7 +313,9 @@ pub async fn execute(mut ctx: RootExecuteContext<'_>) -> Result<SubmissionResult
                 continue;
             }
 
-            if targets_unpushed_bookmark(action, &unpushed_targets, &bookmark_graph) {
+            if targets_unpushed_bookmark(action, &unpushed_targets, &bookmark_graph)
+                || action_depends_on_skipped_mr(action, &skipped_mr_bookmarks, &bookmark_graph)
+            {
                 debug!(
                     "Skipping action {} because pushing is disabled",
                     action.id()
@@ -326,6 +329,9 @@ pub async fn execute(mut ctx: RootExecuteContext<'_>) -> Result<SubmissionResult
                     },
                     action.plan_text()
                 ));
+                if let Some(bookmark) = merge_request_action_bookmark(action) {
+                    skipped_mr_bookmarks.insert(bookmark);
+                }
                 current_results.push(ActionResult {
                     id: action.id(),
                     data: Ok(ActionResultData::Skipped),
@@ -407,6 +413,57 @@ pub async fn execute(mut ctx: RootExecuteContext<'_>) -> Result<SubmissionResult
         errors,
         bookmarks_pushed,
     })
+}
+
+/// Whether a merge request action depends on an MR action skipped because
+/// pushing is disabled.
+fn action_depends_on_skipped_mr(
+    action: &Action,
+    skipped_mr_bookmarks: &HashSet<String>,
+    bookmark_graph: &BookmarkGraph<'_>,
+) -> bool {
+    if skipped_mr_bookmarks.is_empty() {
+        return false;
+    }
+
+    let depends_on_skipped_bookmark = |name: &str| {
+        bookmark_graph
+            .find_bookmark_in_components(name)
+            .is_some_and(|bookmark| {
+                skipped_mr_bookmarks
+                    .iter()
+                    .any(|skipped| bookmark.find(skipped).is_some())
+            })
+    };
+
+    match action {
+        Action::Push(_) | Action::PushCreate(_) => false,
+        Action::CreateMR(create_mr) => {
+            depends_on_skipped_bookmark(&create_mr.bookmark.to_string())
+                || depends_on_skipped_bookmark(&create_mr.target_branch)
+        }
+        Action::UpdateMRBase(update_mr_base) => {
+            depends_on_skipped_bookmark(&update_mr_base.bookmark)
+                || depends_on_skipped_bookmark(&update_mr_base.new_target_branch)
+        }
+        Action::UpdateMRTitleDescription(update) => {
+            depends_on_skipped_bookmark(&update.bookmark.to_string())
+        }
+        Action::SyncDependentMergeRequests(sync) => {
+            depends_on_skipped_bookmark(&sync.bookmark.to_string())
+        }
+    }
+}
+
+/// Gets the source bookmark of a merge request action.
+fn merge_request_action_bookmark(action: &Action) -> Option<String> {
+    match action {
+        Action::CreateMR(create_mr) => Some(create_mr.bookmark.to_string()),
+        Action::UpdateMRBase(update_mr_base) => Some(update_mr_base.bookmark.clone()),
+        Action::UpdateMRTitleDescription(update) => Some(update.bookmark.to_string()),
+        Action::SyncDependentMergeRequests(sync) => Some(sync.bookmark.to_string()),
+        Action::Push(_) | Action::PushCreate(_) => None,
+    }
 }
 
 /// Planned push targets whose head on the push remote will not match the local
