@@ -175,6 +175,108 @@ async fn add_markers_to_description_without_markers() -> Result<()> {
 }
 
 #[tokio::test]
+async fn moving_stack_to_top_preserves_user_text_and_is_stable() -> Result<()> {
+    let repo = TestRepo::with_github_remote();
+
+    let branch_a = repo.bookmark_name("placement-a");
+    let branch_b = repo.bookmark_name("placement-b");
+
+    // main -> A -> B
+    repo.jj.exec(["new", "main"])?;
+    repo.create_change("a.txt", "a", "Commit A")
+        .create_and_push_bookmark(&branch_a);
+
+    repo.jj.exec(["new"])?;
+    repo.create_change("b.txt", "b", "Commit B")
+        .create_and_push_bookmark(&branch_b);
+
+    repo.run(["submit", &branch_b]).await;
+
+    let pr_a = repo
+        .forge()
+        .find_merge_request_by_source_branch(&branch_a)
+        .await?
+        .expect("PR A should exist");
+    let pr_b = repo
+        .forge()
+        .find_merge_request_by_source_branch(&branch_b)
+        .await?
+        .expect("PR B should exist");
+
+    let user_before = "Context before the stack details";
+    let user_after = "Follow-up details after the stack";
+    let initial_stack = pr_a.body.expect("PR A should have a description");
+    assert!(initial_stack.starts_with(START_MARKER));
+    assert!(initial_stack.ends_with(END_MARKER));
+    let edited_description = format!("{user_before}\n\n{initial_stack}\n\n{user_after}");
+    repo.forge()
+        .update_merge_request_info(
+            pr_a.number,
+            UpdateMergeRequestInfoOptions::builder()
+                .description(edited_description)
+                .current_is_draft(pr_a.draft)
+                .current_title(pr_a.title.clone())
+                .build(),
+        )
+        .await?;
+
+    repo.jj.exec([
+        "config",
+        "set",
+        "--repo",
+        "jj-vine.description.placement",
+        "top",
+    ])?;
+    repo.run(["submit", &branch_b]).await;
+
+    let updated_description = repo
+        .forge()
+        .find_merge_request_by_source_branch(&branch_a)
+        .await?
+        .expect("PR A should exist")
+        .body
+        .expect("PR A should have a description");
+
+    assert!(updated_description.starts_with(START_MARKER));
+    assert_eq!(updated_description.matches(START_MARKER).count(), 1);
+    assert_eq!(updated_description.matches(END_MARKER).count(), 1);
+    let stack_end = updated_description
+        .find(END_MARKER)
+        .expect("stack end marker should exist");
+    let stack = &updated_description[..stack_end];
+    assert_contains!(stack, "This PR is part of a stack containing 2 PRs");
+    assert_contains!(stack, "this PR");
+    assert_contains!(stack, &format!("#{}", pr_b.number));
+    assert_eq!(updated_description.matches(user_before).count(), 1);
+    assert_eq!(updated_description.matches(user_after).count(), 1);
+    let stack_end_position = updated_description
+        .find(END_MARKER)
+        .expect("stack end marker should exist");
+    let user_before_position = updated_description
+        .find(user_before)
+        .expect("the first user text should be preserved");
+    let user_after_position = updated_description
+        .find(user_after)
+        .expect("the second user text should be preserved");
+    assert!(stack_end_position < user_before_position);
+    assert!(user_before_position < user_after_position);
+
+    repo.run(["submit", &branch_b]).await;
+
+    assert_eq!(
+        updated_description,
+        repo.forge()
+            .find_merge_request_by_source_branch(&branch_a)
+            .await?
+            .expect("PR A should exist")
+            .body
+            .expect("PR A should have a description")
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn skip_update_when_description_unchanged() -> Result<()> {
     let repo = TestRepo::with_github_remote();
 
