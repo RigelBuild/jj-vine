@@ -15,6 +15,10 @@ pub(crate) struct DetectedForge {
     pub(crate) project: String,
     /// Only for Azure DevOps, the name of the repository.
     pub(crate) repository_name: Option<String>,
+    /// Only from [`detect_project`] for GitHub: the project the remote
+    /// fetches from, when its fetch URL names a different repository than
+    /// its push URL on the same API host. `None` otherwise.
+    pub(crate) target_project: Option<String>,
 }
 
 /// What a remote URL says about the forge API host.
@@ -196,6 +200,7 @@ pub(crate) fn parse_forge_url(url: &str) -> Option<DetectedForge> {
         host,
         project,
         repository_name,
+        target_project: None,
     })
 }
 
@@ -241,6 +246,11 @@ pub(crate) fn parse_remote_list_line(line: &str) -> Option<RemoteListEntry<'_>> 
 /// Detection is best-effort so config validation can report a missing
 /// project instead of failing on remote inspection.
 ///
+/// For GitHub, a separate fetch URL that names a different repository on the
+/// same derived API host sets [`DetectedForge::target_project`]. A fetch URL
+/// on another host, an SSH alias, or a plaintext Enterprise remote never
+/// sets it, because the target would then need a second API host.
+///
 /// Remote URLs can embed credentials, so they are never logged.
 pub(crate) fn detect_project(
     jj: &Jujutsu,
@@ -255,7 +265,7 @@ pub(crate) fn detect_project(
         }
     };
 
-    let mut remote_url = None;
+    let mut remote_entry = None;
     let mut has_upstream = false;
     let mut has_fork = false;
     let mut has_origin = false;
@@ -267,7 +277,7 @@ pub(crate) fn detect_project(
         // selected remote must not fall through to another remote.
         if name == remote_name {
             let entry = parse_remote_list_line(line)?;
-            remote_url = Some(entry.push_or_fetch_url());
+            remote_entry = Some(entry);
         }
         match name {
             "upstream" => has_upstream = true,
@@ -277,17 +287,99 @@ pub(crate) fn detect_project(
         }
     }
 
-    // With a separate upstream, origin is normally a fork and not the target.
-    if has_upstream && remote_name != "upstream" {
-        return None;
-    }
-    // With `fork` beside `origin`, origin is the canonical target.
-    if has_fork && has_origin && remote_name != "origin" {
+    // With a separate upstream, only upstream is the target, even beside a
+    // `fork` and `origin` pair. Otherwise, with `fork` beside `origin`,
+    // origin is the canonical target.
+    let eligible = if has_upstream {
+        remote_name == "upstream"
+    } else if has_fork && has_origin {
+        remote_name == "origin"
+    } else {
+        true
+    };
+    if !eligible {
         return None;
     }
 
-    let detected = parse_forge_url(remote_url?)?;
-    (detected.forge_type == forge_type).then_some(detected)
+    let entry = remote_entry?;
+    let mut detected = parse_forge_url(entry.push_or_fetch_url())?;
+    if detected.forge_type != forge_type {
+        return None;
+    }
+    if forge_type == ForgeType::GitHub && entry.push_url.is_some() {
+        detected.target_project = same_host_fetch_project(&detected, entry.fetch_url);
+    }
+    Some(detected)
+}
+
+/// The GitHub project behind `fetch_url` when it differs from the pushed
+/// project and both resolve to the same derived API host.
+fn same_host_fetch_project(pushed: &DetectedForge, fetch_url: &str) -> Option<String> {
+    let ApiHost::Derived(push_host) = &pushed.host else {
+        return None;
+    };
+    let fetched = parse_forge_url(fetch_url)?;
+    let ApiHost::Derived(fetch_host) = &fetched.host else {
+        return None;
+    };
+    let distinct = fetched.forge_type == ForgeType::GitHub
+        && same_api_host(fetch_host, push_host)
+        && !fetched.project.eq_ignore_ascii_case(&pushed.project);
+    distinct.then_some(fetched.project)
+}
+
+/// Whether two API URLs name the same endpoint. Scheme and hostname compare
+/// ASCII case-insensitively, a default port (443 for HTTPS, 80 for HTTP)
+/// equals no port, and trailing slashes are ignored. HTTP and HTTPS stay
+/// distinct, and the path otherwise compares exactly. A URL that does not
+/// parse matches nothing.
+pub(crate) fn same_api_host(left: &str, right: &str) -> bool {
+    match (ApiEndpoint::parse(left), ApiEndpoint::parse(right)) {
+        (Some(left), Some(right)) => left.same_as(&right),
+        _ => false,
+    }
+}
+
+/// The comparable parts of an API URL.
+struct ApiEndpoint<'a> {
+    is_https: bool,
+    hostname: &'a str,
+    /// `None` for an absent or default port.
+    port: Option<u16>,
+    /// Path without trailing slashes.
+    path: &'a str,
+}
+
+impl<'a> ApiEndpoint<'a> {
+    fn parse(url: &'a str) -> Option<Self> {
+        let (scheme, rest) = url.split_once("://")?;
+        let is_https = if scheme.eq_ignore_ascii_case("https") {
+            true
+        } else if scheme.eq_ignore_ascii_case("http") {
+            false
+        } else {
+            return None;
+        };
+        if rest.contains(['?', '#', '@']) {
+            return None;
+        }
+        let (authority, path) = rest.find('/').map_or((rest, ""), |at| rest.split_at(at));
+        let (hostname, port) = split_host_port(authority)?;
+        let default_port = if is_https { 443 } else { 80 };
+        Some(Self {
+            is_https,
+            hostname,
+            port: port.filter(|&port| port != default_port),
+            path: path.trim_end_matches('/'),
+        })
+    }
+
+    fn same_as(&self, other: &Self) -> bool {
+        self.is_https == other.is_https
+            && self.hostname.eq_ignore_ascii_case(other.hostname)
+            && self.port == other.port
+            && self.path == other.path
+    }
 }
 
 #[cfg(test)]
@@ -627,7 +719,8 @@ mod tests {
             .expect("set push URL");
     }
 
-    /// Branches go to the push URL, so it names the pushed project.
+    /// Branches go to the push URL, so it names the pushed project; the
+    /// fetch URL on the same API host names the target.
     #[test]
     fn detect_remote_with_separate_push_url() {
         let (_temp, repo_path) = create_test_repo();
@@ -636,6 +729,135 @@ mod tests {
         let jj = Jujutsu::new(&repo_path).expect("jj");
         let detected = detect_project(&jj, "origin", ForgeType::GitHub).expect("detect remote");
         assert_eq!(detected.project, "person/push");
+        assert_eq!(detected.target_project.as_deref(), Some("owner/repo"));
+    }
+
+    #[test]
+    fn detect_same_project_push_url_sets_no_target() {
+        let (_temp, repo_path) = create_test_repo();
+        add_remote(&repo_path, "origin", "https://github.com/owner/repo.git");
+        set_push_url(&repo_path, "origin", "git@github.com:owner/repo.git");
+        let jj = Jujutsu::new(&repo_path).expect("jj");
+        let detected = detect_project(&jj, "origin", ForgeType::GitHub).expect("detect remote");
+        assert_eq!(detected.project, "owner/repo");
+        assert_eq!(detected.target_project, None);
+    }
+
+    /// RIG-4691: a target on another API host, or on no known host, is never
+    /// derived.
+    #[test]
+    fn detect_cross_host_fetch_url_sets_no_target() {
+        for (fetch, push) in [
+            (
+                "git@github.example.com:owner/repo.git",
+                "git@github.com:person/push.git",
+            ),
+            (
+                "https://github.com/owner/repo.git",
+                "https://github.example.com/person/push.git",
+            ),
+            (
+                "git@github.com-work:owner/repo.git",
+                "git@github.com:person/push.git",
+            ),
+            (
+                "http://github.example.com/owner/repo.git",
+                "https://github.example.com/person/push.git",
+            ),
+            (
+                "git@gitlab.com:owner/repo.git",
+                "git@github.com:person/push.git",
+            ),
+        ] {
+            let (_temp, repo_path) = create_test_repo();
+            add_remote(&repo_path, "origin", fetch);
+            set_push_url(&repo_path, "origin", push);
+            let jj = Jujutsu::new(&repo_path).expect("jj");
+            let detected =
+                detect_project(&jj, "origin", ForgeType::GitHub).expect("detect push remote");
+            assert_eq!(detected.project, "person/push", "{fetch}");
+            assert_eq!(detected.target_project, None, "{fetch}");
+        }
+    }
+
+    /// A fetch URL that differs from the push URL only in ASCII case names
+    /// the same repository, so it is not a fork target.
+    #[test]
+    fn detect_case_only_push_url_sets_no_target() {
+        let (_temp, repo_path) = create_test_repo();
+        add_remote(&repo_path, "origin", "https://github.com/Owner/Repo.git");
+        set_push_url(&repo_path, "origin", "git@github.com:owner/repo.git");
+        let jj = Jujutsu::new(&repo_path).expect("jj");
+        let detected = detect_project(&jj, "origin", ForgeType::GitHub).expect("detect remote");
+        assert_eq!(detected.project, "owner/repo");
+        assert_eq!(detected.target_project, None);
+    }
+
+    /// An explicit default HTTPS port and hostname case do not make the
+    /// fetch URL another API host.
+    #[test]
+    fn detect_port_443_and_host_case_fetch_url_sets_target() {
+        let (_temp, repo_path) = create_test_repo();
+        add_remote(
+            &repo_path,
+            "origin",
+            "https://github.EXAMPLE.com:443/owner/repo.git",
+        );
+        set_push_url(
+            &repo_path,
+            "origin",
+            "git@github.example.com:person/push.git",
+        );
+        let jj = Jujutsu::new(&repo_path).expect("jj");
+        let detected = detect_project(&jj, "origin", ForgeType::GitHub).expect("detect remote");
+        assert_eq!(detected.project, "person/push");
+        assert_eq!(detected.target_project.as_deref(), Some("owner/repo"));
+    }
+
+    /// `upstream` beside both `fork` and `origin` is the only eligible remote.
+    #[test]
+    fn detect_upstream_fork_origin_prefers_upstream() {
+        let (_temp, repo_path) = create_test_repo();
+        add_remote(&repo_path, "origin", "git@github.com:person/origin.git");
+        add_remote(&repo_path, "fork", "git@github.com:person/fork.git");
+        add_remote(&repo_path, "upstream", "git@github.com:owner/repo.git");
+        let jj = Jujutsu::new(&repo_path).expect("jj");
+        let detected = detect_project(&jj, "upstream", ForgeType::GitHub).expect("detect upstream");
+        assert_eq!(detected.project, "owner/repo");
+        assert!(detect_project(&jj, "origin", ForgeType::GitHub).is_none());
+        assert!(detect_project(&jj, "fork", ForgeType::GitHub).is_none());
+    }
+
+    #[test]
+    fn same_api_host_normalizes_case_default_port_and_trailing_slash() {
+        for (left, right) in [
+            ("https://api.github.com", "https://API.GitHub.com/"),
+            ("https://api.github.com", "HTTPS://api.github.com:443"),
+            (
+                "https://ghe.example/api/v3",
+                "https://ghe.example:443/api/v3/",
+            ),
+            ("http://ghe.example/api/v3", "http://ghe.example:80/api/v3"),
+        ] {
+            assert!(same_api_host(left, right), "{left} vs {right}");
+        }
+    }
+
+    #[test]
+    fn same_api_host_keeps_scheme_port_and_path_distinct() {
+        for (left, right) in [
+            ("https://ghe.example/api/v3", "http://ghe.example/api/v3"),
+            (
+                "https://ghe.example/api/v3",
+                "https://ghe.example:8443/api/v3",
+            ),
+            ("https://ghe.example/api/v3", "https://ghe.example"),
+            ("https://ghe.example/api/v3", "https://ghe.example/API/v3"),
+            ("https://ghe.example/api/v3", "https://other.example/api/v3"),
+            ("https://ghe.example/api/v3", "not a url"),
+        ] {
+            assert!(!same_api_host(left, right), "{left} vs {right}");
+        }
     }
 
     /// `fork` beside `origin` keeps origin eligible as the canonical target.

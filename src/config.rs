@@ -8,7 +8,7 @@ use serde::{Deserialize, de::Visitor};
 use crate::{
     error::{ConfigSnafu, Error, Result},
     jj::Jujutsu,
-    remote::ApiHost,
+    remote::{ApiHost, same_api_host},
 };
 
 /// Forge type (GitLab, GitHub, or Forgejo).
@@ -1031,21 +1031,38 @@ impl Config {
             .build()
         })?;
 
-        // Repo- or workspace-explicit values win; otherwise clone-derived
-        // values supersede global config. Empty values collapse into the
-        // derive path. A plaintext GitHub Enterprise remote derives no host,
-        // so it needs an explicit HTTPS host; an `http://` host does not
-        // count, and the public API is never assumed for it.
+        // Clone-explicit values win; derived values supersede global ones, and
+        // empty values derive. A plaintext Enterprise remote needs a
+        // clone-explicit HTTPS host. A derived target also needs the effective
+        // host and source project to match the remote's.
         if config.forge == ForgeType::GitHub {
             let clone_keys = clone_layer_keys(jj);
             let clone_keys = clone_keys.as_deref();
             let project_set = clone_layer_nonempty(clone_keys, "project", &config.github.project);
             let host_set = clone_layer_nonempty(clone_keys, "host", &config.github.host);
+            let target_set =
+                clone_layer_nonempty(clone_keys, "targetProject", &config.github.target_project);
             let https_host_set = host_set && is_https_host(&config.github.host);
-            if (!project_set || !https_host_set)
+            if (!project_set || !https_host_set || !target_set)
                 && let Some(detected) =
                     crate::remote::detect_project(jj, &config.remote_name, ForgeType::GitHub)
             {
+                // A different effective host or source project would pair the
+                // fetch repository with another server or another source.
+                let source_matches = !project_set
+                    || config
+                        .github
+                        .project
+                        .eq_ignore_ascii_case(&detected.project);
+                let derived_target = match &detected.host {
+                    ApiHost::Derived(host)
+                        if source_matches
+                            && (!host_set || same_api_host(&config.github.host, host)) =>
+                    {
+                        detected.target_project
+                    }
+                    ApiHost::Derived(_) | ApiHost::Unknown | ApiHost::PlaintextEnterprise => None,
+                };
                 if !project_set {
                     config.github.project = detected.project;
                 }
@@ -1066,6 +1083,11 @@ impl Config {
                         }
                         .fail();
                     }
+                }
+                // `detect_project` sets a target only when it differs from the
+                // push project, ignoring ASCII case.
+                if !target_set && let Some(target) = derived_target {
+                    config.github.target_project = target;
                 }
             }
             if config.github.host.is_empty() {
@@ -1443,6 +1465,208 @@ mod tests {
         let config = load_isolated(&repo_path).expect("load config from GitHub remote");
 
         assert!(config.github.target_project.is_empty());
+    }
+
+    fn set_git_push_url(repo_path: &Path, name: &str, url: &str) {
+        isolated_jj(repo_path)
+            .expect("Failed to create Jujutsu instance")
+            .exec(["git", "remote", "set-url", name, "--push", url])
+            .expect("Failed to set push URL");
+    }
+
+    /// RIG-4670: a remote that fetches the canonical repository and pushes to
+    /// another one on the same host is a fork workflow. A global
+    /// `targetProject` is superseded, like global `project` and `host`.
+    #[test]
+    fn derive_target_project_from_distinct_fetch_url() {
+        let (temp, repo_path) = create_test_repo();
+        seed_github_config(&repo_path);
+        std::fs::write(
+            temp.path().join(ISOLATED_TEST_CONFIG),
+            "[jj-vine.github]\ntargetProject = \"stale/global\"\n",
+        )
+        .expect("write user-level GitHub target");
+        add_git_remote(&repo_path, "origin", "https://github.com/owner/repo.git");
+        set_git_push_url(&repo_path, "origin", "git@github.com:person/fork.git");
+
+        let config = load_isolated(&repo_path).expect("load config from fork remote");
+
+        assert_eq!(config.github.source_project(), "person/fork");
+        assert_eq!(config.github.target_project(), "owner/repo");
+        assert_eq!(config.github.host, "https://api.github.com");
+        assert!(config.github.is_fork_workflow());
+    }
+
+    /// Repo- and workspace-explicit `targetProject` win over the fetch URL.
+    #[test]
+    fn derive_target_project_keeps_clone_explicit_value() {
+        for set_config in [set_repo_config, set_workspace_config] {
+            let (_temp, repo_path) = create_test_repo();
+            seed_github_config(&repo_path);
+            set_config(
+                &repo_path,
+                "jj-vine.github.targetProject",
+                "explicit/target",
+            );
+            add_git_remote(&repo_path, "origin", "https://github.com/owner/repo.git");
+            set_git_push_url(&repo_path, "origin", "git@github.com:person/fork.git");
+
+            let config = load_isolated(&repo_path).expect("load config with explicit target");
+
+            assert_eq!(config.github.project, "person/fork");
+            assert_eq!(config.github.target_project(), "explicit/target");
+        }
+    }
+
+    /// An explicit host other than the one both URLs resolve to keeps the
+    /// target unset: the fetch URL names a repository on another server.
+    #[test]
+    fn derive_target_project_skipped_for_other_explicit_host() {
+        let (_temp, repo_path) = create_test_repo();
+        seed_github_config(&repo_path);
+        set_repo_config(
+            &repo_path,
+            "jj-vine.github.host",
+            "https://ghe.example/api/v3",
+        );
+        add_git_remote(&repo_path, "origin", "https://github.com/owner/repo.git");
+        set_git_push_url(&repo_path, "origin", "git@github.com:person/fork.git");
+
+        let config = load_isolated(&repo_path).expect("load config with explicit host");
+
+        assert_eq!(config.github.project, "person/fork");
+        assert!(config.github.target_project.is_empty());
+    }
+
+    /// RIG-4691 is open: a fetch URL on another API host derives no target.
+    #[test]
+    fn derive_target_project_skipped_for_cross_host_fetch_url() {
+        let (_temp, repo_path) = create_test_repo();
+        seed_github_config(&repo_path);
+        add_git_remote(
+            &repo_path,
+            "origin",
+            "https://github.example.com/owner/repo.git",
+        );
+        set_git_push_url(&repo_path, "origin", "git@github.com:person/fork.git");
+
+        let config = load_isolated(&repo_path).expect("load config from cross-host remote");
+
+        assert_eq!(config.github.project, "person/fork");
+        assert_eq!(config.github.host, "https://api.github.com");
+        assert!(config.github.target_project.is_empty());
+    }
+
+    /// An explicit host naming the derived endpoint with other hostname case,
+    /// an explicit default port, or a trailing slash still derives the target.
+    #[test]
+    fn derive_target_project_for_matching_explicit_host() {
+        for host in [
+            "https://api.github.com",
+            "https://API.GitHub.com/",
+            "https://api.github.com:443",
+        ] {
+            let (_temp, repo_path) = create_test_repo();
+            seed_github_config(&repo_path);
+            set_repo_config(&repo_path, "jj-vine.github.host", host);
+            add_git_remote(&repo_path, "origin", "https://github.com/owner/repo.git");
+            set_git_push_url(&repo_path, "origin", "git@github.com:person/fork.git");
+
+            let config = load_isolated(&repo_path).expect("load config with matching host");
+
+            assert_eq!(config.github.host, host);
+            assert_eq!(config.github.project, "person/fork", "{host}");
+            assert_eq!(config.github.target_project(), "owner/repo", "{host}");
+        }
+    }
+
+    /// A plain HTTP host is a different endpoint from the derived HTTPS API.
+    #[test]
+    fn derive_target_project_skipped_for_http_explicit_host() {
+        let (_temp, repo_path) = create_test_repo();
+        seed_github_config(&repo_path);
+        set_repo_config(
+            &repo_path,
+            "jj-vine.github.host",
+            "http://github.example.com/api/v3",
+        );
+        add_git_remote(
+            &repo_path,
+            "origin",
+            "https://github.example.com/owner/repo.git",
+        );
+        set_git_push_url(
+            &repo_path,
+            "origin",
+            "git@github.example.com:person/fork.git",
+        );
+
+        let config = load_isolated(&repo_path).expect("load config with HTTP host");
+
+        assert_eq!(config.github.project, "person/fork");
+        assert!(config.github.target_project.is_empty());
+    }
+
+    /// A clone-explicit source project other than the push URL's keeps the
+    /// target unset: the fetch repository is not that project's upstream.
+    #[test]
+    fn derive_target_project_skipped_for_mismatched_explicit_project() {
+        let (_temp, repo_path) = create_test_repo();
+        seed_github_config(&repo_path);
+        set_repo_config(&repo_path, "jj-vine.github.project", "other/source");
+        add_git_remote(&repo_path, "origin", "https://github.com/owner/repo.git");
+        set_git_push_url(&repo_path, "origin", "git@github.com:person/fork.git");
+
+        let config = load_isolated(&repo_path).expect("load config with explicit project");
+
+        assert_eq!(config.github.project, "other/source");
+        assert!(config.github.target_project.is_empty());
+    }
+
+    /// A clone-explicit source project that matches the push URL up to ASCII
+    /// case still derives the target.
+    #[test]
+    fn derive_target_project_for_case_matching_explicit_project() {
+        let (_temp, repo_path) = create_test_repo();
+        seed_github_config(&repo_path);
+        set_repo_config(&repo_path, "jj-vine.github.project", "Person/Fork");
+        add_git_remote(&repo_path, "origin", "https://github.com/owner/repo.git");
+        set_git_push_url(&repo_path, "origin", "git@github.com:person/fork.git");
+
+        let config = load_isolated(&repo_path).expect("load config with explicit project");
+
+        assert_eq!(config.github.project, "Person/Fork");
+        assert_eq!(config.github.target_project(), "owner/repo");
+    }
+
+    /// A fetch URL naming the push repository in other case is no fork.
+    #[test]
+    fn derive_target_project_skipped_for_case_only_difference() {
+        let (_temp, repo_path) = create_test_repo();
+        seed_github_config(&repo_path);
+        add_git_remote(&repo_path, "origin", "https://github.com/Person/Fork.git");
+        set_git_push_url(&repo_path, "origin", "git@github.com:person/fork.git");
+
+        let config = load_isolated(&repo_path).expect("load config from case-only remote");
+
+        assert_eq!(config.github.project, "person/fork");
+        assert!(config.github.target_project.is_empty());
+        assert!(!config.github.is_fork_workflow());
+    }
+
+    /// With `upstream`, `fork`, and `origin`, only `upstream` derives.
+    #[test]
+    fn derive_upstream_beside_fork_and_origin() {
+        let (_temp, repo_path) = create_test_repo();
+        seed_github_config(&repo_path);
+        set_repo_config(&repo_path, "jj-vine.remoteName", "upstream");
+        add_git_remote(&repo_path, "origin", "git@github.com:person/origin.git");
+        add_git_remote(&repo_path, "fork", "git@github.com:person/fork.git");
+        add_git_remote(&repo_path, "upstream", "git@github.com:owner/repo.git");
+
+        let config = load_isolated(&repo_path).expect("load config from upstream");
+
+        assert_eq!(config.github.project, "owner/repo");
     }
 
     #[test]
