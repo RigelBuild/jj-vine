@@ -72,12 +72,20 @@ impl ExecuteAction for PushCreateAction {
         let push_argv = ctx.execute.config.push.resolve_argv(ctx.execute.no_hooks);
 
         if ctx.execute.dry_run {
-            let push_description = push_description(push_argv.as_deref());
-            ctx.execute.output.log_message(&format!(
-                "Would {} and push to remote {} {push_description} for changes: {change_ids_string}",
-                "create bookmarks".green(),
-                self.remote.cyan()
-            ));
+            if let Some(argv) = push_argv.as_deref() {
+                ctx.execute.output.log_message(&format!(
+                    "Would {} and push to remote {} {} for changes: {change_ids_string}",
+                    "create bookmarks".green(),
+                    self.remote.cyan(),
+                    push_description(Some(argv))
+                ));
+            } else {
+                ctx.execute.output.log_message(&format!(
+                    "Would skip creating and pushing bookmarks to remote {} {} for changes: {change_ids_string}",
+                    self.remote.cyan(),
+                    push_description(None)
+                ));
+            }
 
             if push_argv.is_some() {
                 let bookmarks = self

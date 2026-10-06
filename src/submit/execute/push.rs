@@ -57,11 +57,19 @@ impl ExecuteAction for PushAction {
         let push_argv = ctx.execute.config.push.resolve_argv(ctx.execute.no_hooks);
 
         core::future::ready(if ctx.execute.dry_run {
-            let push_description = push_description(push_argv.as_deref());
-            ctx.execute.output.log_message(&format!(
-                "Would push bookmarks to remote {} {push_description}: {bookmarks_string}",
-                self.remote.cyan()
-            ));
+            if let Some(argv) = push_argv.as_deref() {
+                ctx.execute.output.log_message(&format!(
+                    "Would push bookmarks to remote {} {}: {bookmarks_string}",
+                    self.remote.cyan(),
+                    push_description(Some(argv))
+                ));
+            } else {
+                ctx.execute.output.log_message(&format!(
+                    "Would skip pushing bookmarks to remote {} {}: {bookmarks_string}",
+                    self.remote.cyan(),
+                    push_description(None)
+                ));
+            }
 
             Ok(ActionResultData::Pushed {
                 bookmarks: self.bookmarks.clone(),
