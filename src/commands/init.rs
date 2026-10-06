@@ -198,7 +198,7 @@ fn set_config(repo_path: impl Into<PathBuf>, key: &str, value: impl AsRef<str>) 
 
 #[expect(clippy::single_call_fn, reason = "seems fine")]
 fn detect_remotes(jj: &Jujutsu) -> Result<Option<Remotes>> {
-    let output = jj.exec(["git", "remote", "list"])?;
+    let output = jj.exec_redacted(["git", "remote", "list"])?;
     let remotes: HashMap<_, _> = output
         .stdout
         .lines()
@@ -250,6 +250,33 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+
+    /// Captures every tracing event at TRACE level into a shared buffer.
+    #[derive(Clone, Default)]
+    struct CapturedLogs(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLogs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("log buffer").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl CapturedLogs {
+        fn capture(&self, f: impl FnOnce()) -> String {
+            let writer = self.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::TRACE)
+                .with_writer(move || writer.clone())
+                .finish();
+            tracing::subscriber::with_default(subscriber, f);
+            String::from_utf8(self.0.lock().expect("log buffer").clone()).expect("utf-8 logs")
+        }
+    }
 
     fn create_test_repo() -> (TempDir, PathBuf) {
         let temp_dir = TempDir::new().expect("create temp directory");
@@ -315,6 +342,58 @@ mod tests {
         assert_eq!(
             remotes.target_forge.expect("target forge").project,
             "owner/repo"
+        );
+    }
+
+    #[test]
+    fn detect_remotes_selects_fork_as_source_and_origin_as_target() {
+        let (_temp, repo_path) = create_test_repo();
+        add_remote(&repo_path, "fork", "git@github.com:person/fork.git");
+        add_remote(&repo_path, "origin", "git@github.com:owner/repo.git");
+
+        let jj = Jujutsu::new(&repo_path).expect("jj");
+        let remotes = detect_remotes(&jj)
+            .expect("detect remotes")
+            .expect("origin");
+
+        assert_eq!(remotes.origin, "git@github.com:person/fork.git");
+        assert_eq!(
+            remotes.upstream.as_deref(),
+            Some("git@github.com:owner/repo.git")
+        );
+        assert_eq!(
+            remotes.target_forge.expect("target forge").project,
+            "owner/repo"
+        );
+    }
+
+    #[test]
+    fn detect_remotes_never_traces_remote_userinfo() {
+        let (_temp, repo_path) = create_test_repo();
+        add_remote(
+            &repo_path,
+            "origin",
+            "https://user:safe-fixture-token@github.com/owner/repo.git",
+        );
+        let jj = Jujutsu::new(&repo_path).expect("jj");
+
+        let logs = CapturedLogs::default().capture(|| {
+            let remotes = detect_remotes(&jj)
+                .expect("detect remotes")
+                .expect("origin");
+            assert_eq!(
+                remotes.origin,
+                "https://user:safe-fixture-token@github.com/owner/repo.git"
+            );
+        });
+
+        assert!(
+            logs.contains("git remote list"),
+            "trace capture is live: {logs}"
+        );
+        assert!(
+            !logs.contains("safe-fixture-token"),
+            "remote userinfo leaked: {logs}"
         );
     }
 
