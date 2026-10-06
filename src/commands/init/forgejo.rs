@@ -27,7 +27,7 @@ pub fn init(repo_path: impl Into<PathBuf>, remotes: Option<&Remotes>) -> Result<
     };
 
     let default_host = existing_host
-        .or(forge.map(|f| f.host.clone()))
+        .or_else(|| forge.and_then(|f| f.host.clone()))
         .unwrap_or_else(|| "https://codeberg.org".to_owned());
     let default_project = existing_project.or(forge.map(|f| f.project.clone()));
 

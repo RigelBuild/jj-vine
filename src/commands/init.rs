@@ -3,7 +3,6 @@
 use std::{collections::HashMap, path::PathBuf};
 
 use dialoguer::{Input, Select};
-use itertools::Itertools as _;
 use owo_colors::OwoColorize as _;
 use serde::Deserialize;
 use strum::VariantArray as _;
@@ -203,9 +202,8 @@ fn detect_remotes(jj: &Jujutsu) -> Result<Option<Remotes>> {
         .stdout
         .lines()
         .map(|line| {
-            line.split_whitespace()
-                .take(2)
-                .collect_tuple()
+            remote::parse_remote_list_line(line)
+                .map(|entry| (entry.name, entry.fetch_url))
                 .ok_or_else(|| make_whatever!("Failed to parse remote line"))
         })
         .collect::<Result<_>>()?;

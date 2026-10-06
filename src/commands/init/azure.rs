@@ -32,7 +32,7 @@ pub fn init(repo_path: impl Into<PathBuf>, remotes: Option<&Remotes>) -> Result<
     };
 
     let mut default_host = existing_host
-        .or(forge.map(|f| f.host.clone()))
+        .or_else(|| forge.and_then(|f| f.host.clone()))
         .unwrap_or_else(|| "https://dev.azure.com".to_owned());
 
     // Handle ssh.dev.azure.com
