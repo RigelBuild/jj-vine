@@ -195,6 +195,82 @@ fn set_config(repo_path: impl Into<PathBuf>, key: &str, value: impl AsRef<str>) 
     Jujutsu::new(repo_path)?.exec(["config", "set", "--repo", key, value.as_ref()])?;
     Ok(())
 }
+/// Unset a repository-level configuration value.
+pub(super) fn unset_config(repo_path: impl Into<PathBuf>, key: &str) -> Result<()> {
+    Jujutsu::new(repo_path)?.exec(["config", "unset", "--repo", key])?;
+    Ok(())
+}
+
+/// Set a configuration value without exposing its arguments or output to trace
+/// logs.
+pub(super) fn set_config_redacted(
+    repo_path: impl Into<PathBuf>,
+    key: &str,
+    value: &str,
+) -> Result<()> {
+    let value = toml::Value::String(value.to_owned()).to_string();
+    Jujutsu::new(repo_path)?.exec_secret(["config", "set", "--repo", key, &value])?;
+    Ok(())
+}
+
+/// Return the source layer for one effective configuration key.
+pub(super) fn config_key_source(jj: &Jujutsu, key: &str) -> Option<String> {
+    let output = jj
+        .exec([
+            "config",
+            "list",
+            "--template",
+            r#"name ++ "\t" ++ source ++ "\n""#,
+            key,
+        ])
+        .ok()?;
+    output.stdout.lines().find_map(|line| {
+        let (name, source) = line.split_once('\t')?;
+        (name == key).then(|| source.to_owned())
+    })
+}
+
+/// List config keys from the repo or workspace layer, without reading values.
+pub(super) fn clone_layer_keys(jj: &Jujutsu, table: &str) -> Option<Vec<String>> {
+    let output = jj
+        .exec([
+            "config",
+            "list",
+            "--template",
+            r#"name ++ "\t" ++ source ++ "\n""#,
+            table,
+        ])
+        .ok()?;
+    Some(
+        output
+            .stdout
+            .lines()
+            .filter_map(|line| line.split_once('\t'))
+            .filter(|(_, source)| matches!(*source, "repo" | "workspace"))
+            .map(|(name, _)| name.to_owned())
+            .collect(),
+    )
+}
+
+/// A non-empty config value is clone-explicit when its key comes from the
+/// repo or workspace layer. Unknown source layers keep the value.
+pub(super) fn clone_layer_nonempty(clone_keys: Option<&[String]>, key: &str, value: &str) -> bool {
+    !value.is_empty() && clone_keys.is_none_or(|keys| keys.iter().any(|name| name == key))
+}
+
+/// Keep clone-explicit values, otherwise prefer a remote-derived default to
+/// an inherited global value.
+pub(super) fn derived_config_default(
+    existing: Option<String>,
+    derived: Option<String>,
+    clone_keys: Option<&[String]>,
+    key: &str,
+) -> Option<String> {
+    let explicit = existing
+        .as_ref()
+        .filter(|value| clone_layer_nonempty(clone_keys, key, value));
+    explicit.cloned().or(derived).or(existing)
+}
 
 fn parse_init_remote_line(line: &str) -> Result<remote::RemoteListEntry<'_>> {
     remote::parse_remote_list_line(line)
