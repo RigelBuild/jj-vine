@@ -422,8 +422,9 @@ pub struct GitHubConfig {
     /// first element is the binary. Used only when `token` is empty. The
     /// trimmed stdout becomes the token. A non-zero exit or empty output is an
     /// error. The command must be non-interactive: it gets null stdin and, on
-    /// Unix, no controlling terminal. Every process it starts is killed when
-    /// it exits.
+    /// Unix, no controlling terminal. Processes remaining in its Unix process
+    /// group or Windows job are killed when it exits. A Unix descendant that
+    /// starts another session or group can escape cleanup.
     #[serde(default)]
     pub token_command: Vec<String>,
 }
