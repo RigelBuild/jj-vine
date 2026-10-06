@@ -7,6 +7,7 @@ use std::{
     ffi::OsStr,
     path::{Path, PathBuf},
     process::Command,
+    time::Instant,
 };
 
 use itertools::Itertools as _;
@@ -442,6 +443,10 @@ pub struct Jujutsu {
     /// empty path disables all user and system config files.
     config_override: Option<PathBuf>,
 
+    /// When set, every command run through [`Jujutsu::exec`] must finish by
+    /// this instant. See [`Jujutsu::with_deadline`].
+    deadline: Option<Instant>,
+
     /// The default branch name.
     default_branch: OnceCell<Result<String, Error>>,
 }
@@ -495,6 +500,7 @@ impl Jujutsu {
             config_override: Some(PathBuf::new()),
             #[cfg(not(test))]
             config_override: None,
+            deadline: None,
             default_branch: OnceCell::new(),
         })
     }
@@ -509,8 +515,29 @@ impl Jujutsu {
         Ok(Self {
             cwd: cwd.into(),
             config_override: Some(config_path.into()),
+            deadline: None,
             default_branch: OnceCell::new(),
         })
+    }
+
+    /// A copy of this instance whose jj commands must all finish by
+    /// `deadline`, for a phase with a fixed wall-clock budget.
+    ///
+    /// Each command run through [`Jujutsu::exec`] gets the time left until
+    /// `deadline`. A command that would start at or after the deadline is not
+    /// spawned, and one still running at the deadline is killed together with
+    /// its process group (Unix) or job (Windows) and reaped. Both cases return
+    /// a [`Error::JjCommand`] error. A bounded command runs non-interactively
+    /// with stdin from the null device, and each output stream is capped (see
+    /// [`crate::process`]). [`Jujutsu::exec_argv`] is not bounded.
+    #[must_use]
+    pub(crate) fn with_deadline(&self, deadline: Instant) -> Self {
+        Self {
+            cwd: self.cwd.clone(),
+            config_override: self.config_override.clone(),
+            deadline: Some(deadline),
+            default_branch: OnceCell::new(),
+        }
     }
 
     /// Run a jj command and return the output.
@@ -527,7 +554,24 @@ impl Jujutsu {
         let mut command = Command::new(&jj_bin);
         command.current_dir(&self.cwd).args(args);
         self.apply_config_override(&mut command);
-        let output = command.output()?;
+        let output = match self.deadline {
+            None => command.output()?,
+            Some(deadline) => {
+                let deadline_passed = || {
+                    JjCommandSnafu {
+                        message: format!("jj {args_string} did not finish before its deadline"),
+                        output: None,
+                    }
+                    .build()
+                };
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(deadline_passed());
+                }
+                crate::process::output_with_timeout(command, remaining)?
+                    .ok_or_else(deadline_passed)?
+            }
+        };
 
         let stderr = String::from_utf8_lossy(&output.stderr);
 
@@ -1313,6 +1357,7 @@ mod tests {
             let jj = Jujutsu {
                 cwd: repo,
                 config_override: Some(PathBuf::new()),
+                deadline: None,
                 default_branch: OnceCell::new(),
             };
             let output = jj.exec_argv(&argv(&["push-command"]))?;
@@ -1388,5 +1433,161 @@ mod tests {
             .expect_err("push from a non-repository must fail");
         assert!(error.to_string().contains("jj git push"));
         assert!(!error.to_string().contains("push command failed with"));
+    }
+
+    #[test]
+    fn bounded_exec_returns_output_before_deadline() -> Result<()> {
+        let (_temp, repo_path) = create_test_repo()?;
+        let jj = Jujutsu::new(repo_path)?
+            .with_deadline(Instant::now() + core::time::Duration::from_secs(60));
+
+        let root = jj.log("root()")?;
+        assert_eq!(root.len(), 1, "a bounded log must still parse jj output");
+        Ok(())
+    }
+
+    /// Whether `pid` names a process that exists and is not a zombie. A
+    /// killed descendant is reparented and may be reaped late, but a zombie
+    /// runs no code.
+    #[cfg(unix)]
+    fn is_running(pid: &str) -> bool {
+        let output = std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", pid])
+            .stderr(std::process::Stdio::null())
+            .output()
+            .expect("ps must run");
+        let state = String::from_utf8_lossy(&output.stdout);
+        let state = state.trim();
+        !state.is_empty() && !state.starts_with('Z')
+    }
+
+    #[cfg(unix)]
+    fn process_gone_within(pid: &str, within: core::time::Duration) -> bool {
+        let start = Instant::now();
+        while start.elapsed() < within {
+            if !is_running(pid) {
+                return true;
+            }
+            std::thread::sleep(core::time::Duration::from_millis(20));
+        }
+        false
+    }
+
+    /// Write a fake `jj` into `bin` that records its pid and its descendant's
+    /// pid in `pids`, then hangs.
+    #[cfg(unix)]
+    fn write_hung_jj(bin: &Path, pids: &Path) -> std::io::Result<()> {
+        std::fs::create_dir_all(bin)?;
+        write_executable(
+            &bin.join("jj"),
+            &format!(
+                "#!/bin/sh\necho $$ > '{pids}/jj.pid'\n\
+                 sh -c 'echo $$ > \"$1\"; exec sleep 30' _ '{pids}/descendant.pid' &\n\
+                 exec sleep 30\n",
+                pids = pids.display()
+            ),
+        )
+    }
+
+    /// `PATH` with `dir` searched first, so a fake `jj` there shadows the
+    /// real one while `sh` and `sleep` still resolve.
+    #[cfg(unix)]
+    fn path_with_first(dir: &Path) -> std::io::Result<std::ffi::OsString> {
+        let mut path = dir.as_os_str().to_owned();
+        path.push(":");
+        path.push(std::env::var_os("PATH").ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotFound, "PATH is not set")
+        })?);
+        Ok(path)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_exec_kills_hung_jj_tree_at_deadline() -> Result<()> {
+        const CHILD_MODE: &str = "JJ_VINE_TEST_HUNG_JJ";
+        const REPO_DIR: &str = "JJ_VINE_TEST_REPO_DIR";
+        if std::env::var_os(CHILD_MODE).is_some() {
+            let repo = std::env::var_os(REPO_DIR).map(PathBuf::from).ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::NotFound, "repository directory missing")
+            })?;
+            let jj = Jujutsu::new(repo)?
+                .with_deadline(Instant::now() + core::time::Duration::from_millis(300));
+            let start = Instant::now();
+            let error = jj.log("@").expect_err("a hung jj must fail at the deadline");
+            assert!(
+                start.elapsed() < core::time::Duration::from_secs(5),
+                "a hung jj must not be waited out, took {:?}",
+                start.elapsed()
+            );
+            assert!(
+                matches!(&error, Error::JjCommand { message, .. }
+                    if message.contains("did not finish before its deadline")),
+                "got {error:?}"
+            );
+            return Ok(());
+        }
+
+        let temp = TempDir::new()?;
+        let bin = temp.path().join("bin");
+        write_hung_jj(&bin, temp.path())?;
+        let output = std::process::Command::new(std::env::current_exe()?)
+            .args(["--exact", "jj::tests::bounded_exec_kills_hung_jj_tree_at_deadline"])
+            .env(CHILD_MODE, "1")
+            .env(REPO_DIR, temp.path())
+            .env("PATH", path_with_first(&bin)?)
+            .output()?;
+        assert!(
+            output.status.success(),
+            "child test failed: {}",
+            String::from_utf8_lossy(&output.stdout),
+        );
+        for name in ["jj.pid", "descendant.pid"] {
+            let pid = std::fs::read_to_string(temp.path().join(name))?;
+            assert!(
+                process_gone_within(pid.trim(), core::time::Duration::from_secs(5)),
+                "{name}: a jj command killed at its deadline must not leave a process running"
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn expired_deadline_never_spawns_jj() -> Result<()> {
+        const CHILD_MODE: &str = "JJ_VINE_TEST_EXPIRED_JJ";
+        const REPO_DIR: &str = "JJ_VINE_TEST_REPO_DIR";
+        if std::env::var_os(CHILD_MODE).is_some() {
+            let repo = std::env::var_os(REPO_DIR).map(PathBuf::from).ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::NotFound, "repository directory missing")
+            })?;
+            let jj = Jujutsu::new(repo)?.with_deadline(Instant::now());
+            let error = jj.log("@").expect_err("an expired deadline must fail");
+            assert!(
+                matches!(&error, Error::JjCommand { message, .. }
+                    if message.contains("did not finish before its deadline")),
+                "got {error:?}"
+            );
+            return Ok(());
+        }
+
+        let temp = TempDir::new()?;
+        let bin = temp.path().join("bin");
+        write_hung_jj(&bin, temp.path())?;
+        let output = std::process::Command::new(std::env::current_exe()?)
+            .args(["--exact", "jj::tests::expired_deadline_never_spawns_jj"])
+            .env(CHILD_MODE, "1")
+            .env(REPO_DIR, temp.path())
+            .env("PATH", path_with_first(&bin)?)
+            .output()?;
+        assert!(
+            output.status.success(),
+            "child test failed: {}",
+            String::from_utf8_lossy(&output.stdout),
+        );
+        assert!(
+            !temp.path().join("jj.pid").exists(),
+            "jj must not start once the deadline has passed"
+        );
+        Ok(())
     }
 }
