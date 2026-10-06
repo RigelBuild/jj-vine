@@ -60,6 +60,43 @@ async fn tag_shadowed_bookmark_has_truthful_empty_selection_diagnostic() -> Resu
 }
 
 #[tokio::test]
+async fn named_target_on_foreign_bookmark_fails_before_push() -> Result<()> {
+    let repo = TestRepo::with_local_remote();
+    repo.set_config("jj-vine.forge", "github");
+    repo.set_config("jj-vine.github.project", "owner/repo");
+    repo.set_config("jj-vine.github.token", "gh-test-token");
+    repo.set_config("user.email", "current@example.com");
+    repo.set_config("user.name", "Current User");
+
+    // main -> a (mine) -> c (coworker) -> b (mine)
+    repo.jj.exec(["new", "main"])?;
+    repo.create_change("a.txt", "a", "Change A")
+        .create_bookmark("a");
+    repo.jj.exec(["new"])?;
+    repo.create_change("c.txt", "c", "Change C")
+        .create_bookmark("c");
+    repo.set_config("user.email", "author@example.com");
+    repo.set_config("user.name", "Original Author");
+    repo.jj.exec(["metaedit", "--update-author"])?;
+    repo.set_config("user.email", "current@example.com");
+    repo.set_config("user.name", "Current User");
+    repo.jj.exec(["new"])?;
+    repo.create_change("b.txt", "b", "Change B")
+        .create_bookmark("b");
+
+    let error = repo
+        .try_run(["submit", "b", "--dry-run"])
+        .await
+        .unwrap_err()
+        .to_string();
+
+    assert_contains!(error, "`b` stacks on `c`");
+    assert_contains!(error, "jj-vine submit 'b | c'");
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn generalized_foreign_target_is_not_announced() -> Result<()> {
     let repo = TestRepo::with_local_remote();
     repo.set_config("jj-vine.forge", "github");

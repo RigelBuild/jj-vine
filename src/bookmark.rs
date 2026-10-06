@@ -5,7 +5,7 @@ use itertools::Itertools as _;
 use owo_colors::OwoColorize as _;
 
 use crate::{
-    error::{BookmarkNotFoundSnafu, Error, Result},
+    error::{BookmarkNotFoundSnafu, Error, InvalidGraphSnafu, Result},
     jj::{BookmarkInfo, Change, Jujutsu},
 };
 
@@ -673,9 +673,11 @@ impl<'a> BookmarkGraph<'a> {
             .collect();
 
         // Only selected bookmarks may become graph parents. A bookmarked
-        // ancestor outside the selection (untracked under --tracked, or not
-        // authored by the current user) is walked past like an unbookmarked
-        // change, so the adjacency list never names a missing bookmark.
+        // ancestor outside the selection is walked past like an unbookmarked
+        // change when it is excluded by --tracked or still authored by the
+        // current user. One excluded by `mine()` is an error, because walking
+        // past it would silently submit another author's changes under the
+        // selected bookmark.
         let included_names: HashSet<String> = local_bookmarks
             .iter()
             .map(|b| b.name().to_owned())
@@ -691,7 +693,8 @@ impl<'a> BookmarkGraph<'a> {
 
             let parent_bookmark_changes = Self::find_nearest_bookmarked_ancestors(
                 jj,
-                bookmark.change(),
+                bookmark,
+                skip_untracked_local_bookmarks,
                 &included_names,
                 &pending_bookmarks,
             )?;
@@ -870,29 +873,69 @@ impl<'a> BookmarkGraph<'a> {
         component.downstack_of(bookmark_name)
     }
 
-    /// Find the nearest ancestors starting from a given commit that carry a
-    /// selected bookmark (one of `included_names`) or a pending bookmark.
+    /// Find the nearest ancestors of `bookmark` that carry a selected bookmark
+    /// (one of `included_names`) or a pending bookmark.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the walk reaches an unselected, eligible bookmark on a change
+    /// not authored by the current user before any selected ancestor.
     fn find_nearest_bookmarked_ancestors(
         jj: &Jujutsu,
-        from: &Change,
+        bookmark: &BookmarkOrPending<'_>,
+        skip_untracked_local_bookmarks: bool,
         included_names: &HashSet<String>,
         pending_bookmarks: &HashSet<String>,
     ) -> Result<Vec<Change>> {
-        Self::walk_nearest_bookmarked_ancestors(from, included_names, pending_bookmarks, |change| {
-            jj.log_with_pending_bookmarks(
-                format!("{}- ~ ::trunk()", change.commit_id),
-                pending_bookmarks,
-            )
-        })
+        Self::walk_nearest_bookmarked_ancestors(
+            bookmark.change(),
+            included_names,
+            pending_bookmarks,
+            |change| {
+                jj.log_with_pending_bookmarks(
+                    format!("{}- ~ ::trunk()", change.commit_id),
+                    pending_bookmarks,
+                )
+            },
+            |parent| {
+                let excluded: Vec<&str> = parent
+                    .bookmarks
+                    .iter()
+                    .filter(|info| {
+                        info.is_local() && (!skip_untracked_local_bookmarks || info.is_tracked())
+                    })
+                    .map(BookmarkInfo::name)
+                    .collect();
+                let Some(first) = excluded.first() else {
+                    return Ok(());
+                };
+                if jj.any_in_revset(format!("{} & mine()", parent.commit_id))? {
+                    return Ok(());
+                }
+
+                let child = bookmark.name();
+                InvalidGraphSnafu {
+                    message: format!(
+                        "`{child}` stacks on {}, which another author owns and mine() excludes. Rebase `{child}` onto trunk or a bookmark you own, or name `{first}` explicitly to submit it too, e.g. `jj-vine submit '{child} | {first}'`.",
+                        excluded.iter().map(|name| format!("`{name}`")).join(", "),
+                    ),
+                }
+                .fail()
+            },
+        )
     }
 
     /// Visits each commit at most once, so merge paths sharing an unselected
     /// ancestor cost one `query_parents` call per commit, not per path.
+    /// `check_unselected` sees every visited parent that is neither selected
+    /// nor pending; returning an error stops the walk, otherwise the walk
+    /// continues past it.
     fn walk_nearest_bookmarked_ancestors(
         from: &Change,
         included_names: &HashSet<String>,
         pending_bookmarks: &HashSet<String>,
         mut query_parents: impl FnMut(&Change) -> Result<Vec<Change>>,
+        mut check_unselected: impl FnMut(&Change) -> Result<()>,
     ) -> Result<Vec<Change>> {
         let mut ancestors = Vec::new();
         let mut visited = HashSet::from([from.commit_id.clone()]);
@@ -911,6 +954,7 @@ impl<'a> BookmarkGraph<'a> {
             if has_included_bookmark || pending_bookmarks.contains(&parent.change_id) {
                 ancestors.push(parent);
             } else {
+                check_unselected(&parent)?;
                 to_visit.extend(query_parents(&parent)?.into_iter().rev());
             }
         }
@@ -1414,6 +1458,7 @@ mod tests {
                     .map(|id| commits[id].clone())
                     .collect())
             },
+            |_| Ok(()),
         )?;
 
         let names: Vec<_> = BookmarkOrPending::from_changes(&ancestors)
@@ -1473,6 +1518,7 @@ mod tests {
                     .map(|id| commits[id].clone())
                     .collect())
             },
+            |_| Ok(()),
         )?;
 
         let pending_ids: Vec<_> = ancestors

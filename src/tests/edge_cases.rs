@@ -311,7 +311,7 @@ fn sorted_names(changes: &[crate::jj::Change]) -> Vec<String> {
 }
 
 #[test]
-fn graph_skips_foreign_parent_of_named_target() -> Result<()> {
+fn graph_rejects_foreign_parent_of_named_target() -> Result<()> {
     let repo = TestRepo::with_local_remote();
     as_current_user(&repo);
 
@@ -327,16 +327,24 @@ fn graph_skips_foreign_parent_of_named_target() -> Result<()> {
     let changes = submission_changes(&repo, "y")?;
     assert_eq!(sorted_names(&changes), vec!["y".to_owned()]);
 
+    let error = BookmarkGraph::from_changes(&repo.jj, &changes, false)
+        .unwrap_err()
+        .to_string();
+    assert_contains!(error, "`y` stacks on `x`");
+    assert_contains!(error, "mine() excludes");
+
+    // Naming the foreign parent too selects it, so the stack builds.
+    let changes = submission_changes(&repo, "y | x")?;
     let graph = BookmarkGraph::from_changes(&repo.jj, &changes, false)?;
+    let x = graph.find_bookmark_in_components("x").unwrap();
     let y = graph.find_bookmark_in_components("y").unwrap();
-    assert_eq!(y.parents, vec![]);
-    assert_none!(graph.find_bookmark_in_components("x"));
+    assert_eq!(y.parents, vec![BookmarkRef::Bookmark(x.clone())]);
 
     Ok(())
 }
 
 #[test]
-fn graph_walks_past_foreign_middle_bookmark() -> Result<()> {
+fn graph_rejects_foreign_middle_bookmark() -> Result<()> {
     let repo = TestRepo::with_local_remote();
     as_current_user(&repo);
 
@@ -352,14 +360,46 @@ fn graph_walks_past_foreign_middle_bookmark() -> Result<()> {
     repo.create_change("b.txt", "b", "Change B")
         .create_bookmark("b");
 
-    let changes = submission_changes(&repo, "b")?;
-    assert_eq!(sorted_names(&changes), vec!["a".to_owned(), "b".to_owned()]);
+    // Both a named target and a generalized selection would otherwise stack
+    // `b` on `a` and carry the foreign `c` inside `b`'s review.
+    for revset in ["b", "bookmarks()"] {
+        let changes = submission_changes(&repo, revset)?;
+        assert_eq!(
+            sorted_names(&changes),
+            vec!["a".to_owned(), "b".to_owned()],
+            "revset {revset}"
+        );
 
+        let error = BookmarkGraph::from_changes(&repo.jj, &changes, false)
+            .unwrap_err()
+            .to_string();
+        assert_contains!(error, "`b` stacks on `c`");
+    }
+
+    Ok(())
+}
+
+#[test]
+fn graph_walks_past_unbookmarked_foreign_change() -> Result<()> {
+    let repo = TestRepo::with_local_remote();
+    as_current_user(&repo);
+
+    // main -> a (mine) -> unbookmarked (foreign) -> b (mine)
+    repo.jj.exec(["new", "main"])?;
+    repo.create_change("a.txt", "a", "Change A")
+        .create_bookmark("a");
+    repo.jj.exec(["new"])?;
+    repo.create_change("u.txt", "u", "Unbookmarked");
+    make_foreign(&repo)?;
+    repo.jj.exec(["new"])?;
+    repo.create_change("b.txt", "b", "Change B")
+        .create_bookmark("b");
+
+    let changes = submission_changes(&repo, "b")?;
     let graph = BookmarkGraph::from_changes(&repo.jj, &changes, false)?;
     let a = graph.find_bookmark_in_components("a").unwrap();
     let b = graph.find_bookmark_in_components("b").unwrap();
     assert_eq!(b.parents, vec![BookmarkRef::Bookmark(a.clone())]);
-    assert_none!(graph.find_bookmark_in_components("c"));
 
     Ok(())
 }
