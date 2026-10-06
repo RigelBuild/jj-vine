@@ -349,10 +349,16 @@ impl Forge for TestForge {
     async fn find_merge_request_by_source_branch_base_branch(
         &self,
         source_branch: &str,
-        #[expect(unused, reason = "keep argument name")] base_branch: &str,
+        base_branch: &str,
     ) -> Result<Option<Self::MergeRequest>> {
-        self.find_merge_request_by_source_branch(source_branch)
-            .await
+        Ok(self
+            .state
+            .read()
+            .unwrap()
+            .merge_requests
+            .values()
+            .find(|mr| mr.source_branch == source_branch && mr.target_branch == base_branch)
+            .cloned())
     }
 
     #[doc = " Returns true if the forge supports dependent merge requests."]

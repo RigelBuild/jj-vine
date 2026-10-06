@@ -81,7 +81,7 @@ impl PlanMergeRequest {
 pub async fn plan(ctx: PlanContext<'_>) -> Result<SubmissionPlan> {
     ctx.output.log_current("Planning submission");
 
-    let default_branch = ctx.jj.default_branch()?;
+    let default_branch = ctx.config.root_base_branch(ctx.jj)?;
 
     let mut batches: Vec<Vec<Action>> = Vec::new();
 
@@ -99,18 +99,47 @@ pub async fn plan(ctx: PlanContext<'_>) -> Result<SubmissionPlan> {
                             .output
                             .start_substep(&bookmark.name().magenta().to_string());
 
-                        if let Some(mr) = ctx
-                            .forge
-                            .find_merge_request_by_source_branch_base_branch(
-                                bookmark.name(),
-                                &mr_base_branch(ctx.forge, bookmark, default_branch),
-                            )
-                            .await?
+                        let target_branch = mr_base_branch(ctx.forge, bookmark, default_branch);
+                        let is_root =
+                            matches!(bookmark.parents.first(), None | Some(BookmarkRef::Trunk));
+                        let mr = if let Some(configured_base) = ctx
+                            .config
+                            .default_base_branch
+                            .as_deref()
+                            .filter(|_| is_root)
                         {
-                            Ok(Some((bookmark.name().to_owned(), mr)))
+                            if let Some(mr) = ctx
+                                .forge
+                                .find_merge_request_by_source_branch_base_branch(
+                                    bookmark.name(),
+                                    configured_base,
+                                )
+                                .await?
+                            {
+                                Some(mr)
+                            } else if let Some(mr) = ctx
+                                .forge
+                                .find_merge_request_by_source_branch_base_branch(
+                                    bookmark.name(),
+                                    ctx.jj.default_branch()?,
+                                )
+                                .await?
+                            {
+                                Some(mr)
+                            } else {
+                                ctx.forge
+                                    .find_merge_request_by_source_branch(bookmark.name())
+                                    .await?
+                            }
                         } else {
-                            Ok(None)
-                        }
+                            ctx.forge
+                                .find_merge_request_by_source_branch_base_branch(
+                                    bookmark.name(),
+                                    &target_branch,
+                                )
+                                .await?
+                        };
+                        Ok(mr.map(|mr| (bookmark.name().to_owned(), mr)))
                     })
                     .collect::<FuturesUnordered<_>>()
                     .collect::<Vec<_>>()
@@ -229,8 +258,7 @@ pub async fn plan(ctx: PlanContext<'_>) -> Result<SubmissionPlan> {
                 }
             } else {
                 let revisions = bookmark.revisions(ctx.jj)?;
-                let title =
-                    get_mr_title(ctx.jj, &ctx.config.title, bookmark, component, revisions)?;
+                let title = get_mr_title(ctx.jj, ctx.config, bookmark, component, revisions)?;
 
                 let description = generate_description(
                     &ctx.config.description,
@@ -289,13 +317,8 @@ pub async fn plan(ctx: PlanContext<'_>) -> Result<SubmissionPlan> {
                         };
 
                         let maybe_title = if should_sync_title {
-                            let new_title = get_mr_title(
-                                ctx.jj,
-                                &ctx.config.title,
-                                bookmark,
-                                component,
-                                revisions,
-                            )?;
+                            let new_title =
+                                get_mr_title(ctx.jj, ctx.config, bookmark, component, revisions)?;
 
                             if new_title == *current_title {
                                 None

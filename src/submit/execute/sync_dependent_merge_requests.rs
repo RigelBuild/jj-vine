@@ -71,7 +71,7 @@ impl ExecuteAction for SyncDependentMergeRequestsAction {
             .find_bookmark_in_components(&bookmark_name)
             .ok_or_else::<Error, _>(|| make_whatever!("Bookmark not found: {}", self.bookmark))?;
 
-        let default_branch = ctx.execute.jj.default_branch()?;
+        let default_branch = ctx.execute.config.root_base_branch(ctx.execute.jj)?;
 
         let mr = ctx
             .execute

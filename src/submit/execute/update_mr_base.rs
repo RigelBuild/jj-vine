@@ -7,16 +7,13 @@ use crate::{
     description::FormatMergeRequest as _,
     error::{Error, Result},
     forge::Forge as _,
-    submit::{
-        execute::{
-            ActionInfo,
-            ActionResultData,
-            ExecuteAction,
-            ExecuteActionContext,
-            MRUpdate,
-            MRUpdateType,
-        },
-        mr_base_branch,
+    submit::execute::{
+        ActionInfo,
+        ActionResultData,
+        ExecuteAction,
+        ExecuteActionContext,
+        MRUpdate,
+        MRUpdateType,
     },
 };
 
@@ -91,20 +88,10 @@ impl ExecuteAction for UpdateMRBaseAction {
             whatever!("Bookmark not found: {}", self.bookmark);
         };
 
-        let default_branch = ctx.execute.jj.default_branch()?;
-
-        // Get old target before update
-        let Ok(Some(existing_mr)) = ctx
-            .execute
-            .forge
-            .find_merge_request_by_source_branch_base_branch(
-                bookmark.name(),
-                &mr_base_branch(ctx.execute.forge, bookmark, default_branch),
-            )
-            .await
-        else {
-            whatever!("Failed to find existing MR");
-        };
+        let existing_mr = ctx
+            .all_mrs()
+            .remove(bookmark.name())
+            .ok_or_else(|| Error::new("Failed to find existing MR"))?;
 
         let old_target = existing_mr.target_branch().to_owned();
 

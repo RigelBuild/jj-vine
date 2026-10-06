@@ -3,7 +3,7 @@ use snafu::whatever;
 
 use crate::{
     bookmark::{BookmarkWithPointers, ChangeComponent},
-    config::{TitleConfig, TitleFormat},
+    config::{Config, TitleConfig, TitleFormat},
     error::{Error, Result},
     jj::{Change, Jujutsu},
 };
@@ -14,15 +14,15 @@ use crate::{
 )]
 pub fn get_mr_title(
     jj: &Jujutsu,
-    config: &TitleConfig,
+    config: &Config,
     bookmark: &BookmarkWithPointers<'_>,
     component: &ChangeComponent<'_>,
     revisions: impl AsRef<[Change]>,
 ) -> Result<String> {
-    let default_branch = jj.default_branch()?;
+    let default_branch = config.root_base_branch(jj)?;
 
     Ok(get_mr_title_from_revisions(
-        config,
+        &config.title,
         bookmark,
         component,
         default_branch,
@@ -251,6 +251,14 @@ mod tests {
     use crate::{bookmark::BookmarkGraph, utils::toposort};
 
     fn get_mock_title(config: &TitleConfig, changes: impl IntoIterator<Item = Change>) -> String {
+        get_mock_title_with_default_branch(config, changes, "main")
+    }
+
+    fn get_mock_title_with_default_branch(
+        config: &TitleConfig,
+        changes: impl IntoIterator<Item = Change>,
+        default_branch: &str,
+    ) -> String {
         let changes = Change::mock_stack_map(changes);
         let graph = BookmarkGraph::from_lookups(
             changes.create_bookmark_map(),
@@ -264,10 +272,49 @@ mod tests {
             |change| change.parent_commit_ids.clone(),
         )
         .into_iter()
-        .rev() // head first like jj outputs
+        .rev()
         .collect();
 
-        get_mr_title_from_revisions(config, &bookmark, component, "main", revisions)
+        get_mr_title_from_revisions(config, &bookmark, component, default_branch, revisions)
+    }
+
+    fn get_mock_title_with_config(
+        config: &Config,
+        changes: impl IntoIterator<Item = Change>,
+    ) -> String {
+        let jj = crate::jj::Jujutsu::new(".").expect("jj binary is available");
+        let changes = Change::mock_stack_map(changes);
+        let graph = BookmarkGraph::from_lookups(
+            changes.create_bookmark_map(),
+            &changes.create_adjacency_list(),
+        );
+        let component = graph.components().first().unwrap();
+        let bookmark = component.leaves.first().unwrap().clone();
+        let revisions: Vec<_> = toposort(
+            changes.values().cloned(),
+            |change| change.commit_id.clone(),
+            |change| change.parent_commit_ids.clone(),
+        )
+        .into_iter()
+        .rev()
+        .collect();
+
+        get_mr_title(&jj, config, &bookmark, component, revisions).unwrap()
+    }
+
+    #[test]
+    fn custom_template_parent_bookmark_uses_root_base_branch() {
+        let config = Config::builder()
+            .forge(crate::config::ForgeType::GitHub)
+            .maybe_default_base_branch(Some("release".to_owned()))
+            .title(TitleConfig {
+                single_revision: TitleFormat::Other("{parent_bookmark_name}".to_owned()),
+                ..Default::default()
+            })
+            .build();
+        let title = get_mock_title_with_config(&config, [Change::mock_from_bookmark("commit-a")]);
+
+        assert_eq!(title, "release");
     }
 
     #[test]

@@ -118,10 +118,8 @@ pub struct Config {
     /// Which forge to use.
     pub forge: ForgeType,
 
-    /// The branch name to use for MRs into `trunk()`. You will generally only
-    /// need to set this explicitly if you use a branch name other than
-    /// `main`, `master`, or `trunk`, and jj-vine is having difficulty
-    /// detecting the correct branch name automatically.
+    /// The base branch for root MRs in a stack. When unset, jj-vine uses the
+    /// bookmark that `trunk()` resolves to.
     #[serde(default)]
     pub default_base_branch: Option<String>,
 
@@ -986,6 +984,14 @@ impl Config {
         config.validate()?;
 
         Ok(config)
+    }
+
+    /// Resolve the base branch used by root MRs and stack labels.
+    pub fn root_base_branch<'a>(&'a self, jj: &'a Jujutsu) -> Result<&'a str> {
+        match self.default_base_branch.as_deref() {
+            Some(branch) => Ok(branch),
+            None => jj.default_branch(),
+        }
     }
 
     pub fn validate(&self) -> Result<()> {

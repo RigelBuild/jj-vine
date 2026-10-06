@@ -128,7 +128,7 @@ impl ExecuteAction for UpdateMRTitleDescriptionAction {
             whatever!("No MR found for {}", bookmark.magenta());
         };
 
-        let default_branch = ctx.execute.jj.default_branch()?;
+        let default_branch = ctx.execute.config.root_base_branch(ctx.execute.jj)?;
 
         let Some(stack) = ctx.execute.bookmark_graph.component_containing(&bookmark) else {
             whatever!("Bookmark not found in component: {}", self.bookmark);
