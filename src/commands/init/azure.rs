@@ -31,7 +31,6 @@ pub fn init(repo_path: impl Into<PathBuf>, remotes: Option<&Remotes>) -> Result<
         _ => None,
     };
 
-    let host_requires_https = forge.is_some_and(|forge| forge.host.derived().is_none());
     let default_host = azure_default_host(existing_host, forge);
 
     let azure_host_input = Input::<String>::new().with_prompt(format!(
@@ -39,26 +38,23 @@ pub fn init(repo_path: impl Into<PathBuf>, remotes: Option<&Remotes>) -> Result<
         "Azure DevOps API URL (e.g. https://dev.azure.com)".bold(),
         "jj-vine.azure.host".dimmed()
     ));
-    let azure_host_input = if host_requires_https {
-        let input = if let Some(default_host) = default_host {
-            azure_host_input.default(default_host)
-        } else {
-            azure_host_input
-        };
-        input.validate_with(|host: &String| validate_https_host(host))
-    } else if let Some(default_host) = default_host {
+    let azure_host_input = if let Some(default_host) = default_host {
         azure_host_input.default(default_host)
     } else {
         azure_host_input
     };
-    let azure_host = azure_host_input.interact_text()?;
+    let azure_host = azure_host_input
+        .validate_with(|host: &String| validate_https_host(host))
+        .interact_text()?;
 
-    let default_vssps_host = existing_vssps_host.unwrap_or_else(|| {
-        format!(
-            "https://vssps.{}",
-            azure_host.trim_start_matches("https://")
-        )
-    });
+    let default_vssps_host = existing_vssps_host
+        .filter(|host| crate::config::is_https_host(host))
+        .unwrap_or_else(|| {
+            format!(
+                "https://vssps.{}",
+                azure_host.trim_start_matches("https://")
+            )
+        });
 
     let azure_vssps_host = Input::<String>::new()
         .with_prompt(format!(
@@ -68,6 +64,7 @@ pub fn init(repo_path: impl Into<PathBuf>, remotes: Option<&Remotes>) -> Result<
         ))
         .allow_empty(true)
         .default(default_vssps_host)
+        .validate_with(|host: &String| validate_optional_https_host(host))
         .interact_text()?;
 
     let default_project = existing_project.or(forge.map(|f| f.project.clone()));
@@ -195,7 +192,7 @@ fn azure_default_host(
     forge: Option<&crate::remote::DetectedForge>,
 ) -> Option<String> {
     if forge.is_some_and(|forge| forge.host.derived().is_none()) {
-        return existing_host.filter(|host| host.starts_with("https://"));
+        return existing_host.filter(|host| crate::config::is_https_host(host));
     }
 
     existing_host
@@ -208,10 +205,19 @@ fn azure_default_host(
 }
 
 fn validate_https_host(host: &str) -> core::result::Result<(), &'static str> {
-    if host.starts_with("https://") {
+    if crate::config::is_https_host(host) {
         Ok(())
     } else {
         Err("Enter an HTTPS Azure DevOps API URL")
+    }
+}
+
+/// The VSSPS URL may be left blank; any value given must be HTTPS.
+fn validate_optional_https_host(host: &str) -> core::result::Result<(), &'static str> {
+    if host.trim().is_empty() {
+        Ok(())
+    } else {
+        validate_https_host(host)
     }
 }
 
@@ -226,8 +232,57 @@ mod tests {
 
         assert_eq!(forge.host.derived(), None);
         assert_eq!(azure_default_host(None, Some(&forge)), None);
+        assert_eq!(
+            azure_default_host(Some("http://dev.azure.com".to_owned()), Some(&forge)),
+            None
+        );
         assert!(validate_https_host("http://dev.azure.com").is_err());
         assert!(validate_https_host("https://ado.example.com").is_ok());
+    }
+
+    #[test]
+    fn http_remote_is_not_accepted_as_an_api_host() {
+        let forge =
+            crate::remote::parse_forge_url("http://dev.azure.com/organization/project/repo")
+                .expect("Azure DevOps HTTP remote");
+
+        assert_eq!(forge.host.derived(), Some("http://dev.azure.com"));
+        assert_eq!(
+            azure_default_host(None, Some(&forge)),
+            Some("http://dev.azure.com".to_owned())
+        );
+        assert!(
+            forge
+                .host
+                .derived()
+                .is_some_and(|host| validate_https_host(host).is_err())
+        );
+    }
+
+    #[test]
+    fn edited_http_default_is_rejected_even_for_recognized_remote() {
+        let forge =
+            crate::remote::parse_forge_url("https://dev.azure.com/organization/project/repo")
+                .expect("Azure DevOps HTTPS remote");
+        let edited_default =
+            azure_default_host(Some("http://dev.azure.com".to_owned()), Some(&forge));
+        assert_eq!(edited_default.as_deref(), Some("http://dev.azure.com"));
+        assert!(
+            edited_default
+                .as_ref()
+                .is_some_and(|host| validate_https_host(host).is_err())
+        );
+        assert_eq!(
+            azure_default_host(None, Some(&forge)).as_deref(),
+            Some("https://dev.azure.com")
+        );
+    }
+
+    #[test]
+    fn only_accepts_https_security_api_hosts_or_blank() {
+        assert!(validate_optional_https_host("http://vssps.dev.azure.com").is_err());
+        assert!(validate_optional_https_host("https://vssps.dev.azure.com").is_ok());
+        assert!(validate_optional_https_host("").is_ok());
     }
 
     #[test]

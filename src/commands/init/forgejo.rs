@@ -26,7 +26,6 @@ pub fn init(repo_path: impl Into<PathBuf>, remotes: Option<&Remotes>) -> Result<
         _ => None,
     };
 
-    let host_requires_https = forge.is_some_and(|forge| forge.host.derived().is_none());
     let default_host = forgejo_default_host(existing_host, forge);
     let default_project = existing_project.or(forge.map(|f| f.project.clone()));
 
@@ -35,19 +34,14 @@ pub fn init(repo_path: impl Into<PathBuf>, remotes: Option<&Remotes>) -> Result<
         "Forgejo/Codeburg/Gitea instance URL (e.g. https://codeberg.org)".bold(),
         "jj-vine.forgejo.host".dimmed()
     ));
-    let forgejo_host_input = if host_requires_https {
-        let input = if let Some(default_host) = default_host {
-            forgejo_host_input.default(default_host)
-        } else {
-            forgejo_host_input
-        };
-        input.validate_with(|host: &String| validate_https_host(host))
-    } else if let Some(default_host) = default_host {
+    let forgejo_host_input = if let Some(default_host) = default_host {
         forgejo_host_input.default(default_host)
     } else {
         forgejo_host_input
     };
-    let forgejo_host = forgejo_host_input.interact_text()?;
+    let forgejo_host = forgejo_host_input
+        .validate_with(|host: &String| validate_https_host(host))
+        .interact_text()?;
 
     let forgejo_project = if let Some(project) = default_project {
         Input::<String>::new()
@@ -128,7 +122,7 @@ fn forgejo_default_host(
     forge: Option<&crate::remote::DetectedForge>,
 ) -> Option<String> {
     if forge.is_some_and(|forge| forge.host.derived().is_none()) {
-        return existing_host.filter(|host| host.starts_with("https://"));
+        return existing_host.filter(|host| crate::config::is_https_host(host));
     }
 
     existing_host
@@ -137,7 +131,7 @@ fn forgejo_default_host(
 }
 
 fn validate_https_host(host: &str) -> core::result::Result<(), &'static str> {
-    if host.starts_with("https://") {
+    if crate::config::is_https_host(host) {
         Ok(())
     } else {
         Err("Enter an HTTPS Forgejo instance URL")
@@ -155,8 +149,46 @@ mod tests {
 
         assert_eq!(forge.host.derived(), None);
         assert_eq!(forgejo_default_host(None, Some(&forge)), None);
+        assert_eq!(
+            forgejo_default_host(Some("http://gitea.example.com".to_owned()), Some(&forge)),
+            None
+        );
         assert!(validate_https_host("http://forge.example.com").is_err());
         assert!(validate_https_host("https://forge.example.com").is_ok());
+    }
+
+    #[test]
+    fn rejects_plaintext_remote_and_existing_host_defaults() {
+        let forge = crate::remote::parse_forge_url("http://gitea.example.com/owner/repo.git")
+            .expect("Forgejo HTTP remote");
+
+        assert_eq!(forge.host.derived(), Some("http://gitea.example.com"));
+        let remote_default = forgejo_default_host(None, Some(&forge));
+        assert_eq!(remote_default.as_deref(), Some("http://gitea.example.com"));
+        assert!(
+            remote_default
+                .as_ref()
+                .is_some_and(|host| validate_https_host(host).is_err())
+        );
+        let edited_default =
+            forgejo_default_host(Some("http://gitea.example.com".to_owned()), None);
+        assert_eq!(edited_default.as_deref(), Some("http://gitea.example.com"));
+        assert!(
+            edited_default
+                .as_ref()
+                .is_some_and(|host| validate_https_host(host).is_err())
+        );
+        let https_forge =
+            crate::remote::parse_forge_url("https://gitea.example.com/owner/repo.git")
+                .expect("Forgejo HTTPS remote");
+        assert_eq!(
+            forgejo_default_host(
+                Some("http://gitea.example.com".to_owned()),
+                Some(&https_forge)
+            ),
+            Some("http://gitea.example.com".to_owned())
+        );
+        assert!(validate_https_host("http://gitea.example.com").is_err());
     }
 
     #[test]
