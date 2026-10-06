@@ -201,7 +201,6 @@ fn parse_init_remote_line(line: &str) -> Result<remote::RemoteListEntry<'_>> {
         .ok_or_else(|| make_whatever!("Failed to parse remote line for <unknown>"))
 }
 
-#[expect(clippy::single_call_fn, reason = "seems fine")]
 fn detect_remotes(jj: &Jujutsu) -> Result<Option<Remotes>> {
     let output = jj.exec_redacted(["git", "remote", "list"])?;
     let remotes: HashMap<_, _> = output
