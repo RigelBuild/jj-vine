@@ -1537,7 +1537,8 @@ mod tests {
         );
     }
 
-    /// Child mode for `output_with_timeout_ignores_signal_observed_before_period`:
+    /// Child mode for
+    /// `output_with_timeout_ignores_signal_observed_before_period`:
     /// a handler call observes no active run, a new period starts, and only
     /// then does the handler call record.
     #[test]
