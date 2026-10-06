@@ -23,6 +23,11 @@
 //! this module's handler is still installed: a handler other code installed
 //! during the run is kept, and a caught signal is then raised to it. If that
 //! handler returns, the signal is consumed and later runs are not cancelled.
+//! A caught signal is classified when this module's handler first observes
+//! the shared cancellation state: it cancels only the active period it
+//! observed, and a call that observed no active period records nothing. A
+//! chained call from another handler is classified when it reaches this
+//! module's handler, not when the signal arrived.
 //! On Windows, a console Ctrl-C reaches the child directly, and the job's
 //! kill-on-close limit kills the tree when this process exits.
 //!
@@ -113,7 +118,7 @@ fn check_exit<T>(
 #[cfg(unix)]
 mod platform {
     use core::{
-        sync::atomic::{AtomicI32, Ordering},
+        sync::atomic::{AtomicU64, Ordering},
         time::Duration,
     };
     use std::{
@@ -168,7 +173,7 @@ mod platform {
             if matches!(check, Check::Exited(())) {
                 break tree.kill_and_reap()?;
             }
-            if CANCEL_SIGNAL.load(Ordering::Acquire) != 0_i32 {
+            if pending_signal(CANCEL_WORD.load(Ordering::Acquire)) != 0_i32 {
                 tree.kill_and_reap()?;
                 return Err(io::Error::new(
                     io::ErrorKind::Interrupted,
@@ -203,11 +208,36 @@ mod platform {
     /// from the terminal, so this process must stop the tree itself.
     const CANCEL_SIGNALS: [libc::c_int; 3] = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP];
 
-    /// The first cancellation signal caught while a run was active, or 0.
-    /// The last run to end takes it and raises it again. The first run of a
-    /// new active period clears it, so a value recorded while no run was
-    /// active cannot cancel that run.
-    static CANCEL_SIGNAL: AtomicI32 = AtomicI32::new(0);
+    /// The cancellation state in one lock-free atomic word, so a handler call
+    /// and an active-period transition are totally ordered. Bits 0..8 hold
+    /// the first signal caught in the current active period, or 0; bit 8 is
+    /// set while a period is active; bits 9..32 count handler calls in
+    /// flight; bits 32..64 hold the generation of the latest period.
+    ///
+    /// A handler call classifies its signal by the word it observes when it
+    /// enters: a signal is recorded only if a period was active then, and it
+    /// is recorded against that period. The last run waits for handler calls
+    /// in flight before it ends the period, so a call that observed the
+    /// period cannot record after the period's signal was taken. A call that
+    /// observed no active period records nothing, even if a new period
+    /// starts before it finishes.
+    static CANCEL_WORD: AtomicU64 = AtomicU64::new(0);
+
+    const SIGNAL_MASK: u64 = 0xff;
+    const ACTIVE_BIT: u64 = 1 << 8;
+    const IN_FLIGHT_ONE: u64 = 1 << 9;
+    const IN_FLIGHT_MASK: u64 = ((1 << 23) - 1) << 9;
+    const GENERATION_SHIFT: u32 = 32;
+
+    /// The pending signal held in `word`, or 0.
+    fn pending_signal(word: u64) -> libc::c_int {
+        libc::c_int::try_from(word & SIGNAL_MASK).unwrap_or(0_i32)
+    }
+
+    /// The generation held in `word`.
+    const fn generation(word: u64) -> u64 {
+        word >> GENERATION_SHIFT
+    }
 
     /// Active runs and the signals whose handler this module installed.
     static CANCEL_STATE: Mutex<CancelState> = Mutex::new(CancelState {
@@ -220,12 +250,103 @@ mod platform {
         installed: [bool; 3],
     }
 
-    /// Records the signal only; the run loop does the cleanup. A lock-free
-    /// atomic operation is async-signal-safe.
+    /// Records the signal only; the run loop does the cleanup. It uses only
+    /// lock-free atomic operations, which are async-signal-safe.
     extern "C" fn on_cancel_signal(signal: libc::c_int) {
-        CANCEL_SIGNAL
-            .compare_exchange(0_i32, signal, Ordering::AcqRel, Ordering::Acquire)
-            .ok();
+        HandlerCall::observe().record(signal);
+    }
+
+    /// One handler call, from its observation of the cancellation word to
+    /// its record. Split in two so tests can order a transition between them.
+    pub(super) struct HandlerCall {
+        observed: u64,
+    }
+
+    impl HandlerCall {
+        /// Enter the handler: count this call in flight and observe whether
+        /// a period is active. The observation classifies the signal.
+        pub(super) fn observe() -> Self {
+            Self {
+                observed: CANCEL_WORD.fetch_add(IN_FLIGHT_ONE, Ordering::AcqRel),
+            }
+        }
+
+        /// Record `signal` against the observed period if one was active and
+        /// no signal is pending yet, then leave the handler.
+        pub(super) fn record(self, signal: libc::c_int) {
+            let value = u64::try_from(signal)
+                .ok()
+                .filter(|value| *value != 0 && *value <= SIGNAL_MASK);
+            if let Some(value) = value
+                && self.observed & ACTIVE_BIT != 0
+            {
+                // The period this call observed stays active until the call
+                // leaves, because `end_period` waits for it; the generation
+                // check keeps the record tied to that period regardless.
+                let period = generation(self.observed);
+                let mut word = CANCEL_WORD.load(Ordering::Acquire);
+                while word & ACTIVE_BIT != 0
+                    && generation(word) == period
+                    && word & SIGNAL_MASK == 0
+                {
+                    match CANCEL_WORD.compare_exchange_weak(
+                        word,
+                        word | value,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    ) {
+                        Ok(_) => break,
+                        Err(current) => word = current,
+                    }
+                }
+            }
+            CANCEL_WORD.fetch_sub(IN_FLIGHT_ONE, Ordering::Release);
+        }
+    }
+
+    /// Start a new active period: advance the generation and clear any
+    /// signal. Handler calls in flight observed no active period, so they
+    /// record nothing in this one.
+    fn begin_period() {
+        let mut word = CANCEL_WORD.load(Ordering::Acquire);
+        loop {
+            let next = generation(word).wrapping_add(1) << GENERATION_SHIFT;
+            let started = next | ACTIVE_BIT | (word & IN_FLIGHT_MASK);
+            match CANCEL_WORD.compare_exchange_weak(
+                word,
+                started,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return,
+                Err(current) => word = current,
+            }
+        }
+    }
+
+    /// End the active period and take its signal, or 0. Waits for handler
+    /// calls in flight, so none that observed this period records after it.
+    /// A handler call on this thread runs to completion before this resumes,
+    /// so the wait cannot deadlock on it.
+    fn end_period() -> libc::c_int {
+        let mut word = CANCEL_WORD.load(Ordering::Acquire);
+        loop {
+            if word & IN_FLIGHT_MASK != 0 {
+                std::thread::yield_now();
+                word = CANCEL_WORD.load(Ordering::Acquire);
+                continue;
+            }
+            let ended = word & !(ACTIVE_BIT | SIGNAL_MASK);
+            match CANCEL_WORD.compare_exchange_weak(
+                word,
+                ended,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return pending_signal(word),
+                Err(current) => word = current,
+            }
+        }
     }
 
     /// Catches the cancellation signals while at least one run is active.
@@ -237,13 +358,9 @@ mod platform {
         pub(super) fn enter() -> Self {
             let mut state = CANCEL_STATE.lock().unwrap_or_else(PoisonError::into_inner);
             if state.active == 0 {
-                // A new active period starts here. A signal caught in the
-                // last period was taken when it ended, under this lock, so
-                // any value left now was recorded while no run was active:
-                // for example by other code that kept `on_cancel_signal` and
-                // calls it from its own handler. Clear it before the handlers
-                // are installed, so a signal caught after an install is kept.
-                CANCEL_SIGNAL.store(0_i32, Ordering::Release);
+                // Start the period before the handlers are installed, so a
+                // signal caught after an install is recorded.
+                begin_period();
                 for (signal, installed) in CANCEL_SIGNALS.iter().zip(state.installed.iter_mut()) {
                     *installed = install_if_default(*signal);
                 }
@@ -266,9 +383,8 @@ mod platform {
                 }
             }
             // Take the signal, so a handler that returns does not cancel
-            // later runs. A value recorded after this swap comes from no run;
-            // the next active period clears it on entry.
-            let pending = CANCEL_SIGNAL.swap(0_i32, Ordering::AcqRel);
+            // later runs.
+            let pending = end_period();
             if pending != 0_i32 {
                 // Only a signal this module caught is recorded. Its
                 // disposition is the default again, so this ends the process
@@ -1319,7 +1435,8 @@ mod tests {
         // The module's handler is no longer installed, so it is kept, and no
         // signal is pending, so nothing is raised.
         drop(guard);
-        // No run is active. The chained call records SIGTERM all the same.
+        // No run is active. The chained call observes that and records
+        // nothing.
         // SAFETY: raise has no memory-safety preconditions. It signals this
         // thread, so the handler runs before it returns.
         assert_eq!(unsafe { libc::raise(libc::SIGTERM) }, 0_i32);
@@ -1331,6 +1448,109 @@ mod tests {
             .expect("a signal recorded while inactive must not cancel a new run")
             .expect("the helper exits before the deadline");
         assert_eq!(output.stdout, b"after-signal");
+    }
+
+    #[test]
+    fn output_with_timeout_reraises_signal_observed_before_last_drop() {
+        use std::os::unix::process::ExitStatusExt as _;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut parent = spawn_isolated("isolated_last_drop_race_child", dir.path());
+        let start = std::time::Instant::now();
+        let status = loop {
+            if let Some(status) = parent.try_wait().expect("try_wait must not error") {
+                break status;
+            }
+            if start.elapsed() > core::time::Duration::from_secs(30) {
+                parent.kill().ok();
+                parent.wait().ok();
+                panic!("the child-mode test did not finish");
+            }
+            std::thread::sleep(core::time::Duration::from_millis(20));
+        };
+        assert_eq!(
+            status.signal(),
+            Some(libc::SIGTERM),
+            "a signal the handler observed while a run was active must end the \
+             process when the last run ends; got {status:?}"
+        );
+    }
+
+    /// Child mode for
+    /// `output_with_timeout_reraises_signal_observed_before_last_drop`: a
+    /// handler call observes the active period, the last guard drops on
+    /// another thread, and only then does the handler call record.
+    #[test]
+    #[ignore = "child mode; run only by output_with_timeout_reraises_signal_observed_before_last_drop"]
+    fn isolated_last_drop_race_child() {
+        if std::env::var_os(CHILD_DIR_ENV).is_none() {
+            return;
+        }
+        assert!(
+            platform::set_disposition(libc::SIGTERM, libc::SIG_DFL),
+            "SIGTERM must start at the default disposition"
+        );
+        let guard = platform::CancelGuard::enter();
+        let call = platform::HandlerCall::observe();
+        let ending = std::thread::spawn(move || drop(guard));
+        // Time for the last drop to end the period first, if it does not
+        // wait for a handler call already in flight.
+        std::thread::sleep(core::time::Duration::from_millis(200));
+        call.record(libc::SIGTERM);
+        ending.join().expect("the dropping thread must not panic");
+        // Reached only if the signal was lost: the parent test then fails.
+    }
+
+    #[test]
+    fn output_with_timeout_ignores_signal_observed_before_period() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut parent = spawn_isolated("isolated_next_enter_race_child", dir.path());
+        let start = std::time::Instant::now();
+        let status = loop {
+            if let Some(status) = parent.try_wait().expect("try_wait must not error") {
+                break status;
+            }
+            if start.elapsed() > core::time::Duration::from_secs(30) {
+                parent.kill().ok();
+                parent.wait().ok();
+                panic!("the child-mode test did not finish");
+            }
+            std::thread::sleep(core::time::Duration::from_millis(20));
+        };
+        assert!(
+            status.success(),
+            "a signal the handler observed while no run was active must not \
+             cancel a run that starts before it records; child-mode test failed \
+             with {status:?}"
+        );
+    }
+
+    /// Child mode for `output_with_timeout_ignores_signal_observed_before_period`:
+    /// a handler call observes no active run, a new period starts, and only
+    /// then does the handler call record.
+    #[test]
+    #[ignore = "child mode; run only by output_with_timeout_ignores_signal_observed_before_period"]
+    fn isolated_next_enter_race_child() {
+        if std::env::var_os(CHILD_DIR_ENV).is_none() {
+            return;
+        }
+        assert!(
+            platform::set_disposition(libc::SIGTERM, libc::SIG_DFL),
+            "SIGTERM must start at the default disposition"
+        );
+        let call = platform::HandlerCall::observe();
+        let guard = platform::CancelGuard::enter();
+        call.record(libc::SIGTERM);
+        // The helper outlives the first exit check, so a misattributed
+        // signal would cancel it.
+        let mut command = std::process::Command::new("sh");
+        command.args(["-c", "sleep 0.2; printf after-signal"]);
+        let output = output_with_timeout(command, core::time::Duration::from_secs(20))
+            .expect("a signal observed before the period must not cancel this run")
+            .expect("the helper exits before the deadline");
+        assert_eq!(output.stdout, b"after-signal");
+        // No signal is pending, so this ends the period without raising.
+        drop(guard);
     }
 }
 
