@@ -259,11 +259,17 @@ pub(crate) fn detect_project(
     let mut has_upstream = false;
     let mut has_fork = false;
     let mut has_origin = false;
-    for entry in output.stdout.lines().filter_map(parse_remote_list_line) {
-        if entry.name == remote_name {
+    for line in output.stdout.lines() {
+        let Some(name) = line.split_whitespace().next() else {
+            continue;
+        };
+        // Track remote names even when the URL row is malformed. A malformed
+        // selected remote must not fall through to another remote.
+        if name == remote_name {
+            let entry = parse_remote_list_line(line)?;
             remote_url = Some(entry.push_or_fetch_url());
         }
-        match entry.name {
+        match name {
             "upstream" => has_upstream = true,
             "fork" => has_fork = true,
             "origin" => has_origin = true,
@@ -594,6 +600,24 @@ mod tests {
         add_remote(&repo_path, "upstream", "git@github.com:owner/repo.git");
         let jj = Jujutsu::new(&repo_path).expect("jj");
         assert!(detect_project(&jj, "origin", ForgeType::GitHub).is_none());
+    }
+
+    #[test]
+    fn detect_malformed_upstream_still_fences_origin_fork() {
+        let (_temp, repo_path) = create_test_repo();
+        add_remote(&repo_path, "origin", "git@github.com:person/fork.git");
+        add_remote(&repo_path, "upstream", "malformed remote url");
+        let jj = Jujutsu::new(&repo_path).expect("jj");
+        assert!(detect_project(&jj, "origin", ForgeType::GitHub).is_none());
+    }
+
+    #[test]
+    fn detect_fork_with_malformed_origin_returns_none() {
+        let (_temp, repo_path) = create_test_repo();
+        add_remote(&repo_path, "origin", "malformed remote url");
+        add_remote(&repo_path, "fork", "git@github.com:person/fork.git");
+        let jj = Jujutsu::new(&repo_path).expect("jj");
+        assert!(detect_project(&jj, "fork", ForgeType::GitHub).is_none());
     }
 
     fn set_push_url(repo_path: &Path, name: &str, url: &str) {
