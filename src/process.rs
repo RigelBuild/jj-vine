@@ -980,13 +980,16 @@ mod tests {
     /// the command name in field 2 may hold spaces or parentheses.
     #[cfg(target_os = "linux")]
     fn is_running(pid: &str) -> bool {
-        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
-            return false;
+        let stat = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Ok(stat) => stat,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return false,
+            Err(error) => panic!("cannot inspect process {pid}: {error}"),
         };
         let state = stat
             .rsplit_once(')')
-            .and_then(|(_, rest)| rest.trim_start().chars().next());
-        !matches!(state, None | Some('Z' | 'X'))
+            .and_then(|(_, rest)| rest.trim_start().chars().next())
+            .expect("process stat must contain a state");
+        !matches!(state, 'Z' | 'X')
     }
 
     /// Whether `pid` names a process that exists and is not a zombie. `ps`
@@ -999,8 +1002,17 @@ mod tests {
             .stderr(std::process::Stdio::null())
             .output()
             .expect("ps must run");
+        assert!(
+            output.status.success() || output.status.code() == Some(1),
+            "ps failed to inspect process {pid}: {}",
+            output.status
+        );
         let state = String::from_utf8_lossy(&output.stdout);
         let state = state.trim();
+        assert!(
+            output.status.success() || state.is_empty(),
+            "unexpected ps output"
+        );
         !state.is_empty() && !state.starts_with('Z')
     }
 

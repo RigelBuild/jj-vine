@@ -457,9 +457,9 @@ impl GitHubConfig {
 
     /// Resolve the GitHub token from a literal or a configured command. A
     /// non-empty literal wins and is trimmed; otherwise the command's trimmed
-    /// stdout is used. At most the first 1 MiB of the command's stdout is
-    /// kept; later bytes are read and dropped, so an over-long token is cut
-    /// short and not rejected. The command must finish within 10 seconds.
+    /// stdout is used. At most the first 1 MiB of stdout is kept; later bytes
+    /// are dropped, and a truncated multibyte character fails UTF-8 validation.
+    /// The command must finish within 10 seconds.
     ///
     /// # Errors
     ///
