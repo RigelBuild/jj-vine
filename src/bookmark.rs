@@ -672,12 +672,7 @@ impl<'a> BookmarkGraph<'a> {
             .filter_map(|b| b.as_pending().map(|c| c.change_id.clone()))
             .collect();
 
-        // Only selected bookmarks may become graph parents. A bookmarked
-        // ancestor outside the selection is walked past like an unbookmarked
-        // change when it is excluded by --tracked or still authored by the
-        // current user. One excluded by `mine()` is an error, because walking
-        // past it would silently submit another author's changes under the
-        // selected bookmark.
+        // Walking past an excluded foreign parent would submit its changes under this bookmark.
         let included_names: HashSet<String> = local_bookmarks
             .iter()
             .map(|b| b.name().to_owned())
