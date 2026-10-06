@@ -324,6 +324,18 @@ mod platform {
         }
     }
 
+    /// How long the last run sleeps between checks for handler calls in
+    /// flight. A sleep, not a yield: a yield returns at once under a
+    /// real-time policy when the interrupted thread has a lower priority, so
+    /// a spin would starve the very handler call it waits for.
+    const IN_FLIGHT_BACKOFF: Duration = Duration::from_micros(50);
+
+    /// Set once `end_period` has seen a handler call in flight and waits for
+    /// it. Tests use it to order a record after that wait starts.
+    #[cfg(test)]
+    pub(super) static END_PERIOD_WAITED: core::sync::atomic::AtomicBool =
+        core::sync::atomic::AtomicBool::new(false);
+
     /// End the active period and take its signal, or 0. Waits for handler
     /// calls in flight, so none that observed this period records after it.
     /// A handler call on this thread runs to completion before this resumes,
@@ -332,7 +344,9 @@ mod platform {
         let mut word = CANCEL_WORD.load(Ordering::Acquire);
         loop {
             if word & IN_FLIGHT_MASK != 0 {
-                std::thread::yield_now();
+                #[cfg(test)]
+                END_PERIOD_WAITED.store(true, Ordering::Release);
+                std::thread::sleep(IN_FLIGHT_BACKOFF);
                 word = CANCEL_WORD.load(Ordering::Acquire);
                 continue;
             }
@@ -1498,6 +1512,7 @@ mod tests {
         if std::env::var_os(CHILD_DIR_ENV).is_none() {
             return;
         }
+        platform::END_PERIOD_WAITED.store(false, core::sync::atomic::Ordering::Release);
         assert!(
             platform::set_disposition(libc::SIGTERM, libc::SIG_DFL),
             "SIGTERM must start at the default disposition"
@@ -1505,9 +1520,21 @@ mod tests {
         let guard = platform::CancelGuard::enter();
         let call = platform::HandlerCall::observe();
         let ending = std::thread::spawn(move || drop(guard));
-        // Time for the last drop to end the period first, if it does not
-        // wait for a handler call already in flight.
-        std::thread::sleep(core::time::Duration::from_millis(200));
+        // Record only once the last drop is in `end_period` and waits for
+        // this call. A drop that does not wait never sets the marker and
+        // ends the period first; the assert then fails the child, and with
+        // it the parent test.
+        let start = std::time::Instant::now();
+        while !platform::END_PERIOD_WAITED.load(core::sync::atomic::Ordering::Acquire)
+            && !ending.is_finished()
+            && start.elapsed() < core::time::Duration::from_secs(10)
+        {
+            std::thread::sleep(core::time::Duration::from_millis(1));
+        }
+        assert!(
+            platform::END_PERIOD_WAITED.load(core::sync::atomic::Ordering::Acquire),
+            "the last drop must wait for a handler call in flight"
+        );
         call.record(libc::SIGTERM);
         ending.join().expect("the dropping thread must not panic");
         // Reached only if the signal was lost: the parent test then fails.
