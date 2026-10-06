@@ -11,12 +11,23 @@ use crate::{config::ForgeType, jj::Jujutsu};
 #[derive(Debug, Clone)]
 pub(crate) struct DetectedForge {
     pub(crate) forge_type: ForgeType,
-    /// API host, or `None` when the remote names an SSH config alias whose
-    /// real host is unknown.
-    pub(crate) host: Option<String>,
+    pub(crate) host: ApiHost,
     pub(crate) project: String,
     /// Only for Azure DevOps, the name of the repository.
     pub(crate) repository_name: Option<String>,
+}
+
+/// What a remote URL says about the forge API host.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ApiHost {
+    /// API URL derived from the remote.
+    Derived(String),
+    /// The remote names an SSH config alias whose real host is unknown.
+    Unknown,
+    /// A GitHub Enterprise remote over plain `http://`. The API host
+    /// receives the token, so no host is derived: neither the plaintext
+    /// origin nor a guessed HTTPS origin.
+    PlaintextEnterprise,
 }
 
 /// Transport of a parsed remote URL.
@@ -140,8 +151,8 @@ fn project_path(path: &str) -> Option<&str> {
 
 /// Parse a forge remote URL to detect forge type, host, and project.
 ///
-/// A GitHub Enterprise remote over plain `http://` yields `None`: the API
-/// host receives the token, so it is never derived as a plaintext origin.
+/// A GitHub Enterprise remote over plain `http://` derives the project but
+/// reports [`ApiHost::PlaintextEnterprise`] instead of an API host.
 pub(crate) fn parse_forge_url(url: &str) -> Option<DetectedForge> {
     let remote = RemoteUrl::parse(url)?;
     let is_public_github_host = remote.hostname.eq_ignore_ascii_case("github.com")
@@ -169,12 +180,14 @@ pub(crate) fn parse_forge_url(url: &str) -> Option<DetectedForge> {
     };
 
     let host = match forge_type {
-        ForgeType::GitHub if is_public_github_host => Some("https://api.github.com".to_owned()),
-        ForgeType::GitHub if remote.transport == Transport::Http => return None,
-        _ if remote.is_possible_ssh_alias() => None,
-        ForgeType::GitHub => Some(format!("{}/api/v3", remote.web_origin())),
+        ForgeType::GitHub if is_public_github_host => {
+            ApiHost::Derived("https://api.github.com".to_owned())
+        }
+        ForgeType::GitHub if remote.transport == Transport::Http => ApiHost::PlaintextEnterprise,
+        _ if remote.is_possible_ssh_alias() => ApiHost::Unknown,
+        ForgeType::GitHub => ApiHost::Derived(format!("{}/api/v3", remote.web_origin())),
         ForgeType::GitLab | ForgeType::Forgejo | ForgeType::AzureDevOps => {
-            Some(remote.web_origin())
+            ApiHost::Derived(remote.web_origin())
         }
     };
 
@@ -275,11 +288,20 @@ pub(crate) fn detect_project(
 mod tests {
     use super::*;
 
+    impl ApiHost {
+        fn derived(&self) -> Option<&str> {
+            match self {
+                Self::Derived(host) => Some(host),
+                Self::Unknown | Self::PlaintextEnterprise => None,
+            }
+        }
+    }
+
     #[test]
     fn parse_forgejo_url() {
         let detected = parse_forge_url("https://codeberg.org/owner/repo.git").expect("Forgejo URL");
         assert_eq!(detected.forge_type, ForgeType::Forgejo);
-        assert_eq!(detected.host.as_deref(), Some("https://codeberg.org"));
+        assert_eq!(detected.host.derived(), Some("https://codeberg.org"));
         assert_eq!(detected.project, "owner/repo");
     }
 
@@ -288,7 +310,7 @@ mod tests {
         let detected = parse_forge_url("git@ssh.dev.azure.com:v3/organization/project/repo")
             .expect("Azure DevOps URL");
         assert_eq!(detected.forge_type, ForgeType::AzureDevOps);
-        assert_eq!(detected.host.as_deref(), Some("https://ssh.dev.azure.com"));
+        assert_eq!(detected.host.derived(), Some("https://ssh.dev.azure.com"));
         assert_eq!(detected.project, "organization/project");
         assert_eq!(detected.repository_name.as_deref(), Some("repo"));
     }
@@ -297,7 +319,7 @@ mod tests {
     fn parse_github_ssh_url() {
         let detected = parse_forge_url("git@github.com:owner/repo.git").expect("GitHub URL");
         assert_eq!(detected.forge_type, ForgeType::GitHub);
-        assert_eq!(detected.host.as_deref(), Some("https://api.github.com"));
+        assert_eq!(detected.host.derived(), Some("https://api.github.com"));
         assert_eq!(detected.project, "owner/repo");
     }
 
@@ -306,7 +328,7 @@ mod tests {
         let detected = parse_forge_url("ssh://git@ssh.github.com:443/owner/repo.git")
             .expect("GitHub SSH-over-443 URL");
         assert_eq!(detected.forge_type, ForgeType::GitHub);
-        assert_eq!(detected.host.as_deref(), Some("https://api.github.com"));
+        assert_eq!(detected.host.derived(), Some("https://api.github.com"));
         assert_eq!(detected.project, "owner/repo");
     }
 
@@ -314,7 +336,7 @@ mod tests {
     fn parse_github_https_url() {
         let detected = parse_forge_url("https://github.com/owner/repo.git").expect("GitHub URL");
         assert_eq!(detected.forge_type, ForgeType::GitHub);
-        assert_eq!(detected.host.as_deref(), Some("https://api.github.com"));
+        assert_eq!(detected.host.derived(), Some("https://api.github.com"));
         assert_eq!(detected.project, "owner/repo");
     }
 
@@ -329,7 +351,7 @@ mod tests {
             let detected = parse_forge_url(url).expect("public GitHub URL");
             assert_eq!(detected.forge_type, ForgeType::GitHub, "{url}");
             assert_eq!(
-                detected.host.as_deref(),
+                detected.host.derived(),
                 Some("https://api.github.com"),
                 "{url}"
             );
@@ -343,7 +365,7 @@ mod tests {
             .expect("GitHub Enterprise URL");
         assert_eq!(detected.forge_type, ForgeType::GitHub);
         assert_eq!(
-            detected.host.as_deref(),
+            detected.host.derived(),
             Some("https://github.example.com/api/v3")
         );
         assert_eq!(detected.project, "owner/repo");
@@ -354,7 +376,7 @@ mod tests {
         let detected =
             parse_forge_url("git@gitlab.example.com:group/project.git").expect("GitLab SSH URL");
         assert_eq!(detected.forge_type, ForgeType::GitLab);
-        assert_eq!(detected.host.as_deref(), Some("https://gitlab.example.com"));
+        assert_eq!(detected.host.derived(), Some("https://gitlab.example.com"));
         assert_eq!(detected.project, "group/project");
     }
 
@@ -363,7 +385,7 @@ mod tests {
         let detected = parse_forge_url("https://gitlab.example.com/group/project.git")
             .expect("GitLab HTTPS URL");
         assert_eq!(detected.forge_type, ForgeType::GitLab);
-        assert_eq!(detected.host.as_deref(), Some("https://gitlab.example.com"));
+        assert_eq!(detected.host.derived(), Some("https://gitlab.example.com"));
         assert_eq!(detected.project, "group/project");
     }
 
@@ -373,7 +395,7 @@ mod tests {
             .expect("GitHub Enterprise SSH URL");
         assert_eq!(detected.forge_type, ForgeType::GitHub);
         assert_eq!(
-            detected.host.as_deref(),
+            detected.host.derived(),
             Some("https://github.example.com/api/v3")
         );
         assert_eq!(detected.project, "owner/repo");
@@ -384,7 +406,7 @@ mod tests {
         let detected =
             parse_forge_url("git@gitlab.example.com:group/subgroup/repo.git").expect("GitLab URL");
         assert_eq!(detected.forge_type, ForgeType::GitLab);
-        assert_eq!(detected.host.as_deref(), Some("https://gitlab.example.com"));
+        assert_eq!(detected.host.derived(), Some("https://gitlab.example.com"));
         assert_eq!(detected.project, "group/subgroup/repo");
     }
 
@@ -402,7 +424,7 @@ mod tests {
         assert_eq!(detected.forge_type, ForgeType::GitHub);
         assert_eq!(detected.project, "owner/repo");
         assert_eq!(
-            detected.host.as_deref(),
+            detected.host.derived(),
             Some("https://github.example.com/api/v3")
         );
     }
@@ -412,7 +434,7 @@ mod tests {
         let detected = parse_forge_url("https://user:s3cret@github.com/owner/repo.git")
             .expect("credential-bearing HTTPS URL");
         assert_eq!(detected.forge_type, ForgeType::GitHub);
-        assert_eq!(detected.host.as_deref(), Some("https://api.github.com"));
+        assert_eq!(detected.host.derived(), Some("https://api.github.com"));
         assert_eq!(detected.project, "owner/repo");
     }
 
@@ -422,25 +444,32 @@ mod tests {
         let detected = parse_forge_url("https://token@github.example.com:8443/owner/repo.git")
             .expect("credential-bearing Enterprise URL");
         assert_eq!(
-            detected.host.as_deref(),
+            detected.host.derived(),
             Some("https://github.example.com:8443/api/v3")
         );
         assert_eq!(detected.project, "owner/repo");
     }
 
     /// The derived API host receives the token, so a plaintext Enterprise
-    /// remote never derives one.
+    /// remote derives the project but no host.
     #[test]
-    fn parse_http_enterprise_derives_nothing() {
-        assert!(parse_forge_url("http://github.example.com/owner/repo.git").is_none());
-        assert!(parse_forge_url("http://github.example.com:8080/owner/repo.git").is_none());
+    fn parse_http_enterprise_derives_no_host() {
+        for url in [
+            "http://github.example.com/owner/repo.git",
+            "http://github.example.com:8080/owner/repo.git",
+        ] {
+            let detected = parse_forge_url(url).expect("GitHub Enterprise HTTP URL");
+            assert_eq!(detected.forge_type, ForgeType::GitHub, "{url}");
+            assert_eq!(detected.host, ApiHost::PlaintextEnterprise, "{url}");
+            assert_eq!(detected.project, "owner/repo", "{url}");
+        }
     }
 
     /// github.com always maps to the HTTPS public API, whatever the transport.
     #[test]
     fn parse_http_github_com_uses_https_api() {
         let detected = parse_forge_url("http://github.com/owner/repo.git").expect("GitHub URL");
-        assert_eq!(detected.host.as_deref(), Some("https://api.github.com"));
+        assert_eq!(detected.host.derived(), Some("https://api.github.com"));
     }
 
     /// An SSH config alias names no real host, so it yields the project only.
@@ -452,7 +481,7 @@ mod tests {
         ] {
             let detected = parse_forge_url(url).expect("GitHub alias URL");
             assert_eq!(detected.forge_type, ForgeType::GitHub, "{url}");
-            assert_eq!(detected.host, None, "{url}");
+            assert_eq!(detected.host, ApiHost::Unknown, "{url}");
             assert_eq!(detected.project, "owner/repo", "{url}");
         }
     }
@@ -603,7 +632,7 @@ mod tests {
         let jj = Jujutsu::new(&repo_path).expect("jj");
         let detected = detect_project(&jj, "origin", ForgeType::GitHub).expect("detect origin");
         assert_eq!(detected.project, "owner/repo");
-        assert_eq!(detected.host.as_deref(), Some("https://api.github.com"));
+        assert_eq!(detected.host.derived(), Some("https://api.github.com"));
     }
 
     #[test]

@@ -8,6 +8,7 @@ use serde::{Deserialize, de::Visitor};
 use crate::{
     error::{ConfigSnafu, Error, Result},
     jj::Jujutsu,
+    remote::ApiHost,
 };
 
 /// Forge type (GitLab, GitHub, or Forgejo).
@@ -991,6 +992,13 @@ fn clone_layer_nonempty(clone_keys: Option<&[String]>, key: &str, value: &str) -
         })
 }
 
+/// Whether a configured API host uses HTTPS, so the token never travels
+/// over plaintext.
+fn is_https_host(host: &str) -> bool {
+    host.get(..8)
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("https://"))
+}
+
 impl Config {
     /// Load configuration from jj config.
     pub fn load(repo_path: impl Into<PathBuf>) -> Result<Self> {
@@ -1025,22 +1033,39 @@ impl Config {
 
         // Repo- or workspace-explicit values win; otherwise clone-derived
         // values supersede global config. Empty values collapse into the
-        // derive path.
+        // derive path. A plaintext GitHub Enterprise remote derives no host,
+        // so it needs an explicit HTTPS host; an `http://` host does not
+        // count, and the public API is never assumed for it.
         if config.forge == ForgeType::GitHub {
             let clone_keys = clone_layer_keys(jj);
             let clone_keys = clone_keys.as_deref();
             let project_set = clone_layer_nonempty(clone_keys, "project", &config.github.project);
             let host_set = clone_layer_nonempty(clone_keys, "host", &config.github.host);
-            if (!project_set || !host_set)
+            let https_host_set = host_set && is_https_host(&config.github.host);
+            if (!project_set || !https_host_set)
                 && let Some(detected) =
                     crate::remote::detect_project(jj, &config.remote_name, ForgeType::GitHub)
             {
                 if !project_set {
                     config.github.project = detected.project;
                 }
-                // An SSH alias remote has no known host; keep the configured one.
-                if !host_set && let Some(host) = detected.host {
-                    config.github.host = host;
+                match detected.host {
+                    ApiHost::Derived(host) if !host_set => config.github.host = host,
+                    // An SSH alias remote has no known host; keep the configured one.
+                    ApiHost::Derived(_) | ApiHost::Unknown => {}
+                    ApiHost::PlaintextEnterprise if https_host_set => {}
+                    ApiHost::PlaintextEnterprise => {
+                        return ConfigSnafu {
+                            message: format!(
+                                "the '{}' remote is a GitHub Enterprise remote over plain HTTP, \
+                                 so github.host is not derived and the API token is not sent \
+                                 over it; set jj-vine.github.host in the repository or \
+                                 workspace config to the Enterprise HTTPS API URL",
+                                config.remote_name
+                            ),
+                        }
+                        .fail();
+                    }
                 }
             }
             if config.github.host.is_empty() {
@@ -1270,22 +1295,71 @@ mod tests {
         assert_eq!(config.github.host, "https://github.example.com:8443/api/v3");
     }
 
-    /// A plaintext Enterprise remote derives neither value, so the token is
-    /// never sent to an `http://` API host.
+    /// A plaintext Enterprise remote derives no host, and loading fails rather
+    /// than send the token to the public API or an `http://` host. Neither a
+    /// global host nor an explicit `http://` host overrides it. The error
+    /// names no URL.
     #[test]
     fn derive_skips_http_enterprise_remote() {
+        for (global_host, repo_host) in [
+            (None, None),
+            (Some("https://github.example.com/api/v3"), None),
+            (None, Some("http://github.example.com/api/v3")),
+        ] {
+            let (temp, repo_path) = create_test_repo();
+            seed_github_config(&repo_path);
+            set_repo_config(&repo_path, "jj-vine.github.project", "configured/repo");
+            if let Some(host) = global_host {
+                std::fs::write(
+                    temp.path().join(ISOLATED_TEST_CONFIG),
+                    format!("[jj-vine.github]\nhost = \"{host}\"\n"),
+                )
+                .expect("write user-level GitHub host");
+            }
+            if let Some(host) = repo_host {
+                set_repo_config(&repo_path, "jj-vine.github.host", host);
+            }
+            add_git_remote(
+                &repo_path,
+                "origin",
+                "http://user:s3cret-token@github.example.com/owner/repo.git",
+            );
+
+            let result = load_isolated(&repo_path);
+            let Err(Error::Config { message, .. }) = result else {
+                panic!("Expected Config error for {global_host:?}/{repo_host:?}, got: {result:?}");
+            };
+
+            assert!(
+                message.contains("GitHub Enterprise remote over plain HTTP"),
+                "{message}"
+            );
+            assert!(!message.contains("github.example.com"), "{message}");
+            assert!(!message.contains("s3cret-token"), "{message}");
+        }
+    }
+
+    /// An explicit repository HTTPS host is the safe override for a plaintext
+    /// Enterprise remote; the project still derives from the remote.
+    #[test]
+    fn derive_http_enterprise_remote_uses_explicit_https_host() {
         let (_temp, repo_path) = create_test_repo();
         seed_github_config(&repo_path);
-        set_repo_config(&repo_path, "jj-vine.github.project", "configured/repo");
+        set_repo_config(
+            &repo_path,
+            "jj-vine.github.host",
+            "https://github.example.com/api/v3",
+        );
         add_git_remote(
             &repo_path,
             "origin",
             "http://github.example.com/owner/repo.git",
         );
 
-        let config = load_isolated(&repo_path).expect("load config");
+        let config = load_isolated(&repo_path).expect("load config with explicit HTTPS host");
 
-        assert_eq!(config.github.host, "https://api.github.com");
+        assert_eq!(config.github.host, "https://github.example.com/api/v3");
+        assert_eq!(config.github.project, "owner/repo");
     }
 
     /// An SSH config alias names no real host: the project is derived, the
