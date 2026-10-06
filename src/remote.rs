@@ -305,7 +305,6 @@ mod tests {
         assert_eq!(detected.project, "owner/repo");
     }
 
-
     #[test]
     fn parse_public_github_host_case_and_www_map_to_api() {
         for url in [
@@ -316,11 +315,14 @@ mod tests {
         ] {
             let detected = parse_forge_url(url).expect("public GitHub URL");
             assert_eq!(detected.forge_type, ForgeType::GitHub, "{url}");
-            assert_eq!(detected.host.as_deref(), Some("https://api.github.com"), "{url}");
+            assert_eq!(
+                detected.host.as_deref(),
+                Some("https://api.github.com"),
+                "{url}"
+            );
             assert_eq!(detected.project, "owner/repo", "{url}");
         }
     }
-
 
     #[test]
     fn parse_github_enterprise_url() {
