@@ -142,8 +142,17 @@ fn project_path(path: &str) -> Option<&str> {
 /// host receives the token, so it is never derived as a plaintext origin.
 pub(crate) fn parse_forge_url(url: &str) -> Option<DetectedForge> {
     let remote = RemoteUrl::parse(url)?;
-    let forge_type = ForgeType::detect_from_host(remote.hostname)?;
+    let is_public_github_host = remote.hostname.eq_ignore_ascii_case("github.com")
+        || remote.hostname.eq_ignore_ascii_case("www.github.com");
+    let forge_type = if is_public_github_host {
+        ForgeType::GitHub
+    } else {
+        ForgeType::detect_from_host(remote.hostname)?
+    };
     let path = project_path(remote.path)?;
+    if forge_type == ForgeType::GitHub && path.split('/').count() != 2 {
+        return None;
+    }
 
     let (project, repository_name) = match forge_type {
         ForgeType::AzureDevOps => {
@@ -157,9 +166,7 @@ pub(crate) fn parse_forge_url(url: &str) -> Option<DetectedForge> {
     };
 
     let host = match forge_type {
-        ForgeType::GitHub if remote.hostname == "github.com" => {
-            Some("https://api.github.com".to_owned())
-        }
+        ForgeType::GitHub if is_public_github_host => Some("https://api.github.com".to_owned()),
         ForgeType::GitHub if remote.transport == Transport::Http => return None,
         _ if remote.is_possible_ssh_alias() => None,
         ForgeType::GitHub => Some(format!("{}/api/v3", remote.web_origin())),
@@ -298,6 +305,23 @@ mod tests {
         assert_eq!(detected.project, "owner/repo");
     }
 
+
+    #[test]
+    fn parse_public_github_host_case_and_www_map_to_api() {
+        for url in [
+            "https://GitHub.com/owner/repo.git",
+            "https://WWW.GitHub.com/owner/repo.git",
+            "http://GitHub.com/owner/repo.git",
+            "http://www.github.com/owner/repo.git",
+        ] {
+            let detected = parse_forge_url(url).expect("public GitHub URL");
+            assert_eq!(detected.forge_type, ForgeType::GitHub, "{url}");
+            assert_eq!(detected.host.as_deref(), Some("https://api.github.com"), "{url}");
+            assert_eq!(detected.project, "owner/repo", "{url}");
+        }
+    }
+
+
     #[test]
     fn parse_github_enterprise_url() {
         let detected = parse_forge_url("https://github.example.com/owner/repo.git")
@@ -409,7 +433,7 @@ mod tests {
     fn parse_ssh_alias_derives_project_without_host() {
         for url in [
             "git@github.com-work:owner/repo.git",
-            "git@github-work:owner/repo.git",
+            "git@github-personal:owner/repo.git",
         ] {
             let detected = parse_forge_url(url).expect("GitHub alias URL");
             assert_eq!(detected.forge_type, ForgeType::GitHub, "{url}");
@@ -449,6 +473,17 @@ mod tests {
             "https://github.com/owner/repo.git?x=1",
             "ssh://git@github.com:/owner/repo.git",
             "git@github.com:",
+        ] {
+            assert!(parse_forge_url(url).is_none(), "must reject {url}");
+        }
+    }
+
+    #[test]
+    fn parse_github_rejects_paths_beyond_owner_and_repo() {
+        for url in [
+            "https://github.com/owner/repo/issues",
+            "git@github.com:owner/repo/subdir.git",
+            "https://github.example.com/owner/repo/subdir.git",
         ] {
             assert!(parse_forge_url(url).is_none(), "must reject {url}");
         }
