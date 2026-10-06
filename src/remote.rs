@@ -794,7 +794,7 @@ mod tests {
         assert_eq!(detected.fetch_target, FetchTarget::Pushed);
     }
 
-    /// RIG-4691: another repository fetched from another API host, or from
+    /// Another repository fetched from another API host, or from
     /// no provable host, is reported so config loading can fail closed.
     #[test]
     fn detect_cross_host_fetch_url_reports_other_host() {

@@ -400,7 +400,7 @@ mod token_config_tests {
         assert!(error.to_string().contains("token or github.tokenCommand"));
     }
 
-    /// RIG-4701: the token is never sent to a plain HTTP API host, whatever
+    /// The token is never sent to a plain HTTP API host, whatever
     /// layer configured it. An empty host has no scheme and is rejected too.
     #[test]
     fn validate_config_rejects_non_https_host() {

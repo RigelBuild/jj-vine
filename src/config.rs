@@ -1554,7 +1554,7 @@ mod tests {
         assert!(config.github.target_project.is_empty());
     }
 
-    /// RIG-4691: a remote that fetches another repository from another API
+    /// A remote that fetches another repository from another API
     /// host fails to load rather than route the token for both projects to
     /// one derived host. The error names no URL.
     #[test]
@@ -1659,7 +1659,7 @@ mod tests {
         }
     }
 
-    /// RIG-4701: a clone-explicit plain HTTP host is rejected even with an
+    /// A clone-explicit plain HTTP host is rejected even with an
     /// HTTPS remote, so the token never travels over plaintext.
     #[test]
     fn explicit_http_host_is_rejected() {
@@ -1689,7 +1689,7 @@ mod tests {
         assert!(message.contains("https:// API URL"), "{message}");
     }
 
-    /// RIG-4701: a global plain HTTP host is rejected when nothing derives
+    /// A global plain HTTP host is rejected when nothing derives
     /// a replacement.
     #[test]
     fn global_http_host_is_rejected_without_remote() {
