@@ -19,9 +19,11 @@
 //! A signal is caught only if its disposition is the default on entry. The
 //! handler kills every running tree; after the last run ends, the default
 //! disposition is restored and the signal is raised again, so the process ends
-//! as it would have with no child running. On Windows, a console Ctrl-C
-//! reaches the child directly, and the job's kill-on-close limit kills the
-//! tree when this process exits.
+//! as it would have with no child running. The default is restored only where
+//! this module's handler is still installed: a handler other code installed
+//! during the run is kept, and a caught signal is then raised to it. On
+//! Windows, a console Ctrl-C reaches the child directly, and the job's
+//! kill-on-close limit kills the tree when this process exits.
 //!
 //! Limits: a Unix descendant that leaves the process group on purpose
 //! (`setsid`/`setpgid`) is not killed, but cannot keep a pipe reader blocked:
@@ -44,7 +46,9 @@ const DRAIN_GRACE: Duration = Duration::from_millis(500);
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 /// Run `command` to completion with a wall-clock `timeout`. Returns `Ok(None)`
-/// if the child overran the deadline.
+/// if the child overran the deadline. The exit is checked only while the
+/// deadline has not passed; an exit first seen after it is an overrun, so a
+/// late child cannot return output.
 ///
 /// The child and descendants still in its process group or job are killed when
 /// the child exits or overruns, and the child is reaped. See the module docs
@@ -134,7 +138,10 @@ mod platform {
 
         let start = Instant::now();
         let status = loop {
-            if tree.has_exited()? {
+            // Read the clock before the exit check: a child seen exited only
+            // after the deadline is an overrun, not a success.
+            let elapsed = start.elapsed();
+            if elapsed < timeout && tree.has_exited()? {
                 break tree.kill_and_reap()?;
             }
             if CANCEL_SIGNAL.load(Ordering::Acquire) != 0_i32 {
@@ -144,7 +151,6 @@ mod platform {
                     "cancelled by signal",
                 ));
             }
-            let elapsed = start.elapsed();
             if elapsed >= timeout {
                 tree.kill_and_reap()?;
                 return Ok(None);
@@ -223,39 +229,61 @@ mod platform {
             }
             for (signal, installed) in CANCEL_SIGNALS.iter().zip(state.installed.iter_mut()) {
                 if core::mem::take(installed) {
-                    set_disposition(*signal, libc::SIG_DFL);
+                    restore_default_if_ours(*signal);
                 }
             }
             let pending = CANCEL_SIGNAL.load(Ordering::Acquire);
             if pending != 0_i32 {
-                // Only a signal this module caught is recorded, and its
+                // Only a signal this module caught is recorded. Its
                 // disposition is the default again, so this ends the process
-                // as the original signal would have.
+                // as the original signal would have, unless other code
+                // installed a handler during the run: that handler gets it.
                 // SAFETY: raise has no memory-safety preconditions.
                 unsafe { libc::raise(pending) };
             }
         }
     }
 
+    /// `on_cancel_signal` as a disposition value.
+    fn cancel_handler() -> libc::sighandler_t {
+        let handler: extern "C" fn(libc::c_int) = on_cancel_signal;
+        handler as libc::sighandler_t
+    }
+
     /// Install `on_cancel_signal` for `signal` if its disposition is the
     /// default. Returns whether it was installed.
     fn install_if_default(signal: libc::c_int) -> bool {
+        if current_disposition(signal) != Some(libc::SIG_DFL) {
+            return false;
+        }
+        set_disposition(signal, cancel_handler())
+    }
+
+    /// Restore the default disposition for `signal` only if
+    /// `on_cancel_signal` is still its handler. A disposition other code set
+    /// during the run is left in place. POSIX has no compare-and-swap for a
+    /// disposition, so a handler set between the query and the reset is still
+    /// replaced; that window is two system calls wide.
+    fn restore_default_if_ours(signal: libc::c_int) {
+        if current_disposition(signal) == Some(cancel_handler()) {
+            set_disposition(signal, libc::SIG_DFL);
+        }
+    }
+
+    /// The current handler of `signal`, or `None` if it cannot be queried.
+    pub(super) fn current_disposition(signal: libc::c_int) -> Option<libc::sighandler_t> {
         // SAFETY: an all-zero `sigaction` is a valid value; it is plain data.
         let mut old: libc::sigaction = unsafe { core::mem::zeroed() };
         // SAFETY: a null new action only queries; `old` is writable.
         if unsafe { libc::sigaction(signal, core::ptr::null(), &raw mut old) } == -1_i32 {
-            return false;
+            return None;
         }
-        if old.sa_sigaction != libc::SIG_DFL {
-            return false;
-        }
-        let handler: extern "C" fn(libc::c_int) = on_cancel_signal;
-        set_disposition(signal, handler as libc::sighandler_t)
+        Some(old.sa_sigaction)
     }
 
     /// Set `signal`'s handler with an empty mask and `SA_RESTART`. Returns
     /// whether the call succeeded.
-    fn set_disposition(signal: libc::c_int, handler: libc::sighandler_t) -> bool {
+    pub(super) fn set_disposition(signal: libc::c_int, handler: libc::sighandler_t) -> bool {
         // SAFETY: an all-zero `sigaction` is a valid value; it is plain data.
         let mut action: libc::sigaction = unsafe { core::mem::zeroed() };
         action.sa_sigaction = handler;
@@ -489,22 +517,26 @@ mod platform {
 
         let start = Instant::now();
         let status = loop {
-            match child.try_wait() {
-                Ok(Some(status)) => break status,
-                Ok(None) => {}
-                Err(error) => {
-                    terminate(&job, &mut child).ok();
-                    finish(stdout, stderr, Duration::ZERO);
-                    return Err(error);
+            // Read the clock before the exit check: a child seen exited only
+            // after the deadline is an overrun, not a success.
+            let elapsed = start.elapsed();
+            if elapsed < timeout {
+                match child.try_wait() {
+                    Ok(Some(status)) => break status,
+                    Ok(None) => {}
+                    Err(error) => {
+                        terminate(&job, &mut child).ok();
+                        finish(stdout, stderr, Duration::ZERO);
+                        return Err(error);
+                    }
                 }
-            }
-            if start.elapsed() >= timeout {
+            } else {
                 let killed = terminate(&job, &mut child);
                 finish(stdout, stderr, Duration::ZERO);
                 killed?;
                 return Ok(None);
             }
-            std::thread::sleep(POLL_INTERVAL);
+            std::thread::sleep(POLL_INTERVAL.min(timeout.saturating_sub(elapsed)));
         };
 
         // The child has exited; its descendants are killed even though the
@@ -849,6 +881,326 @@ mod tests {
         assert!(
             process_gone_within(pid.trim(), core::time::Duration::from_secs(5)),
             "a timed-out child's descendants must be terminated too"
+        );
+    }
+
+    #[test]
+    fn output_with_timeout_caps_large_stdout_and_stderr() {
+        let size = MAX_STREAM_BYTES.saturating_add(0x1_0000);
+        let mut command = std::process::Command::new("sh");
+        command
+            .args([
+                "-c",
+                "head -c \"$1\" /dev/zero; head -c \"$1\" /dev/zero >&2; exit 0",
+                "_",
+            ])
+            .arg(size.to_string());
+        let output = output_with_timeout(command, core::time::Duration::from_secs(30))
+            .expect("spawn/poll must not error")
+            .expect("a child that writes past the cap must still complete, not stall");
+        assert!(output.status.success(), "the child must exit 0");
+        assert_eq!(
+            output.stdout.len(),
+            MAX_STREAM_BYTES,
+            "stdout must be capped, and bytes up to the cap kept"
+        );
+        assert_eq!(
+            output.stderr.len(),
+            MAX_STREAM_BYTES,
+            "stderr must be capped, and bytes up to the cap kept"
+        );
+    }
+
+    /// Set in a re-executed test binary to the directory a child-mode test
+    /// uses. Child-mode tests do nothing without it.
+    const CHILD_DIR_ENV: &str = "JJ_VINE_PROCESS_TEST_CHILD_DIR";
+
+    /// Re-run this test binary with only the child-mode test `name`, so
+    /// signals and process-global dispositions do not touch other tests.
+    fn spawn_isolated(name: &str, dir: &std::path::Path) -> std::process::Child {
+        let module = module_path!()
+            .split_once("::")
+            .map_or(module_path!(), |(_crate, rest)| rest);
+        std::process::Command::new(std::env::current_exe().expect("test binary path"))
+            .args(["--exact", &format!("{module}::{name}")])
+            .args(["--ignored", "--test-threads=1"])
+            .env(CHILD_DIR_ENV, dir)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("re-executing the test binary must spawn")
+    }
+
+    /// Wait until `path` holds a complete `echo $$` line; return the pid.
+    fn wait_for_pid(path: &std::path::Path, within: core::time::Duration) -> Option<String> {
+        let start = std::time::Instant::now();
+        while start.elapsed() < within {
+            if let Ok(text) = std::fs::read_to_string(path)
+                && text.ends_with('\n')
+            {
+                return Some(text.trim().to_owned());
+            }
+            std::thread::sleep(core::time::Duration::from_millis(10));
+        }
+        None
+    }
+
+    #[test]
+    fn output_with_timeout_cancels_tree_and_reraises_signal() {
+        use std::os::unix::process::ExitStatusExt as _;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut parent = spawn_isolated("isolated_cancel_child", dir.path());
+        let Some(descendant) = wait_for_pid(
+            &dir.path().join("descendant.pid"),
+            core::time::Duration::from_secs(10),
+        ) else {
+            parent.kill().ok();
+            parent.wait().ok();
+            panic!("the helper's descendant never started");
+        };
+        let helper = wait_for_pid(
+            &dir.path().join("helper.pid"),
+            core::time::Duration::from_secs(1),
+        )
+        .expect("the helper writes its pid before starting the descendant");
+        let parent_pid = libc::pid_t::try_from(parent.id()).expect("pid fits pid_t");
+        // SAFETY: kill has no memory-safety preconditions; the pid is our
+        // unreaped child, so it cannot have been reused.
+        assert_eq!(
+            unsafe { libc::kill(parent_pid, libc::SIGTERM) },
+            0_i32,
+            "SIGTERM must reach the throwaway parent"
+        );
+        let status = parent.wait().expect("the throwaway parent must be reaped");
+        assert_eq!(
+            status.signal(),
+            Some(libc::SIGTERM),
+            "the parent must end by the original signal, after cleanup, as if no \
+             helper had run; got {status:?}"
+        );
+        assert!(
+            !dir.path().join("returned").exists(),
+            "the cancelled run must not return normally to its caller"
+        );
+        assert!(
+            process_gone_within(&helper, core::time::Duration::from_secs(5)),
+            "the helper must be killed before the signal ends the parent"
+        );
+        assert!(
+            process_gone_within(&descendant, core::time::Duration::from_secs(5)),
+            "the helper's process group must be killed before the signal ends the parent"
+        );
+    }
+
+    /// Child mode for `output_with_timeout_cancels_tree_and_reraises_signal`:
+    /// run a helper and a group descendant until the parent test signals us.
+    #[test]
+    #[ignore = "child mode; run only by output_with_timeout_cancels_tree_and_reraises_signal"]
+    fn isolated_cancel_child() {
+        let Some(dir) = std::env::var_os(CHILD_DIR_ENV) else {
+            return;
+        };
+        let dir = std::path::PathBuf::from(dir);
+        assert!(
+            platform::set_disposition(libc::SIGTERM, libc::SIG_DFL),
+            "SIGTERM must start at the default disposition"
+        );
+        let mut command = std::process::Command::new("sh");
+        command
+            .args([
+                "-c",
+                "echo $$ > \"$1/helper.pid\"; \
+                 sh -c 'echo $$ > \"$1/descendant.pid\"; exec sleep 30' _ \"$1\" & sleep 30",
+                "_",
+            ])
+            .arg(&dir);
+        let result = output_with_timeout(command, core::time::Duration::from_secs(30));
+        // Reached only if the caught signal was not raised again.
+        std::fs::write(dir.join("returned"), format!("{result:?}")).ok();
+    }
+
+    #[test]
+    fn output_with_timeout_keeps_handler_installed_during_run() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut parent = spawn_isolated("isolated_keep_handler_child", dir.path());
+        let start = std::time::Instant::now();
+        let status = loop {
+            if let Some(status) = parent.try_wait().expect("try_wait must not error") {
+                break status;
+            }
+            if start.elapsed() > core::time::Duration::from_secs(30) {
+                parent.kill().ok();
+                parent.wait().ok();
+                panic!("the child-mode test did not finish");
+            }
+            std::thread::sleep(core::time::Duration::from_millis(20));
+        };
+        assert!(
+            status.success(),
+            "a SIGHUP handler installed while a helper ran must survive the run; \
+             child-mode test failed with {status:?}"
+        );
+    }
+
+    extern "C" fn embedder_handler(_signal: libc::c_int) {}
+
+    /// Child mode for `output_with_timeout_keeps_handler_installed_during_run`:
+    /// install a SIGHUP handler while the helper runs, as an embedding
+    /// component could, and check the run does not replace it.
+    #[test]
+    #[ignore = "child mode; run only by output_with_timeout_keeps_handler_installed_during_run"]
+    fn isolated_keep_handler_child() {
+        let Some(dir) = std::env::var_os(CHILD_DIR_ENV) else {
+            return;
+        };
+        let dir = std::path::PathBuf::from(dir);
+        // Start from the default, so the run installs its own handler and
+        // this test cannot pass by the run leaving SIGHUP alone.
+        assert!(
+            platform::set_disposition(libc::SIGHUP, libc::SIG_DFL),
+            "SIGHUP must start at the default disposition"
+        );
+        let handler: extern "C" fn(libc::c_int) = embedder_handler;
+        let handler = handler as libc::sighandler_t;
+        let installer = {
+            let dir = dir.clone();
+            std::thread::spawn(move || {
+                let start = std::time::Instant::now();
+                while !dir.join("ready").exists() {
+                    assert!(
+                        start.elapsed() < core::time::Duration::from_secs(10),
+                        "the helper never started"
+                    );
+                    std::thread::sleep(core::time::Duration::from_millis(5));
+                }
+                let during = platform::current_disposition(libc::SIGHUP);
+                assert!(
+                    platform::set_disposition(libc::SIGHUP, handler),
+                    "the embedder handler must install"
+                );
+                std::fs::write(dir.join("installed"), b"").expect("signal the helper");
+                during
+            })
+        };
+        let mut command = std::process::Command::new("sh");
+        command
+            .args([
+                "-c",
+                ": > \"$1/ready\"; while [ ! -e \"$1/installed\" ]; do sleep 0.01; done",
+                "_",
+            ])
+            .arg(&dir);
+        let output = output_with_timeout(command, core::time::Duration::from_secs(20))
+            .expect("spawn/poll must not error")
+            .expect("the helper exits once the handler is installed");
+        let during = installer.join().expect("installer thread must not panic");
+        assert!(output.status.success(), "the helper must exit 0");
+        assert_ne!(
+            during,
+            Some(libc::SIG_DFL),
+            "the run must have caught SIGHUP, or this test proves nothing"
+        );
+        assert_eq!(
+            platform::current_disposition(libc::SIGHUP),
+            Some(handler),
+            "the run must not reset a handler installed while it ran"
+        );
+    }
+}
+
+// Windows-native tests: they drive `powershell`, the job object, and
+// `OpenProcess`. They do not cover console Ctrl-C delivery.
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle, WAIT_OBJECT_0},
+        System::Threading::{OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject},
+    };
+
+    use super::*;
+
+    /// Whether process `pid` is gone, or exits, within `within`.
+    fn process_gone_within(pid: u32, within: core::time::Duration) -> bool {
+        // SAFETY: no pointer arguments; a null result means no such process.
+        let handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) };
+        if handle.is_null() {
+            return true;
+        }
+        let millis = u32::try_from(within.as_millis()).unwrap_or(u32::MAX);
+        // SAFETY: `handle` is a live process handle with SYNCHRONIZE.
+        let waited = unsafe { WaitForSingleObject(handle, millis) };
+        // SAFETY: `handle` is live and not used again.
+        unsafe { CloseHandle(handle) };
+        waited == WAIT_OBJECT_0
+    }
+
+    #[test]
+    fn output_with_timeout_kills_job_descendant_after_success() {
+        let mut command = std::process::Command::new("powershell");
+        command.args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "$p = Start-Process -FilePath ping -ArgumentList '-n','30','127.0.0.1' \
+             -WindowStyle Hidden -PassThru; [Console]::Out.Write($p.Id)",
+        ]);
+        let output = output_with_timeout(command, core::time::Duration::from_secs(60))
+            .expect("spawn/contain/wait must not error")
+            .expect("powershell exits once the descendant starts");
+        assert!(output.status.success(), "powershell must exit 0");
+        let pid: u32 = String::from_utf8(output.stdout)
+            .expect("utf-8 pid")
+            .trim()
+            .parse()
+            .expect("powershell printed the descendant pid");
+        assert!(
+            process_gone_within(pid, core::time::Duration::from_secs(5)),
+            "a descendant in the job must not outlive the call"
+        );
+    }
+
+    #[test]
+    fn output_with_timeout_kills_overrunning_job() {
+        let mut command = std::process::Command::new("ping");
+        command.args(["-n", "30", "127.0.0.1"]);
+        let start = std::time::Instant::now();
+        let result = output_with_timeout(command, core::time::Duration::from_millis(500))
+            .expect("spawn/contain/wait must not error");
+        assert!(result.is_none(), "an overrunning child must report None");
+        assert!(
+            start.elapsed() < core::time::Duration::from_secs(5),
+            "must return promptly after the timeout, not wait out the ping"
+        );
+    }
+
+    #[test]
+    fn output_with_timeout_caps_large_stdout_and_stderr() {
+        let size = MAX_STREAM_BYTES.saturating_add(0x1_0000);
+        let mut command = std::process::Command::new("powershell");
+        command.args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            &format!(
+                "$s = 'x' * {size}; [Console]::Out.Write($s); [Console]::Out.Flush(); \
+                 [Console]::Error.Write($s); [Console]::Error.Flush()"
+            ),
+        ]);
+        let output = output_with_timeout(command, core::time::Duration::from_secs(60))
+            .expect("spawn/contain/wait must not error")
+            .expect("a child that writes past the cap must still complete, not stall");
+        assert!(output.status.success(), "powershell must exit 0");
+        assert_eq!(
+            output.stdout.len(),
+            MAX_STREAM_BYTES,
+            "stdout must be capped"
+        );
+        assert_eq!(
+            output.stderr.len(),
+            MAX_STREAM_BYTES,
+            "stderr must be capped"
         );
     }
 }
