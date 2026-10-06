@@ -6,6 +6,7 @@ use snafu::whatever;
 
 use crate::{
     bookmark::{BookmarkOrPending, BookmarkRef},
+    config::ForgeType,
     description::{generate_description, remove_jj_vine_stack_from_description},
     error::{Error, Result},
     forge::{AnyForgeMergeRequest, Forge as _},
@@ -212,9 +213,24 @@ pub async fn plan(ctx: PlanContext<'_>) -> Result<SubmissionPlan> {
                     .flatten(),
             );
 
+            // GitHub lookup is by head branch, so a root PR can have a manually selected
+            // base. Preserve it; children still follow the calculated parent
+            // base.
             let target_branch = mr_base_branch(ctx.forge, bookmark, default_branch);
 
             if let Some(existing_mr) = existing_mrs.get(bookmark.name()) {
+                let target_branch = if ctx.config.forge == ForgeType::GitHub
+                    && target_branch == default_branch
+                    && bookmark
+                        .parents
+                        .first()
+                        .is_none_or(|parent| matches!(parent, BookmarkRef::Trunk))
+                {
+                    existing_mr.target_branch().to_owned()
+                } else {
+                    target_branch
+                };
+
                 if existing_mr.target_branch() != target_branch {
                     let update_mr_base_action = UpdateMRBaseAction::builder()
                         .bookmark(bookmark.name().to_owned())
