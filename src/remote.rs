@@ -23,16 +23,19 @@ pub(crate) struct DetectedForge {
 /// What a GitHub remote's separate fetch URL says about the PR target.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum FetchTarget {
-    /// No separate fetch URL, or it names the pushed repository.
+    /// No separate fetch URL, or it names the pushed project on the pushed
+    /// repository's API host.
     Pushed,
-    /// The fetch URL names another repository on the pushed repository's
-    /// API host.
+    /// The fetch URL names another project on the pushed repository's API
+    /// host. With [`ApiHost::Unknown`], that host is one SSH alias.
     Project(String),
-    /// The fetch URL names another repository that is not provably on the
-    /// pushed repository's API host: another host or forge, a different or
-    /// one-sided SSH alias, plain HTTP, or an unparsable URL. One API host
-    /// cannot serve both repositories, so nothing is derived for the pair.
+    /// The fetch URL is a GitHub URL on a different derived API host, so
+    /// even an equal project path names another repository.
     OtherHost,
+    /// The fetch URL is not a recognized GitHub URL, or its API host cannot
+    /// be compared with the push URL's: distinct or one-sided SSH aliases,
+    /// or plain HTTP. Whether it names the pushed repository is unknown.
+    Unverified,
 }
 
 /// What a remote URL says about the forge API host.
@@ -264,9 +267,10 @@ pub(crate) fn parse_remote_list_line(line: &str) -> Option<RemoteListEntry<'_>> 
 /// project instead of failing on remote inspection.
 ///
 /// For GitHub, a separate fetch URL sets [`DetectedForge::fetch_target`]:
-/// another repository on the same API host is the target, and a fetch URL
-/// not provably on that host is [`FetchTarget::OtherHost`]. Two SSH URLs
-/// share a host only when they name the same SSH alias.
+/// another project on the same API host is the target, a different derived
+/// API host is [`FetchTarget::OtherHost`], and a host that cannot be compared
+/// is [`FetchTarget::Unverified`]. Two SSH URLs share a host only when they
+/// name the same SSH alias.
 ///
 /// Remote URLs can embed credentials, so they are never logged.
 pub(crate) fn detect_project(
@@ -332,28 +336,26 @@ pub(crate) fn detect_project(
 }
 
 /// Classify a GitHub remote's fetch URL against the project pushed to
-/// `push_url`. A fetch URL naming the pushed project, ignoring ASCII case,
-/// is the pushed repository whatever its host.
+/// `push_url`. A project path identifies a repository only on one API host.
 fn classify_fetch_url(pushed: &DetectedForge, push_url: &str, fetch_url: &str) -> FetchTarget {
     let Some(fetched) =
         parse_forge_url(fetch_url).filter(|fetched| fetched.forge_type == ForgeType::GitHub)
     else {
-        return FetchTarget::OtherHost;
+        return FetchTarget::Unverified;
     };
-    if fetched.project.eq_ignore_ascii_case(&pushed.project) {
-        return FetchTarget::Pushed;
-    }
     let same_host = match (&pushed.host, &fetched.host) {
         (ApiHost::Derived(push_host), ApiHost::Derived(fetch_host)) => {
             same_api_host(push_host, fetch_host)
         }
-        (ApiHost::Unknown, ApiHost::Unknown) => same_ssh_alias(push_url, fetch_url),
-        _ => false,
+        (ApiHost::Unknown, ApiHost::Unknown) if same_ssh_alias(push_url, fetch_url) => true,
+        _ => return FetchTarget::Unverified,
     };
-    if same_host {
-        FetchTarget::Project(fetched.project)
-    } else {
+    if !same_host {
         FetchTarget::OtherHost
+    } else if fetched.project.eq_ignore_ascii_case(&pushed.project) {
+        FetchTarget::Pushed
+    } else {
+        FetchTarget::Project(fetched.project)
     }
 }
 
@@ -794,8 +796,8 @@ mod tests {
         assert_eq!(detected.fetch_target, FetchTarget::Pushed);
     }
 
-    /// Another repository fetched from another API host, or from
-    /// no provable host, is reported so config loading can fail closed.
+    /// A GitHub fetch URL on a different derived API host is another
+    /// repository, even under the pushed project's path.
     #[test]
     fn detect_cross_host_fetch_url_reports_other_host() {
         for (fetch, push) in [
@@ -808,7 +810,32 @@ mod tests {
                 "https://github.example.com/person/push.git",
             ),
             (
+                "https://github.example.com/person/push.git",
+                "git@github.com:person/push.git",
+            ),
+        ] {
+            let (_temp, repo_path) = create_test_repo();
+            add_remote(&repo_path, "origin", fetch);
+            set_push_url(&repo_path, "origin", push);
+            let jj = Jujutsu::new(&repo_path).expect("jj");
+            let detected =
+                detect_project(&jj, "origin", ForgeType::GitHub).expect("detect push remote");
+            assert_eq!(detected.project, "person/push", "{fetch}");
+            assert_eq!(detected.fetch_target, FetchTarget::OtherHost, "{fetch}");
+        }
+    }
+
+    /// A fetch URL whose API host cannot be compared with the push URL's is
+    /// unverified, not another host, whatever project path it names.
+    #[test]
+    fn detect_incomparable_fetch_url_is_unverified() {
+        for (fetch, push) in [
+            (
                 "git@github.com-work:owner/repo.git",
+                "git@github.com:person/push.git",
+            ),
+            (
+                "git@github-work:person/push.git",
                 "git@github.com:person/push.git",
             ),
             (
@@ -823,6 +850,10 @@ mod tests {
                 "git@github-work:owner/repo.git",
                 "git@github-home:person/push.git",
             ),
+            (
+                "git://github.com/person/push.git",
+                "git@github.com:person/push.git",
+            ),
         ] {
             let (_temp, repo_path) = create_test_repo();
             add_remote(&repo_path, "origin", fetch);
@@ -831,21 +862,8 @@ mod tests {
             let detected =
                 detect_project(&jj, "origin", ForgeType::GitHub).expect("detect push remote");
             assert_eq!(detected.project, "person/push", "{fetch}");
-            assert_eq!(detected.fetch_target, FetchTarget::OtherHost, "{fetch}");
+            assert_eq!(detected.fetch_target, FetchTarget::Unverified, "{fetch}");
         }
-    }
-
-    /// The pushed repository fetched over another transport or host is no
-    /// cross-host pair: only one repository is involved.
-    #[test]
-    fn detect_same_project_on_other_host_is_pushed() {
-        let (_temp, repo_path) = create_test_repo();
-        add_remote(&repo_path, "origin", "git@github-work:owner/repo.git");
-        set_push_url(&repo_path, "origin", "git@github.com:owner/repo.git");
-        let jj = Jujutsu::new(&repo_path).expect("jj");
-        let detected = detect_project(&jj, "origin", ForgeType::GitHub).expect("detect remote");
-        assert_eq!(detected.project, "owner/repo");
-        assert_eq!(detected.fetch_target, FetchTarget::Pushed);
     }
 
     /// Two URLs naming the same SSH alias resolve to one real host, so the

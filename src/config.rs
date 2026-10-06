@@ -1032,11 +1032,8 @@ impl Config {
         })?;
 
         // Clone-explicit values win; derived values supersede global ones, and
-        // empty values derive. A plaintext Enterprise remote needs a
-        // clone-explicit HTTPS host. A derived target also needs the effective
-        // host and source project to match the remote's. A remote that fetches
-        // another repository from another API host needs a clone-explicit
-        // HTTPS host and target, because one API host serves both projects.
+        // empty values derive. A target derives only from a fetch URL provably
+        // on the push URL's API host; otherwise the clone names the host.
         if config.forge == ForgeType::GitHub {
             let clone_keys = clone_layer_keys(jj);
             let clone_keys = clone_keys.as_deref();
@@ -1056,6 +1053,19 @@ impl Config {
                         .github
                         .project
                         .eq_ignore_ascii_case(&detected.project);
+                let needs_explicit = |reason: &str| {
+                    ConfigSnafu {
+                        message: format!(
+                            "the '{}' remote {reason}, so github.host and \
+                             github.targetProject are not derived; set jj-vine.github.host \
+                             to an HTTPS API URL and jj-vine.github.targetProject in the \
+                             repository or workspace config",
+                            config.remote_name
+                        ),
+                    }
+                    .fail()
+                };
+                let explicit_pair = https_host_set && target_set;
                 let derived_target = match (&detected.host, detected.fetch_target) {
                     (ApiHost::Derived(host), FetchTarget::Project(target))
                         if source_matches
@@ -1063,19 +1073,29 @@ impl Config {
                     {
                         Some(target)
                     }
-                    (_, FetchTarget::OtherHost) if !(https_host_set && target_set) => {
-                        return ConfigSnafu {
-                            message: format!(
-                                "the '{}' remote fetches from another repository on a \
-                                 different API host than it pushes to, so github.host and \
-                                 github.targetProject are not derived; set \
-                                 jj-vine.github.host to an HTTPS API URL and \
-                                 jj-vine.github.targetProject in the repository or workspace \
-                                 config",
-                                config.remote_name
-                            ),
-                        }
-                        .fail();
+                    // One SSH alias serves both projects; only a clone-explicit
+                    // HTTPS host says which API host that is.
+                    (ApiHost::Unknown, FetchTarget::Project(target)) if https_host_set => {
+                        source_matches.then_some(target)
+                    }
+                    (ApiHost::Unknown, FetchTarget::Project(_)) if !target_set => {
+                        return needs_explicit(
+                            "fetches another repository through the same SSH alias it \
+                             pushes to, and that alias's API host is unknown",
+                        );
+                    }
+                    (_, FetchTarget::OtherHost) if !explicit_pair => {
+                        return needs_explicit(
+                            "fetches from a repository on a different API host than it \
+                             pushes to",
+                        );
+                    }
+                    (_, FetchTarget::Unverified) if !explicit_pair => {
+                        return needs_explicit(
+                            "has a fetch URL whose GitHub API host cannot be compared with \
+                             its push URL's, so whether it names the pushed repository is \
+                             unknown",
+                        );
                     }
                     _ => None,
                 };
@@ -1608,6 +1628,96 @@ mod tests {
         let config = load_isolated(&repo_path).expect("load config with explicit host");
 
         assert_eq!(config.github.host, "https://api.github.com");
+        assert_eq!(config.github.project, "person/fork");
+        assert_eq!(config.github.target_project(), "owner/repo");
+    }
+
+    /// The pushed project's path fetched from another API host is another
+    /// repository, so loading fails closed instead of treating it as pushed.
+    #[test]
+    fn derive_equal_project_on_other_host_fails_closed() {
+        let (_temp, repo_path) = create_test_repo();
+        seed_github_config(&repo_path);
+        add_git_remote(
+            &repo_path,
+            "origin",
+            "https://github.example.com/person/fork.git",
+        );
+        set_git_push_url(&repo_path, "origin", "git@github.com:person/fork.git");
+
+        let result = load_isolated(&repo_path);
+        let Err(Error::Config { message, .. }) = result else {
+            panic!("Expected Config error, got: {result:?}");
+        };
+
+        assert!(message.contains("different API host"), "{message}");
+    }
+
+    /// A fetch URL whose host cannot be compared fails closed with a
+    /// diagnostic that claims no different host, and loads once the clone
+    /// names an HTTPS host and target.
+    #[test]
+    fn derive_unverified_fetch_url_needs_explicit_host_and_target() {
+        for explicit in [false, true] {
+            let (_temp, repo_path) = create_test_repo();
+            seed_github_config(&repo_path);
+            if explicit {
+                set_repo_config(&repo_path, "jj-vine.github.host", "https://api.github.com");
+                set_repo_config(&repo_path, "jj-vine.github.targetProject", "owner/repo");
+            }
+            add_git_remote(&repo_path, "origin", "git://github.com/owner/repo.git");
+            set_git_push_url(&repo_path, "origin", "git@github.com:person/fork.git");
+
+            let result = load_isolated(&repo_path);
+            if explicit {
+                let config = result.expect("load config with explicit host and target");
+                assert_eq!(config.github.project, "person/fork");
+                assert_eq!(config.github.target_project(), "owner/repo");
+                continue;
+            }
+            let Err(Error::Config { message, .. }) = result else {
+                panic!("Expected Config error, got: {result:?}");
+            };
+            assert!(message.contains("cannot be compared"), "{message}");
+            assert!(!message.contains("different API host"), "{message}");
+        }
+    }
+
+    /// Distinct projects behind one SSH alias never silently target the
+    /// pushed fork: without a clone-explicit host or target, loading fails.
+    #[test]
+    fn derive_same_ssh_alias_without_host_fails_closed() {
+        let (_temp, repo_path) = create_test_repo();
+        seed_github_config(&repo_path);
+        add_git_remote(&repo_path, "origin", "git@github-work:owner/repo.git");
+        set_git_push_url(&repo_path, "origin", "git@github-work:person/fork.git");
+
+        let result = load_isolated(&repo_path);
+        let Err(Error::Config { message, .. }) = result else {
+            panic!("Expected Config error, got: {result:?}");
+        };
+
+        assert!(message.contains("same SSH alias"), "{message}");
+        assert!(!message.contains("github-work"), "{message}");
+    }
+
+    /// A clone-explicit HTTPS host names the alias's API host, so the fetched
+    /// project becomes the target.
+    #[test]
+    fn derive_same_ssh_alias_with_explicit_https_host_sets_target() {
+        let (_temp, repo_path) = create_test_repo();
+        seed_github_config(&repo_path);
+        set_repo_config(
+            &repo_path,
+            "jj-vine.github.host",
+            "https://github.example.com/api/v3",
+        );
+        add_git_remote(&repo_path, "origin", "git@github-work:owner/repo.git");
+        set_git_push_url(&repo_path, "origin", "git@github-work:person/fork.git");
+
+        let config = load_isolated(&repo_path).expect("load config with explicit host");
+
+        assert_eq!(config.github.host, "https://github.example.com/api/v3");
         assert_eq!(config.github.project, "person/fork");
         assert_eq!(config.github.target_project(), "owner/repo");
     }
