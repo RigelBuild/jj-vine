@@ -107,7 +107,7 @@ impl ExecuteAction for PushCreateAction {
                 Ok(ActionResultData::Pushed {
                     bookmarks,
                     created_bookmarks,
-                    pushed: push_argv.is_some(),
+                    pushed: true,
                 })
             } else {
                 Ok(ActionResultData::Pushed {
