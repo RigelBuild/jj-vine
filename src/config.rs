@@ -457,7 +457,19 @@ impl GitHubConfig {
 
     /// Resolve the GitHub token from a literal or a configured command. A
     /// non-empty literal wins and is trimmed; otherwise the command's trimmed
-    /// stdout is used. Errors do not include the command's stderr.
+    /// stdout is used. At most the first 1 MiB of the command's stdout is
+    /// kept; later bytes are read and dropped, so an over-long token is cut
+    /// short and not rejected. The command must finish within 10 seconds.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Config`] if neither `token` nor `tokenCommand` is
+    /// set, the command binary is not found in `PATH`, the command does not
+    /// finish in time, exits with a non-zero status, or prints output that is
+    /// not UTF-8 or is empty after trimming. Returns [`Error::Io`] if the
+    /// command cannot be spawned, contained, or reaped, or (on Unix) if a
+    /// caught cancellation signal cut the run short. No error includes the
+    /// command's stdout or stderr.
     pub fn resolved_token(&self) -> Result<String> {
         self.resolved_token_with_timeout(TOKEN_COMMAND_TIMEOUT)
     }
@@ -1663,6 +1675,67 @@ mod tests {
         assert_eq!(
             config.resolved_token().expect("command token"),
             "command-token"
+        );
+    }
+
+    /// A `tokenCommand` argv that prints `token` to stdout and nothing else,
+    /// with a shell present on each platform.
+    fn printing_token_command(token: &str) -> Vec<String> {
+        if cfg!(windows) {
+            vec![
+                "powershell".to_owned(),
+                "-NoProfile".to_owned(),
+                "-NonInteractive".to_owned(),
+                "-Command".to_owned(),
+                format!("[Console]::Out.Write('{token}')"),
+            ]
+        } else {
+            vec![
+                "sh".to_owned(),
+                "-c".to_owned(),
+                "printf '%s' \"$1\"".to_owned(),
+                "_".to_owned(),
+                token.to_owned(),
+            ]
+        }
+    }
+
+    /// The `tokenCommand` key in a real jj config file reaches
+    /// `resolved_token` through `Config::load`, with no literal token set.
+    #[test]
+    fn config_load_token_command_resolves_token() {
+        const TOKEN: &str = "fixture-command-token";
+
+        let (temp, repo_path) = create_test_repo();
+        let mut github = toml::Table::new();
+        github.insert("project".to_owned(), "owner/repo".into());
+        github.insert(
+            "tokenCommand".to_owned(),
+            printing_token_command(TOKEN).into(),
+        );
+        let mut jj_vine = toml::Table::new();
+        jj_vine.insert("forge".to_owned(), "github".into());
+        jj_vine.insert("github".to_owned(), github.into());
+        let mut root = toml::Table::new();
+        root.insert("jj-vine".to_owned(), jj_vine.into());
+        // Overwrite the isolated user config, so the key is read from TOML as
+        // a user writes it, not built in code.
+        std::fs::write(
+            temp.path().join(ISOLATED_TEST_CONFIG),
+            toml::to_string(&root).expect("the fixture table must serialize"),
+        )
+        .expect("Failed to write isolated config");
+
+        let config = load_isolated(&repo_path).expect("Failed to load config");
+
+        assert!(
+            config.github.token.is_empty(),
+            "no literal token is configured, so the command must supply it"
+        );
+        assert_eq!(config.github.token_command, printing_token_command(TOKEN));
+        assert_eq!(
+            config.github.resolved_token().expect("command token"),
+            TOKEN
         );
     }
 }

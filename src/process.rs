@@ -204,7 +204,9 @@ mod platform {
     const CANCEL_SIGNALS: [libc::c_int; 3] = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP];
 
     /// The first cancellation signal caught while a run was active, or 0.
-    /// The last run to end takes it and raises it again.
+    /// The last run to end takes it and raises it again. The first run of a
+    /// new active period clears it, so a value recorded while no run was
+    /// active cannot cancel that run.
     static CANCEL_SIGNAL: AtomicI32 = AtomicI32::new(0);
 
     /// Active runs and the signals whose handler this module installed.
@@ -218,8 +220,8 @@ mod platform {
         installed: [bool; 3],
     }
 
-    /// Records the signal only; the run loop does the cleanup. A store to an
-    /// atomic is async-signal-safe.
+    /// Records the signal only; the run loop does the cleanup. A lock-free
+    /// atomic operation is async-signal-safe.
     extern "C" fn on_cancel_signal(signal: libc::c_int) {
         CANCEL_SIGNAL
             .compare_exchange(0_i32, signal, Ordering::AcqRel, Ordering::Acquire)
@@ -235,6 +237,13 @@ mod platform {
         pub(super) fn enter() -> Self {
             let mut state = CANCEL_STATE.lock().unwrap_or_else(PoisonError::into_inner);
             if state.active == 0 {
+                // A new active period starts here. A signal caught in the
+                // last period was taken when it ended, under this lock, so
+                // any value left now was recorded while no run was active:
+                // for example by other code that kept `on_cancel_signal` and
+                // calls it from its own handler. Clear it before the handlers
+                // are installed, so a signal caught after an install is kept.
+                CANCEL_SIGNAL.store(0_i32, Ordering::Release);
                 for (signal, installed) in CANCEL_SIGNALS.iter().zip(state.installed.iter_mut()) {
                     *installed = install_if_default(*signal);
                 }
@@ -257,7 +266,8 @@ mod platform {
                 }
             }
             // Take the signal, so a handler that returns does not cancel
-            // later runs. A signal recorded after this swap stays recorded.
+            // later runs. A value recorded after this swap comes from no run;
+            // the next active period clears it on entry.
             let pending = CANCEL_SIGNAL.swap(0_i32, Ordering::AcqRel);
             if pending != 0_i32 {
                 // Only a signal this module caught is recorded. Its
@@ -834,22 +844,48 @@ mod tests {
         );
     }
 
-    /// Poll `kill -0 <pid>` until the process is gone or `within` elapses.
+    /// Poll until process `pid` is gone or `within` elapses. A zombie counts
+    /// as gone: a killed descendant is reparented, and its new parent may
+    /// reap it late or never, but a zombie runs no code and holds no pipe.
+    /// `kill -0` succeeds on a zombie, so it cannot be the probe.
     fn process_gone_within(pid: &str, within: core::time::Duration) -> bool {
         let start = std::time::Instant::now();
         while start.elapsed() < within {
-            let alive = std::process::Command::new("kill")
-                .args(["-0", pid])
-                .stderr(std::process::Stdio::null())
-                .status()
-                .expect("kill -0 must run")
-                .success();
-            if !alive {
+            if !is_running(pid) {
                 return true;
             }
             std::thread::sleep(core::time::Duration::from_millis(20));
         }
         false
+    }
+
+    /// Whether `pid` names a process that exists and is not a zombie. Field 3
+    /// of `/proc/<pid>/stat` is the state; it follows the last `)`, because
+    /// the command name in field 2 may hold spaces or parentheses.
+    #[cfg(target_os = "linux")]
+    fn is_running(pid: &str) -> bool {
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            return false;
+        };
+        let state = stat
+            .rsplit_once(')')
+            .and_then(|(_, rest)| rest.trim_start().chars().next());
+        !matches!(state, None | Some('Z' | 'X'))
+    }
+
+    /// Whether `pid` names a process that exists and is not a zombie. `ps`
+    /// prints nothing for a missing pid, and a state that starts with `Z`
+    /// for a zombie.
+    #[cfg(not(target_os = "linux"))]
+    fn is_running(pid: &str) -> bool {
+        let output = std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", pid])
+            .stderr(std::process::Stdio::null())
+            .output()
+            .expect("ps must run");
+        let state = String::from_utf8_lossy(&output.stdout);
+        let state = state.trim();
+        !state.is_empty() && !state.starts_with('Z')
     }
 
     #[test]
@@ -1207,6 +1243,92 @@ mod tests {
         command.args(["-c", "sleep 0.2; printf after-signal"]);
         let output = output_with_timeout(command, core::time::Duration::from_secs(20))
             .expect("a consumed signal must not cancel a later run")
+            .expect("the helper exits before the deadline");
+        assert_eq!(output.stdout, b"after-signal");
+    }
+
+    #[test]
+    fn output_with_timeout_ignores_signal_recorded_while_inactive() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut parent = spawn_isolated("isolated_inactive_signal_child", dir.path());
+        let start = std::time::Instant::now();
+        let status = loop {
+            if let Some(status) = parent.try_wait().expect("try_wait must not error") {
+                break status;
+            }
+            if start.elapsed() > core::time::Duration::from_secs(30) {
+                parent.kill().ok();
+                parent.wait().ok();
+                panic!("the child-mode test did not finish");
+            }
+            std::thread::sleep(core::time::Duration::from_millis(20));
+        };
+        assert!(
+            status.success(),
+            "a signal recorded while no run was active must not cancel the next \
+             run; child-mode test failed with {status:?}"
+        );
+    }
+
+    /// The handler `chaining_handler` forwards to, as a disposition value.
+    static CHAINED: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+    /// An embedder handler that keeps the handler it replaced and forwards
+    /// every signal to it, as a signal-chaining library does.
+    extern "C" fn chaining_handler(signal: libc::c_int) {
+        let previous = CHAINED.load(core::sync::atomic::Ordering::Acquire);
+        if previous != 0 {
+            // SAFETY: `CHAINED` holds only a value read back from
+            // `sigaction` while the module's handler was installed, which is
+            // an `extern "C" fn(c_int)` cast to `sighandler_t`.
+            let previous = unsafe {
+                core::mem::transmute::<libc::sighandler_t, extern "C" fn(libc::c_int)>(previous)
+            };
+            previous(signal);
+        }
+    }
+
+    /// Child mode for
+    /// `output_with_timeout_ignores_signal_recorded_while_inactive`: replace
+    /// the module's SIGTERM handler with one that chains to it, end the
+    /// active period, take SIGTERM while no run is active, then run a helper.
+    #[test]
+    #[ignore = "child mode; run only by output_with_timeout_ignores_signal_recorded_while_inactive"]
+    fn isolated_inactive_signal_child() {
+        if std::env::var_os(CHILD_DIR_ENV).is_none() {
+            return;
+        }
+        assert!(
+            platform::set_disposition(libc::SIGTERM, libc::SIG_DFL),
+            "SIGTERM must start at the default disposition"
+        );
+        let guard = platform::CancelGuard::enter();
+        let ours = platform::current_disposition(libc::SIGTERM)
+            .expect("the SIGTERM disposition must be readable");
+        assert_ne!(
+            ours,
+            libc::SIG_DFL,
+            "the guard must catch SIGTERM, or this test proves nothing"
+        );
+        CHAINED.store(ours, core::sync::atomic::Ordering::Release);
+        let handler: extern "C" fn(libc::c_int) = chaining_handler;
+        assert!(
+            platform::set_disposition(libc::SIGTERM, handler as libc::sighandler_t),
+            "the chaining handler must install"
+        );
+        // The module's handler is no longer installed, so it is kept, and no
+        // signal is pending, so nothing is raised.
+        drop(guard);
+        // No run is active. The chained call records SIGTERM all the same.
+        // SAFETY: raise has no memory-safety preconditions. It signals this
+        // thread, so the handler runs before it returns.
+        assert_eq!(unsafe { libc::raise(libc::SIGTERM) }, 0_i32);
+        // The helper outlives the first exit check, so a stale signal would
+        // cancel it.
+        let mut command = std::process::Command::new("sh");
+        command.args(["-c", "sleep 0.2; printf after-signal"]);
+        let output = output_with_timeout(command, core::time::Duration::from_secs(20))
+            .expect("a signal recorded while inactive must not cancel a new run")
             .expect("the helper exits before the deadline");
         assert_eq!(output.stdout, b"after-signal");
     }
