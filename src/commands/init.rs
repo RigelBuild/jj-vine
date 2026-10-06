@@ -195,17 +195,30 @@ fn set_config(repo_path: impl Into<PathBuf>, key: &str, value: impl AsRef<str>) 
     Ok(())
 }
 
+fn parse_init_remote_line(line: &str) -> Result<(&str, &str)> {
+    remote::parse_remote_list_line(line)
+        .map(|entry| (entry.name, entry.fetch_url))
+        .ok_or_else(|| {
+            let name = line.split_whitespace().next().filter(|name| {
+                !name.is_empty()
+                    && name
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || b"._-/".contains(&byte))
+            });
+            make_whatever!(
+                "Failed to parse remote line for {}",
+                name.unwrap_or("<unknown>")
+            )
+        })
+}
+
 #[expect(clippy::single_call_fn, reason = "seems fine")]
 fn detect_remotes(jj: &Jujutsu) -> Result<Option<Remotes>> {
     let output = jj.exec_redacted(["git", "remote", "list"])?;
     let remotes: HashMap<_, _> = output
         .stdout
         .lines()
-        .map(|line| {
-            remote::parse_remote_list_line(line)
-                .map(|entry| (entry.name, entry.fetch_url))
-                .ok_or_else(|| make_whatever!("Failed to parse remote line"))
-        })
+        .map(parse_init_remote_line)
         .collect::<Result<_>>()?;
 
     let origin = remotes.get("origin");
@@ -393,6 +406,19 @@ mod tests {
             !logs.contains("safe-fixture-token"),
             "remote userinfo leaked: {logs}"
         );
+    }
+
+    #[test]
+    fn malformed_remote_line_names_only_safe_remote_identifier() {
+        let error = parse_init_remote_line("origin <no URL> (push: git@github.com:o/r.git) extra")
+            .expect_err("extra field must fail");
+        assert!(error.to_string().contains("origin"));
+        assert!(!error.to_string().contains("github.com"));
+
+        let error = parse_init_remote_line("user:fixture-token@evil <no URL> extra")
+            .expect_err("malformed credential-shaped name must fail");
+        assert!(error.to_string().contains("<unknown>"));
+        assert!(!error.to_string().contains("fixture-token"));
     }
 
     #[test]
