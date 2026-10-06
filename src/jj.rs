@@ -523,13 +523,15 @@ impl Jujutsu {
     /// A copy of this instance whose jj commands must all finish by
     /// `deadline`, for a phase with a fixed wall-clock budget.
     ///
-    /// Each command run through [`Jujutsu::exec`] gets the time left until
-    /// `deadline`. A command that would start at or after the deadline is not
-    /// spawned, and one still running at the deadline is killed together with
-    /// its process group (Unix) or job (Windows) and reaped. Both cases return
-    /// a [`Error::JjCommand`] error. A bounded command runs non-interactively
-    /// with stdin from the null device, and each output stream is capped (see
-    /// [`crate::process`]). [`Jujutsu::exec_argv`] is not bounded.
+    /// Every command run through [`Jujutsu::exec`] must finish by the same
+    /// `deadline`; the time to spawn each command counts against it, so a
+    /// run of commands cannot extend the phase. A command that would start
+    /// at or after the deadline is not spawned, and one still running at the
+    /// deadline is killed together with its process group (Unix) or job
+    /// (Windows) and reaped. Both cases return a [`Error::JjCommand`] error.
+    /// A bounded command runs non-interactively with stdin from the null
+    /// device, and each output stream is capped (see [`crate::process`]).
+    /// [`Jujutsu::exec_argv`] is not bounded.
     #[must_use]
     pub(crate) fn with_deadline(&self, deadline: Instant) -> Self {
         Self {
@@ -564,11 +566,7 @@ impl Jujutsu {
                     }
                     .build()
                 };
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                if remaining.is_zero() {
-                    return Err(deadline_passed());
-                }
-                crate::process::output_with_timeout(command, remaining)?
+                crate::process::output_by_deadline(command, deadline)?
                     .ok_or_else(deadline_passed)?
             }
         };
@@ -1483,13 +1481,21 @@ mod tests {
     #[cfg(unix)]
     fn write_hung_jj(bin: &Path) -> std::io::Result<()> {
         std::fs::create_dir_all(bin)?;
-        write_executable(
-            &bin.join("jj"),
-            "#!/bin/sh\necho $$ > \"$JJ_VINE_TEST_PID_DIR/jj.pid\"\n\
-             sh -c 'echo $$ > \"$JJ_VINE_TEST_PID_DIR/descendant.pid\"; exec sleep 30' &\n\
-             exec sleep 30\n",
-        )
+        write_executable(&bin.join("jj"), HUNG_JJ_SCRIPT)
     }
+
+    /// The fake `jj` body for [`write_hung_jj`]. Opening the FIFO for reading
+    /// blocks until the descendant opens it for writing, which it does only
+    /// after its pid file is complete. The fake writes its own pid only after
+    /// that, so `jj.pid` existing proves the whole tree was running.
+    #[cfg(unix)]
+    const HUNG_JJ_SCRIPT: &str = "#!/bin/sh\n\
+        dir=\"$JJ_VINE_TEST_PID_DIR\"\n\
+        mkfifo \"$dir/ready\"\n\
+        sh -c 'echo $$ > \"$1/descendant.pid\"; echo > \"$1/ready\"; exec sleep 30' _ \"$dir\" &\n\
+        read _ < \"$dir/ready\"\n\
+        echo $$ > \"$dir/jj.pid\"\n\
+        exec sleep 30\n";
 
     /// `PATH` with `dir` searched first, so a fake `jj` there shadows the
     /// real one while `sh` and `sleep` still resolve.
