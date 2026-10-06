@@ -421,7 +421,9 @@ pub struct GitHubConfig {
     /// A command whose stdout supplies the GitHub token, as a full argv whose
     /// first element is the binary. Used only when `token` is empty. The
     /// trimmed stdout becomes the token. A non-zero exit or empty output is an
-    /// error.
+    /// error. The command must be non-interactive: it gets null stdin and, on
+    /// Unix, no controlling terminal. Every process it starts is killed when
+    /// it exits.
     #[serde(default)]
     pub token_command: Vec<String>,
 }
@@ -1551,6 +1553,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn resolved_token_runs_command_and_trims() {
         let config = GitHubConfig {
@@ -1563,6 +1566,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn resolved_token_rejects_nonzero_exit_without_stderr() {
         let config = GitHubConfig {
@@ -1586,6 +1590,7 @@ mod tests {
         assert!(!message.contains("SAFE_ARG_B"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn resolved_token_rejects_non_utf8_output() {
         let config = GitHubConfig {
@@ -1603,6 +1608,7 @@ mod tests {
         assert!(message.contains("non-UTF-8"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn resolved_token_rejects_empty_output() {
         let config = GitHubConfig {
@@ -1629,6 +1635,7 @@ mod tests {
         assert!(message.contains("not found in PATH"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn resolved_token_timeout_kills_helper() {
         let config = GitHubConfig {
@@ -1644,6 +1651,7 @@ mod tests {
         assert!(start.elapsed() < core::time::Duration::from_secs(5));
     }
 
+    #[cfg(unix)]
     #[test]
     fn resolved_token_whitespace_literal_uses_command() {
         let config = GitHubConfig {

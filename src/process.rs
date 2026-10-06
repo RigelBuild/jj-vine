@@ -1,12 +1,33 @@
 //! Shared bounded-subprocess helpers.
 //!
-//! `output_with_timeout` runs a child process to completion under a wall-clock
-//! deadline and captures stdout/stderr into capped buffers, so a helper that
-//! fills a pipe cannot deadlock. The child runs in its own process group on
-//! Unix or job object on Windows. When the child exits or overruns, remaining
-//! members of that group or job are killed. A Unix descendant that leaves its
-//! process group can outlive the call, but cannot keep a pipe reader blocked:
+//! `output_with_timeout` runs a non-interactive child process to completion
+//! under a wall-clock deadline and captures stdout/stderr into capped buffers,
+//! so a helper that fills a pipe cannot deadlock. The child gets null stdin.
+//!
+//! Containment: the child runs in a new session and process group on Unix, or
+//! in a job object on Windows. When the child exits (with any status),
+//! overruns, or the call is cancelled, every process still in that group or
+//! job is killed. A helper therefore cannot leave a background agent or daemon
+//! running.
+//!
+//! Interactivity: on Unix the new session has no controlling terminal, so a
+//! helper that opens `/dev/tty` to prompt gets an error at once and fails. It
+//! is not stopped by job control and then reported as a timeout.
+//!
+//! Cancellation: on Unix, SIGINT, SIGTERM, and SIGHUP are caught while a child
+//! runs, because the child's own session does not get the terminal's signals.
+//! A signal is caught only if its disposition is the default on entry. The
+//! handler kills every running tree; after the last run ends, the default
+//! disposition is restored and the signal is raised again, so the process ends
+//! as it would have with no child running. On Windows, a console Ctrl-C
+//! reaches the child directly, and the job's kill-on-close limit kills the
+//! tree when this process exits.
+//!
+//! Limits: a Unix descendant that leaves the process group on purpose
+//! (`setsid`/`setpgid`) is not killed, but cannot keep a pipe reader blocked:
 //! output is drained for at most [`DRAIN_GRACE`] and then the pipe is closed.
+//! On Windows, a pipe read that cannot be cancelled within [`DRAIN_GRACE`] is
+//! left to a detached reader thread, so the call itself stays bounded.
 
 use core::time::Duration;
 use std::process::{Command, Stdio};
@@ -26,15 +47,20 @@ const POLL_INTERVAL: Duration = Duration::from_millis(10);
 /// if the child overran the deadline.
 ///
 /// The child and descendants still in its process group or job are killed when
-/// the child exits or overruns, and the child is reaped. A Unix descendant can
-/// leave its process group; its lifetime is not controlled, but inherited
-/// output pipes are drained for at most [`DRAIN_GRACE`] and then closed. No
-/// thread or pipe handle outlives the call.
+/// the child exits or overruns, and the child is reaped. See the module docs
+/// for the containment, interactivity, and cancellation policy.
 ///
-/// The child gets its own process group on Unix (via `process_group`) and is
-/// created suspended inside a job object on Windows (via `creation_flags`).
-/// A caller-set `process_group` or `creation_flags` on `command` is
-/// overridden.
+/// On Unix the child starts a new session (via `pre_exec`), so a caller must
+/// not set `process_group` on `command`: spawning would then fail. On Windows
+/// the child is created suspended inside a job object (via `creation_flags`),
+/// which overrides a caller-set `creation_flags`.
+///
+/// # Errors
+///
+/// Returns an error if the child cannot be spawned, contained, or reaped. On
+/// Unix, a run cut short by a caught cancellation signal returns an
+/// [`std::io::ErrorKind::Interrupted`] error; the signal ends the process when
+/// the last concurrent run returns.
 pub(crate) fn output_with_timeout(
     mut command: Command,
     timeout: Duration,
@@ -56,20 +82,38 @@ fn append_capped(buf: &mut Vec<u8>, bytes: &[u8]) {
 
 #[cfg(unix)]
 mod platform {
-    use core::time::Duration;
+    use core::{
+        sync::atomic::{AtomicI32, Ordering},
+        time::Duration,
+    };
     use std::{
         io,
         os::{fd::AsRawFd, unix::process::CommandExt as _},
         process::{Child, ChildStderr, ChildStdout, Command, ExitStatus, Output},
+        sync::{Mutex, PoisonError},
         time::Instant,
     };
 
     use super::{DRAIN_GRACE, POLL_INTERVAL, append_capped};
 
     pub(super) fn run(mut command: Command, timeout: Duration) -> io::Result<Option<Output>> {
-        // A new process group: its id is the child's pid, and every
-        // descendant stays in it unless it calls setsid/setpgid on purpose.
-        command.process_group(0);
+        // A new session: the child leads a new process group, whose id is its
+        // pid, and has no controlling terminal. Every descendant stays in the
+        // group unless it calls setsid/setpgid on purpose. std applies a
+        // caller-set `process_group` before this hook, which would make the
+        // child a group leader and setsid fail, so callers must not set one.
+        // SAFETY: the hook runs in the forked child before exec and calls only
+        // setsid, which is async-signal-safe.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() == -1_i32 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        // Declared before `tree`, so it drops after the tree is reaped.
+        let _cancel = CancelGuard::enter();
         let mut child = command.spawn()?;
         let Ok(pgid) = libc::pid_t::try_from(child.id()) else {
             child.kill().ok();
@@ -92,6 +136,13 @@ mod platform {
         let status = loop {
             if tree.has_exited()? {
                 break tree.kill_and_reap()?;
+            }
+            if CANCEL_SIGNAL.load(Ordering::Acquire) != 0_i32 {
+                tree.kill_and_reap()?;
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "cancelled by signal",
+                ));
             }
             let elapsed = start.elapsed();
             if elapsed >= timeout {
@@ -116,6 +167,103 @@ mod platform {
             stdout: streams.out,
             stderr: streams.err,
         }))
+    }
+
+    /// Signals that cancel a run. The child's new session does not get them
+    /// from the terminal, so this process must stop the tree itself.
+    const CANCEL_SIGNALS: [libc::c_int; 3] = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP];
+
+    /// The first cancellation signal caught while a run was active, or 0.
+    /// Never reset: the process ends when the last run returns.
+    static CANCEL_SIGNAL: AtomicI32 = AtomicI32::new(0);
+
+    /// Active runs and the signals whose handler this module installed.
+    static CANCEL_STATE: Mutex<CancelState> = Mutex::new(CancelState {
+        active: 0,
+        installed: [false; 3],
+    });
+
+    struct CancelState {
+        active: usize,
+        installed: [bool; 3],
+    }
+
+    /// Records the signal only; the run loop does the cleanup. A store to an
+    /// atomic is async-signal-safe.
+    extern "C" fn on_cancel_signal(signal: libc::c_int) {
+        CANCEL_SIGNAL
+            .compare_exchange(0_i32, signal, Ordering::AcqRel, Ordering::Acquire)
+            .ok();
+    }
+
+    /// Catches the cancellation signals while at least one run is active.
+    /// Only a signal whose disposition is the default on entry is caught, so
+    /// an ignored signal or a handler installed by other code is left alone.
+    struct CancelGuard;
+
+    impl CancelGuard {
+        fn enter() -> Self {
+            let mut state = CANCEL_STATE.lock().unwrap_or_else(PoisonError::into_inner);
+            if state.active == 0 {
+                for (signal, installed) in CANCEL_SIGNALS.iter().zip(state.installed.iter_mut()) {
+                    *installed = install_if_default(*signal);
+                }
+            }
+            state.active = state.active.saturating_add(1);
+            Self
+        }
+    }
+
+    impl Drop for CancelGuard {
+        fn drop(&mut self) {
+            let mut state = CANCEL_STATE.lock().unwrap_or_else(PoisonError::into_inner);
+            state.active = state.active.saturating_sub(1);
+            if state.active != 0 {
+                return;
+            }
+            for (signal, installed) in CANCEL_SIGNALS.iter().zip(state.installed.iter_mut()) {
+                if core::mem::take(installed) {
+                    set_disposition(*signal, libc::SIG_DFL);
+                }
+            }
+            let pending = CANCEL_SIGNAL.load(Ordering::Acquire);
+            if pending != 0_i32 {
+                // Only a signal this module caught is recorded, and its
+                // disposition is the default again, so this ends the process
+                // as the original signal would have.
+                // SAFETY: raise has no memory-safety preconditions.
+                unsafe { libc::raise(pending) };
+            }
+        }
+    }
+
+    /// Install `on_cancel_signal` for `signal` if its disposition is the
+    /// default. Returns whether it was installed.
+    fn install_if_default(signal: libc::c_int) -> bool {
+        // SAFETY: an all-zero `sigaction` is a valid value; it is plain data.
+        let mut old: libc::sigaction = unsafe { core::mem::zeroed() };
+        // SAFETY: a null new action only queries; `old` is writable.
+        if unsafe { libc::sigaction(signal, core::ptr::null(), &raw mut old) } == -1_i32 {
+            return false;
+        }
+        if old.sa_sigaction != libc::SIG_DFL {
+            return false;
+        }
+        let handler: extern "C" fn(libc::c_int) = on_cancel_signal;
+        set_disposition(signal, handler as libc::sighandler_t)
+    }
+
+    /// Set `signal`'s handler with an empty mask and `SA_RESTART`. Returns
+    /// whether the call succeeded.
+    fn set_disposition(signal: libc::c_int, handler: libc::sighandler_t) -> bool {
+        // SAFETY: an all-zero `sigaction` is a valid value; it is plain data.
+        let mut action: libc::sigaction = unsafe { core::mem::zeroed() };
+        action.sa_sigaction = handler;
+        action.sa_flags = libc::SA_RESTART;
+        // SAFETY: `action.sa_mask` is a writable sigset_t.
+        unsafe { libc::sigemptyset(&raw mut action.sa_mask) };
+        // SAFETY: `action` is a valid sigaction; a null old action is allowed.
+        unsafe { libc::sigaction(signal, &raw const action, core::ptr::null_mut()) == 0_i32 }
     }
 
     /// The child and its process group. Dropping an unreaped tree kills the
@@ -345,24 +493,25 @@ mod platform {
                 Ok(Some(status)) => break status,
                 Ok(None) => {}
                 Err(error) => {
-                    terminate(&job);
-                    child.wait().ok();
+                    terminate(&job, &mut child).ok();
                     finish(stdout, stderr, Duration::ZERO);
                     return Err(error);
                 }
             }
             if start.elapsed() >= timeout {
-                terminate(&job);
-                let reaped = child.wait();
+                let killed = terminate(&job, &mut child);
                 finish(stdout, stderr, Duration::ZERO);
-                reaped?;
+                killed?;
                 return Ok(None);
             }
             std::thread::sleep(POLL_INTERVAL);
         };
 
-        terminate(&job);
+        // The child has exited; its descendants are killed even though the
+        // child succeeded, so no helper process outlives the call.
+        let killed = terminate(&job, &mut child);
         let (stdout, stderr) = finish(stdout, stderr, DRAIN_GRACE);
+        killed?;
         Ok(Some(Output {
             status,
             stdout,
@@ -370,11 +519,22 @@ mod platform {
         }))
     }
 
-    /// Kill every process still in the job. On failure the job handle's
-    /// `KILL_ON_JOB_CLOSE` kills them when `job` drops.
-    fn terminate(job: &OwnedHandle) {
+    /// Kill every process still in the job, then wait for the child. If the
+    /// job cannot be terminated, the direct child is killed instead. The
+    /// child is waited for only once a kill succeeded, so the wait cannot
+    /// block on a live child. On error, the remaining processes die when
+    /// `job` drops, by its `KILL_ON_JOB_CLOSE` limit.
+    fn terminate(job: &OwnedHandle, child: &mut Child) -> io::Result<()> {
         // SAFETY: `job` is a live job handle.
-        unsafe { TerminateJobObject(job.as_raw_handle(), 1) };
+        if unsafe { TerminateJobObject(job.as_raw_handle(), 1) } == 0_i32 {
+            let error = io::Error::last_os_error();
+            // `Child::kill` succeeds for a child that has already exited.
+            child.kill()?;
+            child.wait()?;
+            return Err(error);
+        }
+        child.wait()?;
+        Ok(())
     }
 
     /// Put the suspended child in a new kill-on-close job, then resume it.
@@ -451,8 +611,9 @@ mod platform {
         Err(io::Error::other("suspended child has no thread to resume"))
     }
 
-    /// A pipe drained on its own thread. The thread hands the pipe back on
-    /// join, so `raw` stays a live handle until `finish` joins the thread.
+    /// A pipe drained on its own thread. The thread owns the pipe until it
+    /// ends, so `raw` stays a live handle while the thread runs. `raw` is used
+    /// only before the thread is joined or detached.
     struct Reader<R> {
         raw: RawHandle,
         stop: Arc<AtomicBool>,
@@ -483,20 +644,27 @@ mod platform {
             Self { raw, stop, thread }
         }
 
-        /// Make the thread finish. After `stop` is set, the thread can start
-        /// at most one more read, and `CancelIoEx` is repeated until that read
-        /// is cancelled, so this loop ends.
-        fn stop(&self) {
+        /// Ask the thread to finish by `deadline`. After `stop` is set, the
+        /// thread can start at most one more read, and `CancelIoEx` is
+        /// repeated until that read is cancelled or the deadline passes.
+        fn stop(&self, deadline: Instant) {
             self.stop.store(true, Ordering::Release);
-            while !self.thread.is_finished() {
-                // SAFETY: the thread owns the pipe until it is joined, so
-                // `raw` is live. A null OVERLAPPED cancels all its I/O.
+            while !self.thread.is_finished() && Instant::now() < deadline {
+                // SAFETY: the thread is still running, so it still owns the
+                // pipe and `raw` is live. A null OVERLAPPED cancels all its
+                // I/O.
                 unsafe { CancelIoEx(self.raw, core::ptr::null()) };
                 std::thread::sleep(Duration::from_millis(1));
             }
         }
 
+        /// Join a finished thread and return its bytes. A thread still
+        /// running is detached and its bytes are dropped: it owns and closes
+        /// the pipe when its read ends, and `raw` is not used again.
         fn join(self) -> Vec<u8> {
+            if !self.thread.is_finished() {
+                return Vec::new();
+            }
             self.thread
                 .join()
                 .map(|(_pipe, buf)| buf)
@@ -504,8 +672,9 @@ mod platform {
         }
     }
 
-    /// Wait up to `grace` for both readers to reach EOF, cancel any still
-    /// blocked, and join both. Returns (stdout, stderr).
+    /// Wait up to `grace` for both readers to reach EOF, then cancel any
+    /// still blocked for at most another [`DRAIN_GRACE`], and join both.
+    /// Returns (stdout, stderr). Bounded: never waits past both limits.
     fn finish<O, E>(stdout: Reader<O>, stderr: Reader<E>, grace: Duration) -> (Vec<u8>, Vec<u8>)
     where
         O: io::Read + std::os::windows::io::AsRawHandle + Send + 'static,
@@ -517,15 +686,38 @@ mod platform {
         {
             std::thread::sleep(Duration::from_millis(5));
         }
-        stdout.stop();
-        stderr.stop();
+        let deadline = Instant::now() + DRAIN_GRACE;
+        stdout.stop(deadline);
+        stderr.stop(deadline);
         (stdout.join(), stderr.join())
     }
 }
 
-#[cfg(test)]
+// These tests drive `sh` and POSIX utilities, so they run on Unix only.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn output_with_timeout_runs_child_in_new_session() {
+        let mut command = std::process::Command::new("sh");
+        // Field 6 of /proc/<pid>/stat is the session id; `cut` inherits it.
+        command.args(["-c", "echo $$; cut -d' ' -f6 /proc/self/stat"]);
+        let output = output_with_timeout(command, core::time::Duration::from_secs(10))
+            .expect("spawn/poll must not error")
+            .expect("a fast command must return output, not time out");
+        assert!(output.status.success());
+        let stdout = String::from_utf8(output.stdout).expect("utf-8 output");
+        let mut lines = stdout.lines();
+        let pid = lines.next().expect("child pid");
+        let session = lines.next().expect("session id");
+        assert_eq!(
+            pid, session,
+            "the child must lead a new session with no controlling terminal, so a \
+             terminal prompt fails at once instead of stopping until the timeout"
+        );
+    }
 
     #[test]
     fn output_with_timeout_kills_overrunning_child() {
@@ -587,7 +779,6 @@ mod tests {
     }
 
     /// Poll `kill -0 <pid>` until the process is gone or `within` elapses.
-    #[cfg(unix)]
     fn process_gone_within(pid: &str, within: core::time::Duration) -> bool {
         let start = std::time::Instant::now();
         while start.elapsed() < within {
@@ -605,7 +796,6 @@ mod tests {
         false
     }
 
-    #[cfg(unix)]
     #[test]
     fn output_with_timeout_terminates_descendant_holding_pipe_after_success() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -638,7 +828,6 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[test]
     fn output_with_timeout_terminates_descendant_on_timeout() {
         let dir = tempfile::tempdir().expect("tempdir");

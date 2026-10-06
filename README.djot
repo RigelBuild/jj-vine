@@ -288,7 +288,8 @@ Required when `jj-vine.forge` is set to `github`.
 | `github.host` | GitHub API URL (defaults to `https://api.github.com` for GitHub.com, or `https://github.example.com/api/v3` for Enterprise) | String | Yes | - |
 | `github.project` | Repository where branches are pushed in `owner/repo` format | String | Yes | - |
 | `github.token` | Personal access token. Classic PATs need the `repo` scope. Fine-grained PATs need **Contents: Read and Write** and **Pull requests: Read and Write**. Repos in an organization also need **Members: Read**. | String | Yes, unless `github.tokenCommand` is set | - |
-| `github.tokenCommand` | Full command argv (array of strings) whose trimmed stdout supplies the token when `github.token` is empty. Runs non-interactively with stdin redirected to the null device; it must not require terminal input. A non-zero exit, empty output, or a run longer than 10 seconds is an error. | String[] | Yes, if `github.token` is empty | - |
+| `github.targetProject` | Target repository for pull requests (e.g., `upstream-owner/repo`). Use if you are using a fork. | String | No | (same as `github.project`) |
+| `github.tokenCommand` | Full command argv (array of strings) whose trimmed stdout supplies the token when `github.token` is empty. The command must be non-interactive: it gets stdin from the null device and, on Unix, runs in a new session with no controlling terminal, so a prompt for terminal input fails. When the command exits or is cancelled, every process it started is killed, so it cannot leave a background agent or daemon running. A non-zero exit, empty output, or a run longer than 10 seconds is an error. | String[] | Yes, if `github.token` is empty | - |
 
 #### Forgejo/Codeberg/Gitea{#forgejo-codeberg-gitea}
 

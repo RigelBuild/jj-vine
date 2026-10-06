@@ -432,7 +432,8 @@ pub struct Jujutsu {
     /// The directory to run all jj commands from.
     cwd: PathBuf,
 
-    /// Config file supplied to spawned commands for test isolation.
+    /// Value of `JJ_CONFIG` for spawned commands, for test isolation. An
+    /// empty path disables all user and system config files.
     config_override: Option<PathBuf>,
 
     /// The default branch name.
@@ -442,13 +443,6 @@ pub struct Jujutsu {
 #[cfg(test)]
 pub(crate) const ISOLATED_TEST_CONFIG: &str = "isolated-user-config.toml";
 
-#[cfg(test)]
-static ISOLATED_TEST_CONFIG_PATH: std::sync::LazyLock<PathBuf> = std::sync::LazyLock::new(|| {
-    let dir = tempfile::tempdir().expect("Failed to create isolated test config dir");
-    let config_path = dir.path().join("config.toml");
-    std::fs::write(&config_path, "").expect("Failed to write isolated test config");
-    dir.keep()
-});
 impl Jujutsu {
     /// Create a new Jujutsu instance for the given working directory.
     pub fn new(cwd: impl Into<PathBuf>) -> Result<Self> {
@@ -456,7 +450,7 @@ impl Jujutsu {
         Ok(Self {
             cwd: cwd.into(),
             #[cfg(test)]
-            config_override: Some(ISOLATED_TEST_CONFIG_PATH.clone()),
+            config_override: Some(PathBuf::new()),
             #[cfg(not(test))]
             config_override: None,
             default_branch: OnceCell::new(),
