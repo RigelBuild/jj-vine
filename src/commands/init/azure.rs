@@ -31,23 +31,27 @@ pub fn init(repo_path: impl Into<PathBuf>, remotes: Option<&Remotes>) -> Result<
         _ => None,
     };
 
-    let mut default_host = existing_host
-        .or_else(|| forge.and_then(|f| f.host.derived().map(str::to_owned)))
-        .unwrap_or_else(|| "https://dev.azure.com".to_owned());
+    let host_requires_https = forge.is_some_and(|forge| forge.host.derived().is_none());
+    let default_host = azure_default_host(existing_host, forge);
 
-    // Handle ssh.dev.azure.com
-    if default_host.starts_with("https://ssh.") {
-        default_host = default_host.replace("https://ssh.", "https://");
-    }
-
-    let azure_host = Input::<String>::new()
-        .with_prompt(format!(
-            "{} {}",
-            "Azure DevOps API URL (e.g. https://dev.azure.com)".bold(),
-            "jj-vine.azure.host".dimmed()
-        ))
-        .default(default_host)
-        .interact_text()?;
+    let azure_host_input = Input::<String>::new().with_prompt(format!(
+        "{} {}",
+        "Azure DevOps API URL (e.g. https://dev.azure.com)".bold(),
+        "jj-vine.azure.host".dimmed()
+    ));
+    let azure_host_input = if host_requires_https {
+        let input = if let Some(default_host) = default_host {
+            azure_host_input.default(default_host)
+        } else {
+            azure_host_input
+        };
+        input.validate_with(|host: &String| validate_https_host(host))
+    } else if let Some(default_host) = default_host {
+        azure_host_input.default(default_host)
+    } else {
+        azure_host_input
+    };
+    let azure_host = azure_host_input.interact_text()?;
 
     let default_vssps_host = existing_vssps_host.unwrap_or_else(|| {
         format!(
@@ -185,4 +189,64 @@ pub fn init(repo_path: impl Into<PathBuf>, remotes: Option<&Remotes>) -> Result<
     set_config(&repo_path, "jj-vine.azure.token", &azure_token)?;
 
     Ok(())
+}
+fn azure_default_host(
+    existing_host: Option<String>,
+    forge: Option<&crate::remote::DetectedForge>,
+) -> Option<String> {
+    if forge.is_some_and(|forge| forge.host.derived().is_none()) {
+        return existing_host.filter(|host| host.starts_with("https://"));
+    }
+
+    existing_host
+        .or_else(|| forge.and_then(|forge| forge.host.derived().map(str::to_owned)))
+        .or_else(|| forge.is_none().then(|| "https://dev.azure.com".to_owned()))
+        .map(|host| match host.strip_prefix("https://ssh.") {
+            Some(rest) => format!("https://{rest}"),
+            None => host,
+        })
+}
+
+fn validate_https_host(host: &str) -> core::result::Result<(), &'static str> {
+    if host.starts_with("https://") {
+        Ok(())
+    } else {
+        Err("Enter an HTTPS Azure DevOps API URL")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ssh_alias_requires_an_explicit_https_host() {
+        let forge = crate::remote::parse_forge_url("git@azure-work:organization/project/repo")
+            .expect("Azure DevOps SSH alias");
+
+        assert_eq!(forge.host.derived(), None);
+        assert_eq!(azure_default_host(None, Some(&forge)), None);
+        assert!(validate_https_host("http://dev.azure.com").is_err());
+        assert!(validate_https_host("https://ado.example.com").is_ok());
+    }
+
+    #[test]
+    fn no_remote_keeps_the_dev_azure_default() {
+        assert_eq!(
+            azure_default_host(None, None).as_deref(),
+            Some("https://dev.azure.com")
+        );
+    }
+
+    #[test]
+    fn azure_ssh_endpoint_keeps_its_existing_web_host_mapping() {
+        let forge =
+            crate::remote::parse_forge_url("git@ssh.dev.azure.com:v3/organization/project/repo")
+                .expect("Azure DevOps SSH URL");
+
+        assert_eq!(
+            azure_default_host(None, Some(&forge)).as_deref(),
+            Some("https://dev.azure.com")
+        );
+    }
 }
