@@ -8,7 +8,7 @@ use serde::{Deserialize, de::Visitor};
 use crate::{
     error::{ConfigSnafu, Error, Result},
     jj::Jujutsu,
-    remote::{ApiHost, same_api_host},
+    remote::{ApiHost, FetchTarget, same_api_host},
 };
 
 /// Forge type (GitLab, GitHub, or Forgejo).
@@ -994,7 +994,7 @@ fn clone_layer_nonempty(clone_keys: Option<&[String]>, key: &str, value: &str) -
 
 /// Whether a configured API host uses HTTPS, so the token never travels
 /// over plaintext.
-fn is_https_host(host: &str) -> bool {
+pub(crate) fn is_https_host(host: &str) -> bool {
     host.get(..8)
         .is_some_and(|scheme| scheme.eq_ignore_ascii_case("https://"))
 }
@@ -1034,7 +1034,9 @@ impl Config {
         // Clone-explicit values win; derived values supersede global ones, and
         // empty values derive. A plaintext Enterprise remote needs a
         // clone-explicit HTTPS host. A derived target also needs the effective
-        // host and source project to match the remote's.
+        // host and source project to match the remote's. A remote that fetches
+        // another repository from another API host needs a clone-explicit
+        // HTTPS host and target, because one API host serves both projects.
         if config.forge == ForgeType::GitHub {
             let clone_keys = clone_layer_keys(jj);
             let clone_keys = clone_keys.as_deref();
@@ -1054,14 +1056,28 @@ impl Config {
                         .github
                         .project
                         .eq_ignore_ascii_case(&detected.project);
-                let derived_target = match &detected.host {
-                    ApiHost::Derived(host)
+                let derived_target = match (&detected.host, detected.fetch_target) {
+                    (ApiHost::Derived(host), FetchTarget::Project(target))
                         if source_matches
                             && (!host_set || same_api_host(&config.github.host, host)) =>
                     {
-                        detected.target_project
+                        Some(target)
                     }
-                    ApiHost::Derived(_) | ApiHost::Unknown | ApiHost::PlaintextEnterprise => None,
+                    (_, FetchTarget::OtherHost) if !(https_host_set && target_set) => {
+                        return ConfigSnafu {
+                            message: format!(
+                                "the '{}' remote fetches from another repository on a \
+                                 different API host than it pushes to, so github.host and \
+                                 github.targetProject are not derived; set \
+                                 jj-vine.github.host to an HTTPS API URL and \
+                                 jj-vine.github.targetProject in the repository or workspace \
+                                 config",
+                                config.remote_name
+                            ),
+                        }
+                        .fail();
+                    }
+                    _ => None,
                 };
                 if !project_set {
                     config.github.project = detected.project;
@@ -1538,11 +1554,50 @@ mod tests {
         assert!(config.github.target_project.is_empty());
     }
 
-    /// RIG-4691 is open: a fetch URL on another API host derives no target.
+    /// RIG-4691: a remote that fetches another repository from another API
+    /// host fails to load rather than route the token for both projects to
+    /// one derived host. The error names no URL.
     #[test]
-    fn derive_target_project_skipped_for_cross_host_fetch_url() {
+    fn derive_cross_host_fetch_url_fails_closed() {
+        for (repo_host, repo_target) in [
+            (None, None),
+            (Some("https://api.github.com"), None),
+            (None, Some("owner/repo")),
+            (Some("http://github.example.com/api/v3"), Some("owner/repo")),
+        ] {
+            let (_temp, repo_path) = create_test_repo();
+            seed_github_config(&repo_path);
+            if let Some(host) = repo_host {
+                set_repo_config(&repo_path, "jj-vine.github.host", host);
+            }
+            if let Some(target) = repo_target {
+                set_repo_config(&repo_path, "jj-vine.github.targetProject", target);
+            }
+            add_git_remote(
+                &repo_path,
+                "origin",
+                "https://github.example.com/owner/repo.git",
+            );
+            set_git_push_url(&repo_path, "origin", "git@github.com:person/fork.git");
+
+            let result = load_isolated(&repo_path);
+            let Err(Error::Config { message, .. }) = result else {
+                panic!("Expected Config error for {repo_host:?}/{repo_target:?}, got: {result:?}");
+            };
+
+            assert!(message.contains("different API host"), "{message}");
+            assert!(!message.contains("github.example.com"), "{message}");
+        }
+    }
+
+    /// A cross-host pair loads once the clone names an HTTPS host and target
+    /// explicitly; nothing is derived for the pair beyond the push project.
+    #[test]
+    fn derive_cross_host_fetch_url_uses_explicit_https_host_and_target() {
         let (_temp, repo_path) = create_test_repo();
         seed_github_config(&repo_path);
+        set_repo_config(&repo_path, "jj-vine.github.host", "https://api.github.com");
+        set_repo_config(&repo_path, "jj-vine.github.targetProject", "owner/repo");
         add_git_remote(
             &repo_path,
             "origin",
@@ -1550,11 +1605,35 @@ mod tests {
         );
         set_git_push_url(&repo_path, "origin", "git@github.com:person/fork.git");
 
-        let config = load_isolated(&repo_path).expect("load config from cross-host remote");
+        let config = load_isolated(&repo_path).expect("load config with explicit host");
 
-        assert_eq!(config.github.project, "person/fork");
         assert_eq!(config.github.host, "https://api.github.com");
-        assert!(config.github.target_project.is_empty());
+        assert_eq!(config.github.project, "person/fork");
+        assert_eq!(config.github.target_project(), "owner/repo");
+    }
+
+    /// Distinct fetch and push repositories on one Enterprise host derive
+    /// both projects and that host.
+    #[test]
+    fn derive_same_enterprise_host_fetch_and_push() {
+        let (_temp, repo_path) = create_test_repo();
+        seed_github_config(&repo_path);
+        add_git_remote(
+            &repo_path,
+            "origin",
+            "https://github.example.com/owner/repo.git",
+        );
+        set_git_push_url(
+            &repo_path,
+            "origin",
+            "git@github.example.com:person/fork.git",
+        );
+
+        let config = load_isolated(&repo_path).expect("load config from same-host remote");
+
+        assert_eq!(config.github.host, "https://github.example.com/api/v3");
+        assert_eq!(config.github.project, "person/fork");
+        assert_eq!(config.github.target_project(), "owner/repo");
     }
 
     /// An explicit host naming the derived endpoint with other hostname case,
@@ -1580,9 +1659,10 @@ mod tests {
         }
     }
 
-    /// A plain HTTP host is a different endpoint from the derived HTTPS API.
+    /// RIG-4701: a clone-explicit plain HTTP host is rejected even with an
+    /// HTTPS remote, so the token never travels over plaintext.
     #[test]
-    fn derive_target_project_skipped_for_http_explicit_host() {
+    fn explicit_http_host_is_rejected() {
         let (_temp, repo_path) = create_test_repo();
         seed_github_config(&repo_path);
         set_repo_config(
@@ -1601,10 +1681,33 @@ mod tests {
             "git@github.example.com:person/fork.git",
         );
 
-        let config = load_isolated(&repo_path).expect("load config with HTTP host");
+        let result = load_isolated(&repo_path);
+        let Err(Error::Config { message, .. }) = result else {
+            panic!("Expected Config error, got: {result:?}");
+        };
 
-        assert_eq!(config.github.project, "person/fork");
-        assert!(config.github.target_project.is_empty());
+        assert!(message.contains("https:// API URL"), "{message}");
+    }
+
+    /// RIG-4701: a global plain HTTP host is rejected when nothing derives
+    /// a replacement.
+    #[test]
+    fn global_http_host_is_rejected_without_remote() {
+        let (temp, repo_path) = create_test_repo();
+        seed_github_config(&repo_path);
+        set_repo_config(&repo_path, "jj-vine.github.project", "owner/repo");
+        std::fs::write(
+            temp.path().join(ISOLATED_TEST_CONFIG),
+            "[jj-vine.github]\nhost = \"http://github.example.com/api/v3\"\n",
+        )
+        .expect("write user-level GitHub host");
+
+        let result = load_isolated(&repo_path);
+        let Err(Error::Config { message, .. }) = result else {
+            panic!("Expected Config error, got: {result:?}");
+        };
+
+        assert!(message.contains("https:// API URL"), "{message}");
     }
 
     /// A clone-explicit source project other than the push URL's keeps the

@@ -345,6 +345,16 @@ pub fn validate_config(config: &Config) -> Result<()> {
         }
         .build());
     }
+    // The token goes to this host, so plaintext HTTP is never accepted,
+    // including a clone-explicit value.
+    if !crate::config::is_https_host(&config.github.host) {
+        return Err(ConfigSnafu {
+            message: "github.host must be an https:// API URL; the API token is not sent \
+                      over plain HTTP"
+                .to_owned(),
+        }
+        .build());
+    }
     if config.github.token.trim().is_empty() && config.github.token_command.is_empty() {
         return Err(ConfigSnafu {
             message: "github.token or github.tokenCommand is required when forge is github"
@@ -364,6 +374,7 @@ mod token_config_tests {
         let config = Config::builder()
             .forge(crate::config::ForgeType::GitHub)
             .github(crate::config::GitHubConfig {
+                host: "https://api.github.com".to_owned(),
                 project: "owner/repo".to_owned(),
                 token_command: vec!["printf".to_owned(), "token".to_owned()],
                 ..crate::config::GitHubConfig::default()
@@ -378,6 +389,7 @@ mod token_config_tests {
         let config = Config::builder()
             .forge(crate::config::ForgeType::GitHub)
             .github(crate::config::GitHubConfig {
+                host: "https://api.github.com".to_owned(),
                 project: "owner/repo".to_owned(),
                 token: " \n\t".to_owned(),
                 ..crate::config::GitHubConfig::default()
@@ -386,6 +398,41 @@ mod token_config_tests {
 
         let error = validate_config(&config).expect_err("whitespace token is absent");
         assert!(error.to_string().contains("token or github.tokenCommand"));
+    }
+
+    /// RIG-4701: the token is never sent to a plain HTTP API host, whatever
+    /// layer configured it. An empty host has no scheme and is rejected too.
+    #[test]
+    fn validate_config_rejects_non_https_host() {
+        for host in ["http://github.example.com/api/v3", "HTTP://api.github.com", ""] {
+            let config = Config::builder()
+                .forge(crate::config::ForgeType::GitHub)
+                .github(crate::config::GitHubConfig {
+                    host: host.to_owned(),
+                    project: "owner/repo".to_owned(),
+                    token: "token".to_owned(),
+                    ..crate::config::GitHubConfig::default()
+                })
+                .build();
+
+            let error = validate_config(&config).expect_err("non-HTTPS host is rejected");
+            assert!(error.to_string().contains("https:// API URL"), "{host}: {error}");
+        }
+    }
+
+    #[test]
+    fn validate_config_accepts_https_host_any_case() {
+        let config = Config::builder()
+            .forge(crate::config::ForgeType::GitHub)
+            .github(crate::config::GitHubConfig {
+                host: "HTTPS://github.example.com/api/v3".to_owned(),
+                project: "owner/repo".to_owned(),
+                token: "token".to_owned(),
+                ..crate::config::GitHubConfig::default()
+            })
+            .build();
+
+        assert!(validate_config(&config).is_ok());
     }
 }
 
