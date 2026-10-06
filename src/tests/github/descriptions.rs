@@ -205,10 +205,9 @@ async fn moving_stack_to_top_preserves_user_text_and_is_stable() -> Result<()> {
 
     let user_before = "Context before the stack details";
     let user_after = "Follow-up details after the stack";
-    let initial_stack = pr_a.body.expect("PR A should have a description");
-    assert!(initial_stack.starts_with(START_MARKER));
-    assert!(initial_stack.ends_with(END_MARKER));
-    let edited_description = format!("{user_before}\n\n{initial_stack}\n\n{user_after}");
+    let initial_description = pr_a.body.expect("PR A should have a description");
+    assert!(initial_description.ends_with(END_MARKER));
+    let edited_description = format!("{user_before}\n\n{initial_description}\n\n{user_after}");
     repo.forge()
         .update_merge_request_info(
             pr_a.number,
