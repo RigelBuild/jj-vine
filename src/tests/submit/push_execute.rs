@@ -12,8 +12,8 @@ use tokio::{
 };
 
 use crate::{
-    bookmark::{BookmarkGraph, BookmarkOrPending},
-    config::{Config, DescriptionConfig, ForgeType, GitLabConfig, RepoPushConfig, TitleConfig},
+    bookmark::{BookmarkGraph, BookmarkOrPending, change_id_to_temp_bookmark_name},
+    config::{Config, ForgeType, GitLabConfig, RepoPushConfig, TitleConfig},
     forge::{
         Forge as _,
         ForgeImpl,
@@ -467,45 +467,55 @@ async fn mr_description(forge: &ForgeImpl, source_branch: &str) -> String {
         .to_owned()
 }
 
+fn mock_gitlab_forge(api: &GitLabApiMock) -> ForgeImpl {
+    ForgeImpl::GitLab(
+        GitLabForge::new(
+            &api.base_url,
+            "group/project",
+            "group/project",
+            "test-token",
+            None::<&str>,
+            false,
+            true,
+        )
+        .expect("create mock GitLab forge"),
+    )
+}
+
+fn gitlab_disabled_push_config() -> Config {
+    Config::builder()
+        .forge(ForgeType::GitLab)
+        .push(RepoPushConfig::Enabled(false))
+        .gitlab(GitLabConfig {
+            create_merge_request_dependencies: true,
+            ..GitLabConfig::default()
+        })
+        .title(TitleConfig {
+            sync_single_revision: false,
+            sync_multiple_revisions: false,
+            ..TitleConfig::default()
+        })
+        .build()
+}
+
+const MR_API: &str = "/api/v4/projects/group%2Fproject/merge_requests";
+
 #[tokio::test]
-async fn disabled_push_skips_dependent_mr_actions_after_skipped_parent() {
+async fn disabled_push_syncs_child_dependencies_after_skipped_parent_base_update() {
     for dry_run in [false, true] {
         let (repo, pending_change_id) = pending_parent_synced_stacks();
-        let api = GitLabApiMock::start().await;
-        let forge = ForgeImpl::GitLab(
-            GitLabForge::new(
-                &api.base_url,
-                "group/project",
-                "group/project",
-                "test-token",
-                None::<&str>,
-                false,
-                true,
-            )
-            .expect("create mock GitLab forge"),
-        );
-        let config = Config::builder()
-            .forge(ForgeType::GitLab)
-            .push(RepoPushConfig::Enabled(false))
-            .gitlab(GitLabConfig {
-                create_merge_request_dependencies: true,
-                ..GitLabConfig::default()
-            })
-            .description(DescriptionConfig {
-                enabled: false,
-                ..DescriptionConfig::default()
-            })
-            .title(TitleConfig {
-                sync_single_revision: false,
-                sync_multiple_revisions: false,
-                ..TitleConfig::default()
-            })
-            .build();
+        let api = GitLabApiMock::start(vec![
+            gitlab_mr(1, 101, "p", "main"),
+            gitlab_mr(2, 102, "c", "p"),
+            gitlab_mr(3, 103, "synced", "old-base"),
+        ])
+        .await;
+        let forge = mock_gitlab_forge(&api);
 
         let (result, output) = plan_and_execute_with_config(
             &repo,
             &forge,
-            &config,
+            &gitlab_disabled_push_config(),
             dry_run,
             &format!("{pending_change_id} | c | synced"),
             &HashSet::from([pending_change_id]),
@@ -521,28 +531,155 @@ async fn disabled_push_skips_dependent_mr_actions_after_skipped_parent() {
             "{skip_verb} because pushing is disabled: Update base of MR 1 for p"
         )));
         assert!(output.contains(&format!(
-            "{skip_verb} because pushing is disabled: Sync dependent merge requests for c"
+            "{skip_verb} because pushing is disabled: Regenerate stack in description of MR for c"
         )));
         assert!(
-            requests.iter().all(|request| !request.contains("/blocks")),
-            "dependent-MR sync must not call the GitLab dependency API: {requests:?}"
+            !output.contains("because pushing is disabled: Sync dependent merge requests for c"),
+            "a skipped update of an existing parent MR does not skip the child's sync: {output}"
         );
         assert!(
             !requests
                 .iter()
-                .any(|request| request.contains("/merge_requests/1 ")),
+                .any(|request| request.line.starts_with(&format!("PUT {MR_API}/1 "))),
             "the skipped parent base update must not call the GitLab update API: {requests:?}"
         );
 
         if dry_run {
             assert!(output.contains("Would update MR !3 base for synced to main"));
-            assert!(requests.iter().all(|request| !request.starts_with("PUT ")));
+            assert!(
+                requests
+                    .iter()
+                    .all(|request| request.line.starts_with("GET ")),
+                "dry-run only reads: {requests:?}"
+            );
         } else {
-            assert!(requests.iter().any(|request| {
-                request.contains("PUT /api/v4/projects/group%2Fproject/merge_requests/3 ")
-            }));
+            assert!(
+                requests
+                    .iter()
+                    .any(|request| request.line.starts_with(&format!("PUT {MR_API}/3 ")))
+            );
+            assert_eq!(
+                dependency_posts(&requests),
+                vec![(2, json!({ "blocking_merge_request_id": 101 }))],
+                "c's MR is made dependent on p's existing MR: {requests:?}"
+            );
         }
     }
+}
+
+#[tokio::test]
+async fn disabled_push_syncs_pushed_chain_dependencies_below_pending_descendant() {
+    for dry_run in [false, true] {
+        let (repo, pending_change_id) = pushed_chain_with_pending_descendant();
+        let pending_name = change_id_to_temp_bookmark_name(&pending_change_id);
+        let api = GitLabApiMock::start(vec![
+            gitlab_mr(1, 101, "a", "main"),
+            gitlab_mr(2, 102, "b", "a"),
+        ])
+        .await;
+        let forge = mock_gitlab_forge(&api);
+
+        let (result, output) = plan_and_execute_with_config(
+            &repo,
+            &forge,
+            &gitlab_disabled_push_config(),
+            dry_run,
+            &pending_change_id,
+            &HashSet::from([pending_change_id.clone()]),
+        )
+        .await;
+        let requests = api.requests();
+        api.stop().await;
+
+        let skip_verb = if dry_run { "Would skip" } else { "Skipping" };
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert!(result.bookmarks_pushed.is_empty());
+        for skipped in [
+            format!("Create MR for {pending_name}"),
+            "Regenerate stack in description of MR for a".to_owned(),
+            "Regenerate stack in description of MR for b".to_owned(),
+            format!("Sync dependent merge requests for {pending_name}"),
+        ] {
+            assert!(
+                output.contains(&format!(
+                    "{skip_verb} because pushing is disabled: {skipped}"
+                )),
+                "expected skipped action {skipped:?}: {output}"
+            );
+        }
+        assert!(
+            !output.contains("because pushing is disabled: Sync dependent merge requests for b"),
+            "b and its direct parent a both have MRs, so b's sync runs: {output}"
+        );
+        assert!(
+            !requests
+                .iter()
+                .any(|request| request.line.starts_with("PUT ")),
+            "no MR description or base is updated: {requests:?}"
+        );
+
+        if dry_run {
+            assert!(
+                requests
+                    .iter()
+                    .all(|request| request.line.starts_with("GET ")),
+                "dry-run only reads: {requests:?}"
+            );
+        } else {
+            assert_eq!(
+                dependency_posts(&requests),
+                vec![(2, json!({ "blocking_merge_request_id": 101 }))],
+                "b's MR is made dependent on a's MR: {requests:?}"
+            );
+            assert!(
+                result
+                    .merge_requests
+                    .iter()
+                    .any(|update| update.bookmark == "b"),
+                "b reports its dependency sync: {:?}",
+                result.merge_requests
+            );
+        }
+    }
+}
+
+/// MR IIDs and JSON bodies of dependency-creation requests, in request order.
+fn dependency_posts(requests: &[MockRequest]) -> Vec<(u64, Value)> {
+    requests
+        .iter()
+        .filter_map(|request| {
+            let path = request.line.strip_prefix(&format!("POST {MR_API}/"))?;
+            let iid = path.split_once("/blocks ")?.0.parse().ok()?;
+            let body = serde_json::from_str(&request.body).expect("dependency body is JSON");
+            Some((iid, body))
+        })
+        .collect()
+}
+
+/// A pushed stack `main -> a -> b` with an unbookmarked change on `b`, as
+/// `submit --create` would bookmark. Returns the repository and the pending
+/// change ID.
+fn pushed_chain_with_pending_descendant() -> (TestRepo<TestRepo<()>>, String) {
+    let repo = TestRepo::with_local_remote();
+
+    repo.create_change("a.txt", "a", "A commit")
+        .create_and_push_bookmark("a");
+    repo.new_on("a")
+        .create_change("b.txt", "b", "B commit")
+        .create_and_push_bookmark("b");
+    repo.new_on("b")
+        .create_change("pending.txt", "pending", "Pending commit");
+    let pending_change_id = repo
+        .jj
+        .log("@")
+        .expect("read pending change")
+        .into_iter()
+        .next()
+        .expect("pending change exists")
+        .change_id;
+    repo.new_on("main");
+
+    (repo, pending_change_id)
 }
 
 fn pending_parent_synced_stacks() -> (TestRepo<TestRepo<()>>, String) {
@@ -573,15 +710,24 @@ fn pending_parent_synced_stacks() -> (TestRepo<TestRepo<()>>, String) {
     (repo, pending_change_id)
 }
 
+/// A request received by [`GitLabApiMock`].
+#[derive(Debug, Clone)]
+struct MockRequest {
+    /// The HTTP request line, such as `GET /path HTTP/1.1`.
+    line: String,
+    body: String,
+}
+
+/// A minimal GitLab API serving a fixed set of merge requests.
 struct GitLabApiMock {
     base_url: String,
-    requests: Arc<Mutex<Vec<String>>>,
+    requests: Arc<Mutex<Vec<MockRequest>>>,
     shutdown: Option<oneshot::Sender<()>>,
     server: tokio::task::JoinHandle<()>,
 }
 
 impl GitLabApiMock {
-    async fn start() -> Self {
+    async fn start(merge_requests: Vec<Value>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind mock GitLab API");
@@ -599,48 +745,12 @@ impl GitLabApiMock {
                     break;
                 };
 
-                let mut request = Vec::new();
-                let mut buffer = [0_u8; 1024];
-                loop {
-                    let read = stream
-                        .read(&mut buffer)
-                        .await
-                        .expect("read mock GitLab request");
-                    if read == 0 {
-                        break;
-                    }
-                    request.extend_from_slice(&buffer[..read]);
-                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
-                        break;
-                    }
-                }
-
-                let request_line = String::from_utf8(request)
-                    .expect("request is UTF-8")
-                    .lines()
-                    .next()
-                    .expect("HTTP request line")
-                    .to_owned();
+                let request = read_mock_request(&mut stream).await;
+                let body = gitlab_mock_response(&merge_requests, &request).to_string();
                 server_requests
                     .lock()
                     .expect("lock request log")
-                    .push(request_line.clone());
-                let body = match request_line.split_whitespace().nth(1).unwrap_or_default() {
-                    "/api/v4/projects/group%2Fproject/merge_requests?source_branch=p&state=opened" => {
-                        json!([gitlab_mr(1, 101, "p", "main")])
-                    }
-                    "/api/v4/projects/group%2Fproject/merge_requests?source_branch=c&state=opened" => {
-                        json!([gitlab_mr(2, 102, "c", "p")])
-                    }
-                    "/api/v4/projects/group%2Fproject/merge_requests?source_branch=synced&state=opened" => {
-                        json!([gitlab_mr(3, 103, "synced", "old-base")])
-                    }
-                    "/api/v4/projects/group%2Fproject/merge_requests/3" => {
-                        json!(gitlab_mr(3, 103, "synced", "main"))
-                    }
-                    _ => json!([]),
-                }
-                .to_string();
+                    .push(request);
                 let response = format!(
                     "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
                     body.len(),
@@ -661,7 +771,7 @@ impl GitLabApiMock {
         }
     }
 
-    fn requests(&self) -> Vec<String> {
+    fn requests(&self) -> Vec<MockRequest> {
         self.requests.lock().expect("lock request log").clone()
     }
 
@@ -670,6 +780,109 @@ impl GitLabApiMock {
             shutdown.send(()).expect("signal mock GitLab shutdown");
         }
         self.server.await.expect("stop mock GitLab API");
+    }
+}
+
+/// Reads one HTTP request, including the whole body named by
+/// `Content-Length`, so the client never sees the socket close mid-send.
+async fn read_mock_request(stream: &mut tokio::net::TcpStream) -> MockRequest {
+    let mut request = Vec::new();
+    let mut buffer = [0_u8; 1024];
+    let header_end = loop {
+        if let Some(end) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+            break end + 4;
+        }
+        let read = stream
+            .read(&mut buffer)
+            .await
+            .expect("read mock GitLab request");
+        assert_ne!(read, 0, "connection closed before request headers ended");
+        request.extend_from_slice(&buffer[..read]);
+    };
+
+    let headers = String::from_utf8(request[..header_end].to_vec()).expect("headers are UTF-8");
+    let content_length = headers
+        .lines()
+        .filter_map(|line| line.split_once(':'))
+        .find(|(name, _)| name.trim().eq_ignore_ascii_case("content-length"))
+        .map_or(0, |(_, value)| {
+            value
+                .trim()
+                .parse::<usize>()
+                .expect("numeric Content-Length")
+        });
+    while request.len() < header_end + content_length {
+        let read = stream
+            .read(&mut buffer)
+            .await
+            .expect("read mock GitLab request body");
+        assert_ne!(read, 0, "connection closed before request body ended");
+        request.extend_from_slice(&buffer[..read]);
+    }
+
+    MockRequest {
+        line: headers
+            .lines()
+            .next()
+            .expect("HTTP request line")
+            .to_owned(),
+        body: String::from_utf8(request[header_end..header_end + content_length].to_vec())
+            .expect("body is UTF-8"),
+    }
+}
+
+/// The mock GitLab response for `request` over `merge_requests`.
+fn gitlab_mock_response(merge_requests: &[Value], request: &MockRequest) -> Value {
+    let mut parts = request.line.split_whitespace();
+    let method = parts.next().unwrap_or_default();
+    let target = parts.next().unwrap_or_default();
+    let Some(rest) = target.strip_prefix(MR_API) else {
+        return json!([]);
+    };
+    let by_iid = |iid: &str| {
+        merge_requests
+            .iter()
+            .find(|mr| mr["iid"].to_string() == iid)
+            .cloned()
+            .unwrap_or_else(|| panic!("unknown mock MR {iid}"))
+    };
+
+    if let Some(query) = rest.strip_prefix('?') {
+        let source = query
+            .split('&')
+            .find_map(|pair| pair.strip_prefix("source_branch="))
+            .unwrap_or_default();
+        return Value::Array(
+            merge_requests
+                .iter()
+                .filter(|mr| mr["source_branch"] == source)
+                .cloned()
+                .collect(),
+        );
+    }
+
+    let path = rest.trim_start_matches('/');
+    match (method, path.split_once('/')) {
+        ("GET", Some((_, "blocks"))) => json!([]),
+        ("POST", Some((_, "blocks"))) => {
+            let body: Value = serde_json::from_str(&request.body).expect("JSON request body");
+            let blocking = merge_requests
+                .iter()
+                .find(|mr| mr["id"] == body["blocking_merge_request_id"])
+                .cloned()
+                .expect("blocking MR exists");
+            json!({ "id": 900, "blocking_merge_request": blocking, "project_id": 1 })
+        }
+        ("GET", None) => by_iid(path),
+        ("PUT", None) => {
+            let mut mr = by_iid(path);
+            let body: Value = serde_json::from_str(&request.body).expect("JSON request body");
+            if let (Some(mr), Some(body)) = (mr.as_object_mut(), body.as_object()) {
+                mr.extend(body.clone());
+            }
+            mr
+        }
+        _ => json!([]),
     }
 }
 

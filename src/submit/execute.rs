@@ -115,8 +115,8 @@ pub enum ActionResultData {
     MRCreated(MRUpdate),
     MRUpdated(MRUpdate),
     DryRun,
-    /// Skipped because pushing is disabled or a required merge request action
-    /// was skipped.
+    /// Skipped because pushing is disabled or a merge request it needs was
+    /// not created.
     Skipped,
 }
 
@@ -268,7 +268,7 @@ pub async fn execute(mut ctx: RootExecuteContext<'_>) -> Result<SubmissionResult
     let mut merge_requests = Vec::new();
     let mut errors = Vec::new();
     let mut bookmarks_pushed = Vec::new();
-    let mut skipped_mr_bookmarks = HashSet::new();
+    let mut absent_mr_bookmarks = HashSet::new();
     let mut current_results: Vec<ActionResult> = Vec::new();
 
     let mut bookmark_graph =
@@ -315,7 +315,7 @@ pub async fn execute(mut ctx: RootExecuteContext<'_>) -> Result<SubmissionResult
             }
 
             if targets_unpushed_bookmark(action, &unpushed_targets, &bookmark_graph)
-                || action_depends_on_skipped_mr(action, &skipped_mr_bookmarks, &bookmark_graph)
+                || action_needs_absent_mr(action, &absent_mr_bookmarks, &bookmark_graph)
             {
                 debug!(
                     "Skipping action {} because pushing is disabled",
@@ -330,8 +330,10 @@ pub async fn execute(mut ctx: RootExecuteContext<'_>) -> Result<SubmissionResult
                     },
                     action.plan_text()
                 ));
-                if let Some(bookmark) = merge_request_action_bookmark(action) {
-                    skipped_mr_bookmarks.insert(bookmark);
+                // Only a skipped creation leaves an MR missing. A skipped
+                // update leaves the existing MR in place.
+                if let Action::CreateMR(create_mr) = action {
+                    absent_mr_bookmarks.insert(create_mr.bookmark.to_string());
                 }
                 current_results.push(ActionResult {
                     id: action.id(),
@@ -416,54 +418,47 @@ pub async fn execute(mut ctx: RootExecuteContext<'_>) -> Result<SubmissionResult
     })
 }
 
-/// Whether a merge request action depends on an MR action skipped because
-/// pushing is disabled.
-fn action_depends_on_skipped_mr(
+/// Whether a merge request action needs an MR whose creation was skipped
+/// because pushing is disabled. Actions run in topological order, so checking
+/// direct parents also covers MRs missing further down the stack.
+fn action_needs_absent_mr(
     action: &Action,
-    skipped_mr_bookmarks: &HashSet<String>,
+    absent_mr_bookmarks: &HashSet<String>,
     bookmark_graph: &BookmarkGraph<'_>,
 ) -> bool {
-    if skipped_mr_bookmarks.is_empty() {
+    if absent_mr_bookmarks.is_empty() {
         return false;
     }
 
-    let depends_on_skipped_bookmark = |name: &str| {
-        bookmark_graph
-            .find_bookmark_in_components(name)
-            .is_some_and(|bookmark| {
-                skipped_mr_bookmarks
-                    .iter()
-                    .any(|skipped| bookmark.find(skipped).is_some())
-            })
-    };
+    let is_absent = |name: &str| absent_mr_bookmarks.contains(name);
 
     match action {
         Action::Push(_) | Action::PushCreate(_) => false,
-        Action::CreateMR(create_mr) => {
-            depends_on_skipped_bookmark(&create_mr.bookmark.to_string())
-                || depends_on_skipped_bookmark(&create_mr.target_branch)
-        }
-        Action::UpdateMRBase(update_mr_base) => {
-            depends_on_skipped_bookmark(&update_mr_base.bookmark)
-                || depends_on_skipped_bookmark(&update_mr_base.new_target_branch)
-        }
-        Action::UpdateMRTitleDescription(update) => {
-            depends_on_skipped_bookmark(&update.bookmark.to_string())
-        }
+        Action::CreateMR(create_mr) => is_absent(&create_mr.target_branch),
+        Action::UpdateMRBase(update_mr_base) => is_absent(&update_mr_base.new_target_branch),
+        // The stack description lists every MR in the component.
+        Action::UpdateMRTitleDescription(update) => bookmark_graph
+            .component_containing(&update.bookmark.to_string())
+            .is_some_and(|component| {
+                component
+                    .all_bookmarks()
+                    .iter()
+                    .any(|bookmark| is_absent(bookmark.name()))
+            }),
+        // Dependency sync reads its own MR and the MRs of its direct parents.
         Action::SyncDependentMergeRequests(sync) => {
-            depends_on_skipped_bookmark(&sync.bookmark.to_string())
-        }
-    }
-}
+            let name = sync.bookmark.to_string();
 
-/// Gets the source bookmark of a merge request action.
-fn merge_request_action_bookmark(action: &Action) -> Option<String> {
-    match action {
-        Action::CreateMR(create_mr) => Some(create_mr.bookmark.to_string()),
-        Action::UpdateMRBase(update_mr_base) => Some(update_mr_base.bookmark.clone()),
-        Action::UpdateMRTitleDescription(update) => Some(update.bookmark.to_string()),
-        Action::SyncDependentMergeRequests(sync) => Some(sync.bookmark.to_string()),
-        Action::Push(_) | Action::PushCreate(_) => None,
+            is_absent(&name)
+                || bookmark_graph
+                    .find_bookmark_in_components(&name)
+                    .is_some_and(|bookmark| {
+                        bookmark.parents.iter().any(|parent| match parent {
+                            BookmarkRef::Bookmark(parent) => is_absent(parent.name()),
+                            BookmarkRef::Trunk => false,
+                        })
+                    })
+        }
     }
 }
 
