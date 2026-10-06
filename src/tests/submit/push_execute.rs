@@ -643,6 +643,48 @@ async fn disabled_push_syncs_pushed_chain_dependencies_below_pending_descendant(
     }
 }
 
+#[tokio::test]
+async fn disabled_push_skips_pushed_child_mr_when_parent_creation_is_skipped() {
+    let (repo, pending_change_id) = pushed_chain_with_pending_parent();
+    let pending_name = change_id_to_temp_bookmark_name(&pending_change_id);
+    assert_eq!(
+        repo.jj
+            .bookmarks_synced_with_remote(["p", "c"], "origin")
+            .expect("read pushed parent and child"),
+        HashSet::from(["p".to_owned(), "c".to_owned()]),
+        "both p and c are pushed before execution"
+    );
+
+    let api = GitLabApiMock::start(Vec::new()).await;
+    let forge = mock_gitlab_forge(&api);
+    let (result, output) = plan_and_execute_with_config(
+        &repo,
+        &forge,
+        &gitlab_disabled_push_config(),
+        false,
+        &format!("{pending_change_id} | p | c"),
+        &HashSet::from([pending_change_id]),
+    )
+    .await;
+    let requests = api.requests();
+    api.stop().await;
+
+    assert!(result.errors.is_empty(), "{:?}", result.errors);
+    assert!(result.bookmarks_pushed.is_empty());
+    assert!(output.contains(&format!(
+        "Skipping because pushing is disabled: Create MR for p -> {pending_name}"
+    )));
+    assert!(output.contains("Skipping because pushing is disabled: Create MR for c -> p"));
+    assert!(
+        !requests.iter().any(|request| {
+            request.line.starts_with(&format!("POST {MR_API} "))
+                && serde_json::from_str::<Value>(&request.body)
+                    .is_ok_and(|body| body["source_branch"] == "c")
+        }),
+        "c's pushed head must not get an MR while its pushed target p has no MR: {requests:?}"
+    );
+}
+
 /// MR IIDs and JSON bodies of dependency-creation requests, in request order.
 fn dependency_posts(requests: &[MockRequest]) -> Vec<(u64, Value)> {
     requests
@@ -677,6 +719,31 @@ fn pushed_chain_with_pending_descendant() -> (TestRepo<TestRepo<()>>, String) {
         .next()
         .expect("pending change exists")
         .change_id;
+    repo.new_on("main");
+
+    (repo, pending_change_id)
+}
+
+/// A pushed stack `main -> pending -> p -> c`. Returns the repository and the
+/// pending change ID between `main` and the pushed bookmarks.
+fn pushed_chain_with_pending_parent() -> (TestRepo<TestRepo<()>>, String) {
+    let repo = TestRepo::with_local_remote();
+    repo.create_change("pending.txt", "pending", "Pending commit");
+    let pending_change_id = repo
+        .jj
+        .log("@")
+        .expect("read pending change")
+        .into_iter()
+        .next()
+        .expect("pending change exists")
+        .change_id;
+
+    repo.jj.exec(["new"]).expect("continue pending stack");
+    repo.create_change("parent.txt", "parent", "Parent commit")
+        .create_and_push_bookmark("p");
+    repo.jj.exec(["new", "p"]).expect("start child stack");
+    repo.create_change("child.txt", "child", "Child commit")
+        .create_and_push_bookmark("c");
     repo.new_on("main");
 
     (repo, pending_change_id)
@@ -722,6 +789,7 @@ struct MockRequest {
 struct GitLabApiMock {
     base_url: String,
     requests: Arc<Mutex<Vec<MockRequest>>>,
+    unsupported_requests: Arc<Mutex<Vec<String>>>,
     shutdown: Option<oneshot::Sender<()>>,
     server: tokio::task::JoinHandle<()>,
 }
@@ -734,6 +802,8 @@ impl GitLabApiMock {
         let address = listener.local_addr().expect("read mock address");
         let requests = Arc::new(Mutex::new(Vec::new()));
         let server_requests = Arc::clone(&requests);
+        let unsupported_requests = Arc::new(Mutex::new(Vec::new()));
+        let server_unsupported_requests = Arc::clone(&unsupported_requests);
         let (shutdown, mut shutdown_rx) = oneshot::channel();
         let server = tokio::spawn(async move {
             loop {
@@ -746,13 +816,23 @@ impl GitLabApiMock {
                 };
 
                 let request = read_mock_request(&mut stream).await;
-                let body = gitlab_mock_response(&merge_requests, &request).to_string();
+                let (status, content_type, body) =
+                    match gitlab_mock_response(&merge_requests, &request) {
+                        Ok(response) => ("200 OK", "application/json", response.to_string()),
+                        Err(error) => {
+                            server_unsupported_requests
+                                .lock()
+                                .expect("lock unsupported request log")
+                                .push(error.clone());
+                            ("501 Not Implemented", "text/plain", error)
+                        }
+                    };
                 server_requests
                     .lock()
                     .expect("lock request log")
                     .push(request);
                 let response = format!(
-                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    "HTTP/1.1 {status}\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
                     body.len(),
                     body
                 );
@@ -766,6 +846,7 @@ impl GitLabApiMock {
         Self {
             base_url: format!("http://{address}"),
             requests,
+            unsupported_requests,
             shutdown: Some(shutdown),
             server,
         }
@@ -780,6 +861,15 @@ impl GitLabApiMock {
             shutdown.send(()).expect("signal mock GitLab shutdown");
         }
         self.server.await.expect("stop mock GitLab API");
+        let unsupported_requests = self
+            .unsupported_requests
+            .lock()
+            .expect("lock unsupported request log")
+            .clone();
+        assert!(
+            unsupported_requests.is_empty(),
+            "unsupported GitLab mock request(s): {unsupported_requests:#?}"
+        );
     }
 }
 
@@ -832,57 +922,117 @@ async fn read_mock_request(stream: &mut tokio::net::TcpStream) -> MockRequest {
 }
 
 /// The mock GitLab response for `request` over `merge_requests`.
-fn gitlab_mock_response(merge_requests: &[Value], request: &MockRequest) -> Value {
+fn gitlab_mock_response(merge_requests: &[Value], request: &MockRequest) -> Result<Value, String> {
     let mut parts = request.line.split_whitespace();
-    let method = parts.next().unwrap_or_default();
-    let target = parts.next().unwrap_or_default();
-    let Some(rest) = target.strip_prefix(MR_API) else {
-        return json!([]);
-    };
+    let method = parts
+        .next()
+        .ok_or_else(|| format!("unsupported GitLab mock request line: {:?}", request.line))?;
+    let target = parts
+        .next()
+        .ok_or_else(|| format!("unsupported GitLab mock request line: {:?}", request.line))?;
+    let rest = target.strip_prefix(MR_API).ok_or_else(|| {
+        format!(
+            "unsupported GitLab mock path in request: {:?}",
+            request.line
+        )
+    })?;
     let by_iid = |iid: &str| {
         merge_requests
             .iter()
             .find(|mr| mr["iid"].to_string() == iid)
             .cloned()
-            .unwrap_or_else(|| panic!("unknown mock MR {iid}"))
+            .ok_or_else(|| format!("unknown mock MR {iid} in request: {:?}", request.line))
     };
 
     if let Some(query) = rest.strip_prefix('?') {
+        if method != "GET" {
+            return Err(format!(
+                "unsupported GitLab mock request: {:?}",
+                request.line
+            ));
+        }
         let source = query
             .split('&')
             .find_map(|pair| pair.strip_prefix("source_branch="))
-            .unwrap_or_default();
-        return Value::Array(
+            .ok_or_else(|| format!("missing source_branch in request: {:?}", request.line))?;
+        return Ok(Value::Array(
             merge_requests
                 .iter()
                 .filter(|mr| mr["source_branch"] == source)
                 .cloned()
                 .collect(),
-        );
+        ));
     }
 
-    let path = rest.trim_start_matches('/');
-    match (method, path.split_once('/')) {
-        ("GET", Some((_, "blocks"))) => json!([]),
-        ("POST", Some((_, "blocks"))) => {
-            let body: Value = serde_json::from_str(&request.body).expect("JSON request body");
-            let blocking = merge_requests
-                .iter()
-                .find(|mr| mr["id"] == body["blocking_merge_request_id"])
-                .cloned()
-                .expect("blocking MR exists");
-            json!({ "id": 900, "blocking_merge_request": blocking, "project_id": 1 })
+    if rest.is_empty() && method == "POST" {
+        let body: Value = serde_json::from_str(&request.body)
+            .map_err(|error| format!("invalid MR create request body: {error}"))?;
+        let source = body["source_branch"]
+            .as_str()
+            .ok_or_else(|| format!("missing source_branch in request: {:?}", request.line))?;
+        let target = body["target_branch"]
+            .as_str()
+            .ok_or_else(|| format!("missing target_branch in request: {:?}", request.line))?;
+        let mut mr = gitlab_mr(1, 1, source, target);
+        if let (Some(mr), Some(body)) = (mr.as_object_mut(), body.as_object()) {
+            mr.extend(body.clone());
         }
-        ("GET", None) => by_iid(path),
-        ("PUT", None) => {
-            let mut mr = by_iid(path);
-            let body: Value = serde_json::from_str(&request.body).expect("JSON request body");
+        return Ok(mr);
+    }
+
+    let Some(path) = rest.strip_prefix('/') else {
+        return Err(format!(
+            "unsupported GitLab mock request: {:?}",
+            request.line
+        ));
+    };
+    if let Some((iid, suffix)) = path.split_once('/') {
+        if suffix != "blocks" || suffix.contains('/') {
+            return Err(format!(
+                "unsupported GitLab mock request: {:?}",
+                request.line
+            ));
+        }
+        let mr = by_iid(iid)?;
+        return match method {
+            "GET" => Ok(json!([])),
+            "POST" => {
+                let body: Value = serde_json::from_str(&request.body)
+                    .map_err(|error| format!("invalid dependency request body: {error}"))?;
+                let blocking = merge_requests
+                    .iter()
+                    .find(|candidate| candidate["id"] == body["blocking_merge_request_id"])
+                    .cloned()
+                    .ok_or_else(|| format!("unknown blocking MR in request: {:?}", request.line))?;
+                Ok(json!({
+                    "id": 900,
+                    "blocking_merge_request": blocking,
+                    "project_id": 1,
+                    "dependent_merge_request": mr,
+                }))
+            }
+            _ => Err(format!(
+                "unsupported GitLab mock request: {:?}",
+                request.line
+            )),
+        };
+    }
+
+    match method {
+        "GET" => by_iid(path),
+        "PUT" => {
+            let mut mr = by_iid(path)?;
+            let body: Value = serde_json::from_str(&request.body)
+                .map_err(|error| format!("invalid MR update request body: {error}"))?;
             if let (Some(mr), Some(body)) = (mr.as_object_mut(), body.as_object()) {
                 mr.extend(body.clone());
             }
-            mr
+            Ok(mr)
         }
-        _ => json!([]),
+        _ => Err(format!(
+            "unsupported GitLab mock request: {:?}",
+            request.line
+        )),
     }
 }
 
