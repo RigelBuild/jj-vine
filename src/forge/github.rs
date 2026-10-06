@@ -337,8 +337,9 @@ pub fn validate_config(config: &Config) -> Result<()> {
     if config.github.project.is_empty() {
         return Err(ConfigSnafu {
             message: format!(
-                "github.project is required when forge is github (auto-detection from the \
-                 '{}' remote found no GitHub owner/repo); set jj-vine.github.project",
+                "github.project is required when forge is github and could not be derived \
+                 from the '{}' remote (the remote is missing or not a GitHub URL, or an \
+                 `upstream` or `fork` remote marks a fork workflow); set jj-vine.github.project",
                 config.remote_name
             ),
         }

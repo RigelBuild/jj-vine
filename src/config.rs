@@ -956,34 +956,39 @@ const GITHUB_DEFAULT_API_HOST: &str = "https://api.github.com";
 /// Names (`jj-vine.github.<key>`) whose effective value comes from the repo
 /// or workspace layer. Such values are explicit for this clone; values from
 /// the user/global layer are not. Only names and layer sources are read, so
-/// config values such as tokens never enter this output. Failures are
-/// best-effort and leave values eligible for remote detection.
-fn clone_layer_keys(jj: &Jujutsu) -> Vec<String> {
-    let Ok(output) = jj.exec([
-        "config",
-        "list",
-        "--template",
-        r#"name ++ "\t" ++ source ++ "\n""#,
-        "jj-vine.github",
-    ]) else {
-        return Vec::new();
-    };
-    output
-        .stdout
-        .lines()
-        .filter_map(|line| line.split_once('\t'))
-        .filter(|(_, source)| matches!(*source, "repo" | "workspace"))
-        .map(|(name, _)| name.to_owned())
-        .collect()
+/// config values such as tokens never enter this output. Returns `None` when
+/// the layer sources cannot be read.
+fn clone_layer_keys(jj: &Jujutsu) -> Option<Vec<String>> {
+    let output = jj
+        .exec([
+            "config",
+            "list",
+            "--template",
+            r#"name ++ "\t" ++ source ++ "\n""#,
+            "jj-vine.github",
+        ])
+        .ok()?;
+    Some(
+        output
+            .stdout
+            .lines()
+            .filter_map(|line| line.split_once('\t'))
+            .filter(|(_, source)| matches!(*source, "repo" | "workspace"))
+            .map(|(name, _)| name.to_owned())
+            .collect(),
+    )
 }
 
 /// A non-empty effective value from the repo or workspace layer takes
-/// precedence over clone-derived values.
-fn clone_layer_nonempty(clone_keys: &[String], key: &str, value: &str) -> bool {
+/// precedence over clone-derived values. When the layer sources are unknown,
+/// every non-empty value is kept, so a failed lookup never replaces a value
+/// that may be explicit.
+fn clone_layer_nonempty(clone_keys: Option<&[String]>, key: &str, value: &str) -> bool {
     !value.is_empty()
-        && clone_keys
-            .iter()
-            .any(|name| name.strip_prefix("jj-vine.github.") == Some(key))
+        && clone_keys.is_none_or(|keys| {
+            keys.iter()
+                .any(|name| name.strip_prefix("jj-vine.github.") == Some(key))
+        })
 }
 
 impl Config {
@@ -1023,8 +1028,9 @@ impl Config {
         // derive path.
         if config.forge == ForgeType::GitHub {
             let clone_keys = clone_layer_keys(jj);
-            let project_set = clone_layer_nonempty(&clone_keys, "project", &config.github.project);
-            let host_set = clone_layer_nonempty(&clone_keys, "host", &config.github.host);
+            let clone_keys = clone_keys.as_deref();
+            let project_set = clone_layer_nonempty(clone_keys, "project", &config.github.project);
+            let host_set = clone_layer_nonempty(clone_keys, "host", &config.github.host);
             if (!project_set || !host_set)
                 && let Some(detected) =
                     crate::remote::detect_project(jj, &config.remote_name, ForgeType::GitHub)
@@ -1032,8 +1038,9 @@ impl Config {
                 if !project_set {
                     config.github.project = detected.project;
                 }
-                if !host_set {
-                    config.github.host = detected.host;
+                // An SSH alias remote has no known host; keep the configured one.
+                if !host_set && let Some(host) = detected.host {
+                    config.github.host = host;
                 }
             }
             if config.github.host.is_empty() {
@@ -1184,7 +1191,7 @@ mod tests {
         };
 
         assert!(
-            message.contains("auto-detection from the 'origin' remote found no GitHub owner/repo"),
+            message.contains("could not be derived from the 'origin' remote"),
             "validation error must explain remote detection failure: {message}"
         );
     }
@@ -1202,8 +1209,26 @@ mod tests {
         };
 
         assert!(
-            message.contains("auto-detection from the 'origin' remote found no GitHub owner/repo"),
+            message.contains("could not be derived from the 'origin' remote"),
             "fork workflow must skip derivation and explain the missing project: {message}"
+        );
+    }
+
+    #[test]
+    fn derive_fork_beside_origin_fence_errors() {
+        let (_temp, repo_path) = create_test_repo();
+        seed_github_config(&repo_path);
+        set_repo_config(&repo_path, "jj-vine.remoteName", "fork");
+        add_git_remote(&repo_path, "origin", "git@github.com:owner/canonical.git");
+        add_git_remote(&repo_path, "fork", "git@github.com:person/fork.git");
+
+        let error = load_isolated(&repo_path).expect_err("fork layout skips derivation");
+
+        assert!(
+            error
+                .to_string()
+                .contains("could not be derived from the 'fork' remote"),
+            "fork layout must explain the missing project: {error}"
         );
     }
 
@@ -1212,11 +1237,87 @@ mod tests {
         let (_temp, repo_path) = create_test_repo();
         seed_github_config(&repo_path);
         set_repo_config(&repo_path, "jj-vine.remoteName", "upstream");
-        add_git_remote(&repo_path, "upstream", "git@github.com:owner/canonical.git");
+        add_git_remote(
+            &repo_path,
+            "upstream",
+            "git@github.example.com:owner/canonical.git",
+        );
 
         let config = load_isolated(&repo_path).expect("load config from configured remote");
 
         assert_eq!(config.github.project, "owner/canonical");
+        assert_eq!(config.github.host, "https://github.example.com/api/v3");
+    }
+
+    #[test]
+    fn derive_enterprise_host_supersedes_global_host() {
+        let (temp, repo_path) = create_test_repo();
+        seed_github_config(&repo_path);
+        std::fs::write(
+            temp.path().join(ISOLATED_TEST_CONFIG),
+            "[jj-vine.github]\nhost = \"https://stale.example/api/v3\"\n",
+        )
+        .expect("write user-level GitHub host");
+        add_git_remote(
+            &repo_path,
+            "origin",
+            "https://github.example.com:8443/owner/repo.git",
+        );
+
+        let config = load_isolated(&repo_path).expect("load config from Enterprise remote");
+
+        assert_eq!(config.github.project, "owner/repo");
+        assert_eq!(config.github.host, "https://github.example.com:8443/api/v3");
+    }
+
+    /// A plaintext Enterprise remote derives neither value, so the token is
+    /// never sent to an `http://` API host.
+    #[test]
+    fn derive_skips_http_enterprise_remote() {
+        let (_temp, repo_path) = create_test_repo();
+        seed_github_config(&repo_path);
+        set_repo_config(&repo_path, "jj-vine.github.project", "configured/repo");
+        add_git_remote(
+            &repo_path,
+            "origin",
+            "http://github.example.com/owner/repo.git",
+        );
+
+        let config = load_isolated(&repo_path).expect("load config");
+
+        assert_eq!(config.github.host, "https://api.github.com");
+    }
+
+    /// An SSH config alias names no real host: the project is derived, the
+    /// global host stays.
+    #[test]
+    fn derive_ssh_alias_keeps_global_host() {
+        let (temp, repo_path) = create_test_repo();
+        seed_github_config(&repo_path);
+        std::fs::write(
+            temp.path().join(ISOLATED_TEST_CONFIG),
+            "[jj-vine.github]\nhost = \"https://github.example.com/api/v3\"\n",
+        )
+        .expect("write user-level GitHub host");
+        add_git_remote(&repo_path, "origin", "git@github.com-work:owner/repo.git");
+
+        let config = load_isolated(&repo_path).expect("load config from alias remote");
+
+        assert_eq!(config.github.project, "owner/repo");
+        assert_eq!(config.github.host, "https://github.example.com/api/v3");
+    }
+
+    /// Unknown layer sources keep every non-empty value, so a failed source
+    /// lookup never lets the remote replace a possibly explicit value.
+    #[test]
+    fn unknown_layer_sources_keep_nonempty_values() {
+        assert!(clone_layer_nonempty(None, "project", "configured/repo"));
+        assert!(!clone_layer_nonempty(None, "project", ""));
+        assert!(!clone_layer_nonempty(
+            Some(&[][..]),
+            "project",
+            "global/repo"
+        ));
     }
 
     #[test]
@@ -1298,7 +1399,7 @@ mod tests {
             panic!("Expected Config error, got: {result:?}");
         };
 
-        assert!(message.contains("auto-detection from the 'origin' remote"));
+        assert!(message.contains("could not be derived from the 'origin' remote"));
     }
 
     fn set_workspace_config(repo_path: &Path, key: &str, value: &str) {
