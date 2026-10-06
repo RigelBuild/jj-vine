@@ -1,7 +1,13 @@
 use core::{cell::OnceCell, hash::BuildHasher};
 #[cfg(test)]
 use std::collections::{BTreeMap, BTreeSet};
-use std::{collections::HashSet, ffi::OsStr, path::PathBuf, process::Command};
+use std::{
+    borrow::Cow,
+    collections::HashSet,
+    ffi::OsStr,
+    path::{Path, PathBuf},
+    process::Command,
+};
 
 use itertools::Itertools as _;
 use owo_colors::OwoColorize as _;
@@ -556,23 +562,46 @@ impl Jujutsu {
             .build());
         };
 
-        let bin_path = if bin.contains(std::path::is_separator) {
-            self.cwd.join(bin)
+        // Resolve relative paths before the child changes cwd to the repository.
+        let has_bin_path = bin.contains(std::path::is_separator);
+        let caller_cwd = if self.cwd.is_absolute() && has_bin_path {
+            None
         } else {
-            which::which(bin).map_err(|_| {
+            Some(std::env::current_dir()?)
+        };
+        let selected_cwd = match caller_cwd.as_ref() {
+            Some(caller_cwd) if !self.cwd.is_absolute() => Cow::Owned(caller_cwd.join(&self.cwd)),
+            _ => Cow::Borrowed(self.cwd.as_path()),
+        };
+        let bin_path = if has_bin_path {
+            let bin_path = Path::new(bin);
+            if bin_path.is_absolute() {
+                bin_path.to_path_buf()
+            } else {
+                selected_cwd.join(bin_path)
+            }
+        } else {
+            let bin_path = which::which(bin).map_err(|_| {
                 ConfigSnafu {
                     message: "push command executable not found in PATH".to_owned(),
                 }
                 .build()
-            })?
+            })?;
+            if bin_path.is_absolute() {
+                bin_path
+            } else {
+                match caller_cwd.as_ref() {
+                    Some(caller_cwd) => caller_cwd.join(bin_path),
+                    None => std::env::current_dir()?.join(bin_path),
+                }
+            }
         };
         trace!("Running configured push command");
 
         let mut command = Command::new(bin_path);
-        command.current_dir(&self.cwd).args(bin_args);
+        command.current_dir(selected_cwd.as_ref()).args(bin_args);
         self.apply_config_override(&mut command);
         let output = command.output()?;
-
         if !output.status.success() {
             return Err(JjCommandSnafu {
                 message: format!("push command failed with {}", output.status),
@@ -1149,6 +1178,97 @@ mod tests {
             .exec_argv(&argv(&["./push-command"]))
             .expect("resolve the configured command under the selected repository");
         assert_eq!(output.stdout, "selected-repo");
+    }
+
+    #[cfg(unix)]
+    fn write_executable(path: &Path, contents: &str) -> std::io::Result<()> {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        std::fs::write(path, contents)?;
+        let mut permissions = std::fs::metadata(path)?.permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(path, permissions)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exec_argv_resolves_relative_repo_from_separate_process_cwd() -> Result<()> {
+        const CHILD_MODE: &str = "JJ_VINE_TEST_RELATIVE_REPO_CWD";
+        if std::env::var_os(CHILD_MODE).is_some() {
+            let jj = Jujutsu::new("repo")?;
+            let output = jj.exec_argv(&argv(&["./scripts/push"]))?;
+            assert_eq!(output.stdout, "selected-repo");
+            return Ok(());
+        }
+
+        let temp = TempDir::new()?;
+        let caller = temp.path().join("caller");
+        let repo = caller.join("repo");
+        std::fs::create_dir_all(repo.join("scripts"))?;
+        write_executable(
+            &repo.join("scripts/push"),
+            "#!/bin/sh\nprintf selected-repo\n",
+        )?;
+
+        let caller_alias = temp.path().join("caller-alias");
+        std::os::unix::fs::symlink(&caller, &caller_alias)?;
+        let output = std::process::Command::new(std::env::current_exe()?)
+            .args([
+                "--exact",
+                "jj::tests::exec_argv_resolves_relative_repo_from_separate_process_cwd",
+            ])
+            .current_dir(caller_alias)
+            .env(CHILD_MODE, "1")
+            .output()?;
+        assert!(
+            output.status.success(),
+            "child test failed: {}",
+            String::from_utf8_lossy(&output.stderr),
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exec_argv_resolves_relative_path_entry_from_caller_cwd() -> Result<()> {
+        const CHILD_MODE: &str = "JJ_VINE_TEST_RELATIVE_PATH_ENTRY";
+        if std::env::var_os(CHILD_MODE).is_some() {
+            let jj = Jujutsu::new("repo")?;
+            let output = jj.exec_argv(&argv(&["push-command"]))?;
+            assert_eq!(output.stdout, "caller-path");
+            return Ok(());
+        }
+
+        let temp = TempDir::new()?;
+        let caller = temp.path().join("caller");
+        std::fs::create_dir_all(caller.join("repo"))?;
+        std::fs::create_dir_all(caller.join("bin"))?;
+        write_executable(
+            &caller.join("bin/push-command"),
+            "#!/bin/sh\nprintf caller-path\n",
+        )?;
+
+        let mut path = std::ffi::OsString::from("bin:");
+        path.push(
+            std::env::var_os("PATH").ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::NotFound, "PATH is not set")
+            })?,
+        );
+        let output = std::process::Command::new(std::env::current_exe()?)
+            .args([
+                "--exact",
+                "jj::tests::exec_argv_resolves_relative_path_entry_from_caller_cwd",
+            ])
+            .current_dir(&caller)
+            .env(CHILD_MODE, "1")
+            .env("PATH", path)
+            .output()?;
+        assert!(
+            output.status.success(),
+            "child test failed: {}",
+            String::from_utf8_lossy(&output.stderr),
+        );
+        Ok(())
     }
 
     #[test]
