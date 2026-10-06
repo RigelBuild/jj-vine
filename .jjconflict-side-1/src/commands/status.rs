@@ -1,0 +1,750 @@
+#![expect(clippy::module_name_repetitions, reason = "seems fine here")]
+use core::{cmp::Ordering, fmt::Write as _, ops::Sub as _};
+
+use clap::{Args, ValueEnum};
+use enum_dispatch::enum_dispatch;
+use futures::{
+    StreamExt as _,
+    stream::{FuturesOrdered, FuturesUnordered},
+    try_join,
+};
+use itertools::Itertools as _;
+use jiff::SpanRound;
+use owo_colors::OwoColorize as _;
+use pluralizer::pluralize;
+
+use crate::{
+    bookmark::Bookmark,
+    cli::CliConfig,
+    commands::{GetBookmarksOptions, StrVisualWidth as _},
+    config::Config,
+    description::FormatMergeRequest as _,
+    error::{ConfigSnafu, Error, Result},
+    forge::{
+        AnyForgeMergeRequest,
+        ApprovalSatisfaction,
+        ApprovalStatus,
+        CheckStatus,
+        Forge as _,
+        ForgeImpl,
+        MergeRequestLike as _,
+        MergeRequestStatus,
+    },
+    jj::Jujutsu,
+    output::{Output as _, SyncOutput},
+};
+
+#[derive(Args)]
+pub struct StatusCommandConfig {
+    /// Output format
+    /// - two-line-compact: Two-lines per merge request (default)
+    /// - slack: Suitable for posting in Slack
+    #[arg(short = 'f', long, default_value = "two-line-compact")]
+    pub format: StatusFormat,
+
+    /// Options for the revset.
+    #[command(flatten)]
+    pub revset_options: StatusCommandRevsetOptions,
+
+    /// Include draft pull/merge requests. Default true.
+    #[arg(long, overrides_with = "no_drafts", num_args = 0..=1)]
+    pub drafts: Option<bool>,
+
+    /// Exclude draft pull/merge requests.
+    #[arg(long)]
+    pub no_drafts: bool,
+
+    /// Set to true to only show approved pull/merge requests. Set to false to
+    /// only show unapproved pull/merge requests. If not set, will show all
+    /// pull/merge requests.
+    #[arg(long)]
+    pub approved: Option<bool>,
+}
+
+impl StatusCommandConfig {
+    #[must_use]
+    pub fn help_long() -> String {
+        format!(
+            "
+Show the status of tracked bookmarks and their {}
+
+{}
+
+Show the status of all my bookmarks:
+{}
+
+Show the status of all tracked bookmarks:
+{}
+
+Show the status of a specific revset:
+{}
+",
+            match ForgeImpl::from_cwd() {
+                Ok(forge) => format!("{}s", forge.mr_name()),
+                Err(_) => "MRs/PRs".to_owned(),
+            },
+            "Examples:".yellow().bold(),
+            "jj vine status".green().bold(),
+            "jj vine status --tracked".green().bold(),
+            "jj vine status -r <revset>".green().bold(),
+        )
+    }
+}
+
+#[derive(Args, Default)]
+#[group(required = false, multiple = false)]
+pub struct StatusCommandRevsetOptions {
+    /// Use a manual revset.
+    #[arg(short = 'r', long)]
+    pub revset: Option<String>,
+
+    /// Include only `(mine() & tracked_remote_bookmarks()) ~ trunk()`.
+    #[arg(long)]
+    pub tracked: bool,
+}
+
+impl StatusCommandRevsetOptions {
+    fn to_get_bookmarks_options(&self) -> GetBookmarksOptions {
+        match (self.revset.as_deref(), self.tracked) {
+            (Some(revset), false) => GetBookmarksOptions::Revset(revset.to_owned()),
+            (None, true) => GetBookmarksOptions::Tracked,
+            (None, false) => GetBookmarksOptions::Mine,
+            _ => unreachable!(),
+        }
+    }
+}
+
+enum BookmarkStatus {
+    HasMergeRequest {
+        bookmark: String,
+        merge_request: AnyForgeMergeRequest,
+        status: MergeRequestStatus,
+    },
+    NoMergeRequest {
+        bookmark: String,
+    },
+}
+
+struct BookmarkStatusError {
+    bookmark: String,
+    error: Error,
+}
+
+#[expect(clippy::single_call_fn, reason = "reusable")]
+fn resolve_bool(yes: Option<bool>, no: bool, default: bool) -> bool {
+    // wheeeeeeeee
+    match (yes, no) {
+        (Some(true), false) => true,
+        (Some(false) | None, true) | (Some(false), false) => false,
+        (None, false) => default,
+        (Some(true), true) => unreachable!(),
+    }
+}
+
+pub async fn status(
+    StatusCommandConfig {
+        drafts,
+        no_drafts,
+        format,
+        revset_options,
+        approved: approved_filter,
+    }: &StatusCommandConfig,
+    cli_config: &CliConfig<'_>,
+) -> Result<()> {
+    let drafts = resolve_bool(*drafts, *no_drafts, true);
+
+    let jj = Jujutsu::new(&cli_config.repository)?;
+    let repo_config = Config::load(&cli_config.repository)?;
+    let forge = ForgeImpl::new(&repo_config)?;
+    let mut output = cli_config.output;
+
+    let revset = revset_options.to_get_bookmarks_options().to_revset();
+    let changes = jj.log(revset)?;
+    let bookmarks: Vec<_> = Bookmark::from_changes(&changes).into_iter().collect();
+
+    if bookmarks.is_empty() {
+        output.finish();
+        writeln!(output, "No tracked bookmarks found.")?;
+        return Ok(());
+    }
+
+    output.log_current("Checking status of tracked bookmarks");
+
+    let statuses: Vec<_> = bookmarks
+        .iter()
+        .map(|bookmark| async {
+            let _substep = output.start_substep(&bookmark.name().magenta().to_string());
+
+            // Can't really use find_merge_request_by_source_branch_base_branch here
+            let merge_request = forge
+                .find_merge_request_by_source_branch(bookmark.name())
+                .await
+                .map_err(|error| BookmarkStatusError {
+                    bookmark: bookmark.name().to_owned(),
+                    error,
+                })?;
+
+            if let Some(merge_request) = &merge_request
+                && merge_request.is_draft()
+                && !drafts
+            {
+                return Ok(None);
+            }
+
+            let status = match merge_request {
+                Some(merge_request) => {
+                    let status = forge
+                        .get_merge_request_status(merge_request.iid())
+                        .await
+                        .map_err(|error| BookmarkStatusError {
+                            bookmark: bookmark.name().to_owned(),
+                            error,
+                        })?;
+
+                    match (&status.approval_status.satisfaction, approved_filter) {
+                        (ApprovalSatisfaction::Satisfied, Some(false))
+                        | (ApprovalSatisfaction::Unsatisfied, Some(true)) => {
+                            return Ok(None);
+                        }
+                        _ => {}
+                    }
+
+                    BookmarkStatus::HasMergeRequest {
+                        bookmark: bookmark.name().to_owned(),
+                        merge_request,
+                        status,
+                    }
+                }
+                None => BookmarkStatus::NoMergeRequest {
+                    bookmark: bookmark.name().to_owned(),
+                },
+            };
+
+            Ok(Some(status))
+        })
+        .collect::<FuturesUnordered<_>>()
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .filter_map(|status| match status {
+            Ok(Some(status)) => Some(Ok(status)),
+            Ok(None) => None,
+            Err(error) => Some(Err(error)),
+        })
+        .collect();
+
+    let rendered = format.render(statuses, &forge, output).await;
+
+    output.finish();
+
+    writeln!(output, "{rendered}")?;
+
+    Ok(())
+}
+
+#[derive(ValueEnum, Clone, Copy)]
+pub enum StatusFormat {
+    /// Render the status of merge requests in a two-line compact format.
+    #[value(id = "two-line-compact")]
+    TwoLineCompact,
+
+    // Render the status of pull/merge requests suitable for posting in Slack.
+    #[value(id = "slack")]
+    Slack,
+}
+
+impl core::str::FromStr for StatusFormat {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        match s {
+            "flat" => Ok(StatusFormat::TwoLineCompact),
+            _ => Err(ConfigSnafu {
+                message: format!("Invalid output mode: {s}. Valid modes are: flat"),
+            }
+            .build()),
+        }
+    }
+}
+
+impl StatusFormat {
+    async fn render(
+        &self,
+        statuses: Vec<Result<BookmarkStatus, BookmarkStatusError>>,
+        forge: &ForgeImpl,
+        output: &SyncOutput,
+    ) -> String {
+        match self {
+            StatusFormat::TwoLineCompact => print_two_line_compact(statuses, forge, output).await,
+            StatusFormat::Slack => print_slack_status(statuses, forge, output).await,
+        }
+    }
+}
+
+fn sorted_statuses(
+    statuses: &[Result<BookmarkStatus, BookmarkStatusError>],
+) -> impl Iterator<Item = &Result<BookmarkStatus, BookmarkStatusError>> + '_ {
+    statuses.iter().sorted_by(|a, b| match (a, b) {
+        // Order by merge request ID first
+        (
+            Ok(BookmarkStatus::HasMergeRequest {
+                merge_request: a, ..
+            }),
+            Ok(BookmarkStatus::HasMergeRequest {
+                merge_request: b, ..
+            }),
+        ) => a.iid().cmp(&b.iid()),
+
+        // Place merge requests before no merge requests
+        (Ok(BookmarkStatus::HasMergeRequest { .. }), _) => Ordering::Less,
+        (_, Ok(BookmarkStatus::HasMergeRequest { .. })) => Ordering::Greater,
+
+        // Order no merge requests by bookmark name
+        (
+            Ok(BookmarkStatus::NoMergeRequest { bookmark: a }),
+            Ok(BookmarkStatus::NoMergeRequest { bookmark: b }),
+        ) => a.cmp(b),
+
+        // Place errors last
+        (Ok(BookmarkStatus::NoMergeRequest { .. }), _) => Ordering::Less,
+        (_, Ok(BookmarkStatus::NoMergeRequest { .. })) => Ordering::Greater,
+        (Err(_), Err(_)) => Ordering::Equal,
+    })
+}
+
+/// Renders the status of merge requests in a two-line compact format.
+/// Example:
+/// !123 MR Title Here
+///      my-bookmark • [READY] • ✓ Checks OK • Approved (3/3).
+#[expect(clippy::single_call_fn, reason = "breaking things up")]
+async fn print_two_line_compact(
+    statuses: Vec<Result<BookmarkStatus, BookmarkStatusError>>,
+    forge: &ForgeImpl,
+    output: &SyncOutput,
+) -> String {
+    let futures: FuturesOrdered<_> = sorted_statuses(&statuses)
+        .map(|status| two_line_compact_status(status, forge, output))
+        .collect();
+
+    futures
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .flatten()
+        .join("\n\n")
+}
+
+#[expect(clippy::single_call_fn, reason = "breaking things up")]
+async fn two_line_compact_status(
+    status: &Result<BookmarkStatus, BookmarkStatusError>,
+    forge: &ForgeImpl,
+    output: &SyncOutput,
+) -> Option<String> {
+    match status {
+        Ok(BookmarkStatus::HasMergeRequest {
+            bookmark,
+            merge_request,
+            status,
+        }) => {
+            let _substep =
+                output.start_substep(&forge.format_merge_request_id(merge_request.iid()));
+
+            let data = StatusData::new(
+                forge,
+                bookmark.clone(),
+                merge_request.clone(),
+                status.clone(),
+            );
+
+            // TODO would love templating language like jj has
+            let first_line = parse_components("iid title");
+            let second_line =
+                parse_components("bookmark ready checks approval num_discussions created url");
+
+            let (first_line, second_line) = match try_join!(
+                render_components(first_line, &data),
+                render_components(second_line, &data)
+            ) {
+                Ok(lines) => lines,
+                Err(err) => return Some(err.to_string()),
+            };
+
+            let second_line_padding = " ".repeat(
+                first_line
+                    .first()
+                    .unwrap_or(&String::new())
+                    .visual_width()
+                    .strict_add(1),
+            );
+
+            Some(format!(
+                "{}\n{}{}",
+                first_line.join(" "),
+                second_line_padding,
+                second_line.join(&" • ".dimmed().to_string()),
+            ))
+        }
+        Ok(BookmarkStatus::NoMergeRequest { bookmark }) => Some(format!(
+            "{} {}",
+            bookmark.magenta(),
+            "No merge request".dimmed()
+        )),
+        Err(BookmarkStatusError { bookmark, error }) => Some(format!(
+            "Failed to get status for bookmark {}: {}",
+            bookmark.magenta(),
+            error
+        )),
+    }
+}
+
+// TODO bad, dedupe
+#[expect(clippy::single_call_fn, reason = "breaking things up")]
+async fn print_slack_status(
+    statuses: Vec<Result<BookmarkStatus, BookmarkStatusError>>,
+    forge: &ForgeImpl,
+    output: &SyncOutput,
+) -> String {
+    let futures: FuturesOrdered<_> = sorted_statuses(&statuses)
+        .map(|status| slack_status(status, forge, output))
+        .collect();
+
+    futures
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .flatten()
+        .join("\n\n")
+}
+
+#[expect(clippy::single_call_fn, reason = "breaking things up")]
+async fn slack_status(
+    status: &Result<BookmarkStatus, BookmarkStatusError>,
+    forge: &ForgeImpl,
+    output: &SyncOutput,
+) -> Option<String> {
+    let output = match status {
+        Ok(BookmarkStatus::HasMergeRequest {
+            bookmark,
+            merge_request,
+            status,
+        }) => {
+            let _substep =
+                output.start_substep(&forge.format_merge_request_id(merge_request.iid()));
+
+            let data = StatusData::new(
+                forge,
+                bookmark.clone(),
+                merge_request.clone(),
+                status.clone(),
+            );
+
+            // TODO would love templating language like jj has
+            let line = parse_components(
+                "iid_linked_slack title • ready • checks • approval • num_discussions • created",
+            );
+
+            let line = match render_components(line, &data).await {
+                Ok(lines) => lines,
+                Err(err) => return Some(err.to_string()),
+            };
+
+            let line = line.join(" ");
+
+            // Just remove duplicates for now, need to improve this whole system
+            let line = regex::Regex::new("(• )+")
+                .unwrap()
+                .replace_all(&line, "• ")
+                .to_string();
+
+            Some(line)
+        }
+        Ok(BookmarkStatus::NoMergeRequest { .. }) => None,
+        Err(BookmarkStatusError { bookmark, error }) => Some(format!(
+            "Failed to get status for bookmark {}: {}",
+            bookmark.magenta(),
+            error
+        )),
+    };
+
+    output.map(|output| strip_ansi::strip_str(&output).to_string())
+}
+
+fn parse_components(line: &str) -> Vec<StatusComponentImpl> {
+    line.split_whitespace()
+        .map(get_component)
+        .collect::<Vec<_>>()
+}
+
+async fn render_components(
+    components: Vec<StatusComponentImpl>,
+    data: &StatusData<'_>,
+) -> Result<Vec<String>> {
+    let futures: FuturesOrdered<_> = components
+        .iter()
+        .map(|component| component.render(data))
+        .collect();
+
+    Ok(futures
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .flatten()
+        .collect())
+}
+
+#[expect(clippy::single_call_fn, reason = "breaking things up")]
+fn get_component(name: &str) -> StatusComponentImpl {
+    match name {
+        "bookmark" => BookmarkNameComponent {}.into(),
+        "iid" => MergeRequestIIDComponent {}.into(),
+        "iid_linked_slack" => MergeRequestIIDLinkedSlackComponent {}.into(),
+        "title" => MergeRequestTitleComponent {}.into(),
+        "ready" => ReadyToMergeComponent {}.into(),
+        "checks" => ChecksStatusComponent {}.into(),
+        "approval" => ApprovalStatusComponent {}.into(),
+        "created" => CreatedAtComponent {}.into(),
+        "url" => MergeRequestURLComponent {}.into(),
+        "num_discussions" => NumOpenDiscussionsComponent {}.into(),
+        literal => LiteralComponent {
+            literal: literal.to_owned(),
+        }
+        .into(),
+    }
+}
+
+#[enum_dispatch]
+trait StatusComponent: Send + Sync {
+    async fn render(&self, status: &StatusData<'_>) -> Result<Option<String>>;
+}
+
+#[enum_dispatch(StatusComponent)]
+enum StatusComponentImpl {
+    BookmarkName(BookmarkNameComponent),
+    MergeRequestIID(MergeRequestIIDComponent),
+    MergeRequestIIDLinkedSlack(MergeRequestIIDLinkedSlackComponent),
+
+    MergeRequestTitle(MergeRequestTitleComponent),
+    ReadyToMerge(ReadyToMergeComponent),
+    ChecksStatus(ChecksStatusComponent),
+    ApprovalStatus(ApprovalStatusComponent),
+    CreatedAt(CreatedAtComponent),
+    MergeRequestURL(MergeRequestURLComponent),
+    NumOpenDiscussions(NumOpenDiscussionsComponent),
+    Literal(LiteralComponent),
+}
+
+macro_rules! component {
+    ($struct_name:ident, $body:expr) => {
+        struct $struct_name {}
+
+        impl StatusComponent for $struct_name {
+            async fn render(&self, status: &StatusData<'_>) -> Result<Option<String>> {
+                ($body)(status).await
+            }
+        }
+    };
+}
+
+struct StatusData<'a> {
+    forge: &'a ForgeImpl,
+    bookmark: String,
+    merge_request: AnyForgeMergeRequest,
+    status: MergeRequestStatus,
+}
+
+impl<'a> StatusData<'a> {
+    fn new(
+        forge: &'a ForgeImpl,
+        bookmark: String,
+        merge_request: AnyForgeMergeRequest,
+        status: MergeRequestStatus,
+    ) -> Self {
+        Self {
+            forge,
+            bookmark,
+            merge_request,
+            status,
+        }
+    }
+}
+
+component!(BookmarkNameComponent, async |data: &StatusData<'_>| {
+    Ok(Some(data.bookmark.magenta().to_string()))
+});
+
+component!(MergeRequestIIDComponent, async |data: &StatusData<'_>| {
+    Ok(Some(
+        data.forge
+            .format_merge_request_id(data.merge_request.iid())
+            .cyan()
+            .to_string(),
+    ))
+});
+
+component!(
+    MergeRequestIIDLinkedSlackComponent,
+    async |data: &StatusData<'_>| {
+        Ok(Some(linked_markdownish(
+            data.forge.format_merge_request_id(data.merge_request.iid()),
+            data.merge_request.url(),
+        )))
+    }
+);
+
+component!(MergeRequestTitleComponent, async |data: &StatusData<'_>| {
+    Ok(Some(format!("\"{}\"", data.merge_request.title().white())))
+});
+
+component!(ReadyToMergeComponent, async |data: &StatusData<'_>| {
+    if data.status.ready_to_merge() {
+        Ok(Some("[READY]".green().bold().to_string()))
+    } else {
+        Ok(None)
+    }
+});
+
+component!(ChecksStatusComponent, async |data: &StatusData<'_>| {
+    match data.status.check_status {
+        CheckStatus::Success => Ok(Some("✓ Checks OK".green().to_string())),
+        CheckStatus::Failed => Ok(Some("✗ Checks failing".red().to_string())),
+        CheckStatus::Pending => Ok(Some("⋯ Checks pending".yellow().to_string())),
+        CheckStatus::None => Ok(None),
+    }
+});
+
+component!(ApprovalStatusComponent, async |data: &StatusData<'_>| {
+    let ApprovalStatus {
+        approved_count,
+        required_count,
+        satisfaction,
+        blocking_count,
+    } = data.status.approval_status.clone();
+
+    Ok(Some(match satisfaction {
+        ApprovalSatisfaction::Satisfied if required_count == 0 => pluralize(
+            "approval",
+            approved_count.try_into().expect("too large"),
+            true,
+        )
+        .white()
+        .to_string(),
+        ApprovalSatisfaction::Satisfied if required_count == 1 => "Approved".green().to_string(),
+        ApprovalSatisfaction::Satisfied => format!("Approved ({approved_count}/{required_count})")
+            .green()
+            .to_string(),
+        ApprovalSatisfaction::Unsatisfied if blocking_count == 0 && required_count == 1 => {
+            "Needs approval".red().to_string()
+        }
+        ApprovalSatisfaction::Unsatisfied if blocking_count == 0 => format!(
+            "Needs {} ({approved_count}/{required_count})",
+            pluralize(
+                "approval",
+                required_count.try_into().expect("too large"),
+                false
+            ),
+        )
+        .red()
+        .to_string(),
+        ApprovalSatisfaction::Unsatisfied => format!(
+            "Needs {} ({approved_count}/{required_count}) ({blocking_count} blocking {})",
+            pluralize(
+                "approval",
+                required_count.try_into().expect("too large"),
+                false
+            ),
+            pluralize(
+                "review",
+                blocking_count.try_into().expect("too large"),
+                false
+            ),
+        )
+        .red()
+        .to_string(),
+        ApprovalSatisfaction::Unknown => pluralize(
+            "approval",
+            approved_count.try_into().expect("too large"),
+            true,
+        )
+        .white()
+        .to_string(),
+    }))
+});
+
+component!(CreatedAtComponent, async |data: &StatusData<'_>| {
+    let now = jiff::Zoned::now();
+    let duration = (data.merge_request.created_at().sub(now.timestamp())).abs();
+
+    let mut round = SpanRound::new().largest(jiff::Unit::Year).relative(&now);
+
+    if duration.total((jiff::Unit::Hour, &now)).unwrap() > 24.0_f64 {
+        round = round.smallest(jiff::Unit::Hour);
+    } else if duration.total((jiff::Unit::Minute, &now)).unwrap() > 0.0_f64 {
+        round = round.smallest(jiff::Unit::Minute);
+    } else {
+        round = round.smallest(jiff::Unit::Second);
+    }
+
+    Ok(Some(
+        format!(
+            "{:#} old",
+            duration.round(round).expect("Failed to round duration")
+        )
+        .dimmed()
+        .to_string(),
+    ))
+});
+
+component!(MergeRequestURLComponent, async |data: &StatusData<'_>| {
+    Ok(Some(
+        data.merge_request
+            .url()
+            .truecolor(100, 100, 100)
+            .to_string(),
+    ))
+});
+
+component!(NumOpenDiscussionsComponent, async |data: &StatusData<
+    '_,
+>|
+       -> Result<
+    Option<String>,
+> {
+    let num_open_discussions = data
+        .forge
+        .num_open_discussions(data.merge_request.iid())
+        .await?;
+
+    match num_open_discussions.unresolved {
+        0 => Ok(None),
+        unresolved => Ok(Some(
+            format!(
+                "{} open {}",
+                unresolved,
+                pluralize(
+                    "discussion",
+                    unresolved.try_into().expect("too large"),
+                    false
+                )
+            )
+            .yellow()
+            .to_string(),
+        )),
+    }
+});
+
+struct LiteralComponent {
+    literal: String,
+}
+
+impl StatusComponent for LiteralComponent {
+    async fn render(&self, _status: &StatusData<'_>) -> Result<Option<String>> {
+        Ok(Some(self.literal.clone()))
+    }
+}
+
+#[expect(clippy::single_call_fn, reason = "reusable")]
+fn linked_markdownish(part: impl AsRef<str>, to: impl AsRef<str>) -> String {
+    format!("[{}]({})", part.as_ref(), to.as_ref())
+}
