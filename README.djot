@@ -347,7 +347,12 @@ will always be kept in sync with your PR/MR stack upon submitting your bookmark(
 If you would like description generation, but not a stack diagram, you can set each value of `description.diagram` to `none`. Alternatively, if you would
 like to only generate a stack diagram, you can set `description.singleRevision` and `description.multipleRevisions` to `none`.
 
-On resubmission, `bottom` moves an existing stack block below all user text, including text previously written after the block. This may reorder an existing description; the user text is retained.
+On resubmission with the default `bottom` placement, an existing stack block moves below all user text,
+including text after the block. The description may be reordered; user text is retained.
+
+Rust callers must pass a `StackPlacement` argument to `insert_stack_into_description`. This is a
+source-breaking API change. `DescriptionConfig` struct literals must set `placement` or use
+`..DescriptionConfig::default()`.
 
 ### Configuration{#description-configuration}
 
