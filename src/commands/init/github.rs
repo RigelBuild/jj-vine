@@ -1,11 +1,14 @@
 use std::path::{Path, PathBuf};
 
-use dialoguer::{Input, Password};
 use owo_colors::OwoColorize as _;
 
 use crate::{
     commands::init::{
+        Prompts,
         Remotes,
+        TerminalPrompts,
+        TextPrompt,
+        Validator,
         clone_layer_keys,
         config_key_source,
         derived_config_default,
@@ -21,9 +24,6 @@ use crate::{
 
 /// Public GitHub API URL, offered only when no remote says otherwise.
 const PUBLIC_API_HOST: &str = "https://api.github.com";
-
-/// Checks a typed prompt value; the error is shown to the user.
-type Validator = fn(&str) -> core::result::Result<(), &'static str>;
 
 /// Initialize GitHub-specific configuration.
 #[expect(clippy::single_call_fn, reason = "important")]
@@ -72,7 +72,7 @@ fn run(
         label: "GitHub API URL (e.g. https://api.github.com)",
         key: "jj-vine.github.host",
         default: derived_config_default(
-            host,
+            host.filter(|host| crate::config::is_https_host(host)),
             derived.host.clone().filter(|_| remotes.is_some()),
             clone_keys,
             "jj-vine.github.host",
@@ -118,9 +118,6 @@ fn run(
 
     let github_token = prompt_for_github_token(credential, &github_host, prompts)?;
 
-    if invalid_token_command {
-        unset_config(repo_path, "jj-vine.github.tokenCommand")?;
-    }
     set_config(repo_path, "jj-vine.github.host", &github_host)?;
     set_config(repo_path, "jj-vine.github.project", &github_project)?;
     if !github_target_project.is_empty() {
@@ -136,58 +133,10 @@ fn run(
     if let Some(token) = github_token {
         set_config_redacted(repo_path, "jj-vine.github.token", &token)?;
     }
+    if invalid_token_command {
+        unset_config(repo_path, "jj-vine.github.tokenCommand")?;
+    }
     Ok(())
-}
-
-/// One text prompt of the wizard.
-struct TextPrompt<'a> {
-    label: &'a str,
-    key: &'a str,
-    /// Accepted when the user enters nothing.
-    default: Option<String>,
-    /// Pre-filled text the user can accept or erase.
-    initial_text: Option<String>,
-    allow_empty: bool,
-    validate: Option<Validator>,
-}
-
-/// Source of the wizard's answers.
-trait Prompts {
-    fn text(&mut self, prompt: TextPrompt<'_>) -> Result<String>;
-
-    /// Read a Personal Access Token without echo.
-    fn token(&mut self, key: &str) -> Result<String>;
-}
-
-/// Prompts on the user's terminal.
-struct TerminalPrompts;
-
-impl Prompts for TerminalPrompts {
-    fn text(&mut self, prompt: TextPrompt<'_>) -> Result<String> {
-        let mut input = Input::<String>::new()
-            .with_prompt(format!("{} {}", prompt.label.bold(), prompt.key.dimmed()))
-            .allow_empty(prompt.allow_empty);
-        if let Some(default) = prompt.default {
-            input = input.default(default);
-        }
-        if let Some(initial_text) = prompt.initial_text {
-            input = input.with_initial_text(initial_text);
-        }
-        if let Some(validate) = prompt.validate {
-            input = input.validate_with(move |value: &String| validate(value));
-        }
-        Ok(input.interact_text()?)
-    }
-
-    fn token(&mut self, key: &str) -> Result<String> {
-        Ok(Password::new()
-            .with_prompt(format!(
-                "{} {}",
-                "GitHub Personal Access Token".bold(),
-                key.dimmed()
-            ))
-            .interact()?)
-    }
 }
 
 /// Which GitHub credential the effective configuration already provides.
@@ -236,7 +185,7 @@ impl ExistingSettings {
 
         let has_literal = text("token").is_some();
         let command = github.and_then(|github| github.get("tokenCommand"));
-        let invalid_token_command = command.is_some_and(|value| !names_command(value));
+        let invalid_token_command = command.is_some_and(|value| !valid_token_command(value));
         let credential = match command {
             _ if has_literal => ExistingCredential::Literal,
             None => ExistingCredential::Missing,
@@ -257,18 +206,45 @@ impl ExistingSettings {
     }
 }
 
-/// Whether a `tokenCommand` value is an argv of strings whose first element
-/// names a binary.
-fn names_command(command: &toml::Value) -> bool {
-    command.as_array().is_some_and(|argv| {
-        argv.iter().all(toml::Value::is_str)
-            && argv
-                .first()
-                .and_then(toml::Value::as_str)
-                .is_some_and(|bin| !bin.trim().is_empty())
-    })
+/// Whether a `tokenCommand` value has the schema type `Vec<String>`.
+fn valid_token_command(command: &toml::Value) -> bool {
+    command
+        .as_array()
+        .is_some_and(|argv| argv.iter().all(toml::Value::is_str))
 }
 
+/// Whether a valid `tokenCommand` names a usable binary.
+fn names_command(command: &toml::Value) -> bool {
+    valid_token_command(command)
+        && command
+            .as_array()
+            .and_then(|argv| argv.first())
+            .and_then(toml::Value::as_str)
+            .is_some_and(|bin| !bin.trim().is_empty() && bin == bin.trim())
+}
+#[cfg(test)]
+mod command_tests {
+    use super::*;
+
+    #[test]
+    fn token_command_distinguishes_invalid_schema_from_unusable_argv() {
+        assert!(valid_token_command(&toml::Value::Array(Vec::new())));
+        assert!(!names_command(&toml::Value::Array(Vec::new())));
+        assert!(!names_command(&toml::Value::Array(vec![
+            toml::Value::String(" ".to_owned(),)
+        ])));
+        assert!(!names_command(&toml::Value::Array(vec![
+            toml::Value::String(" gh ".to_owned(),)
+        ])));
+        assert!(names_command(&toml::Value::Array(vec![
+            toml::Value::String("gh".to_owned(),)
+        ])));
+        assert!(!valid_token_command(&toml::Value::String("gh".to_owned())));
+        assert!(!valid_token_command(&toml::Value::Array(vec![
+            toml::Value::Integer(1)
+        ])));
+    }
+}
 /// Prompt defaults derived from the clone's remotes.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct RemoteDefaults {
@@ -348,7 +324,7 @@ fn prompt_for_github_token(
     match credential {
         ExistingCredential::Literal => {
             println!(
-                "Using existing Personal Access Token. Run `jj config set --repo jj-vine.github.token <token>` to update it."
+                "Using existing Personal Access Token. To update it, unset it with `jj config unset --repo jj-vine.github.token` and re-run `jj-vine init`, or edit the repo config with `jj config edit --repo`."
             );
             return Ok(None);
         }
@@ -385,8 +361,9 @@ fn prompt_for_github_token(
         .dimmed()
     );
     println!();
-
-    prompts.token("jj-vine.github.token").map(Some)
+    prompts
+        .token("GitHub Personal Access Token", "jj-vine.github.token")
+        .map(Some)
 }
 
 #[cfg(test)]
@@ -452,7 +429,7 @@ mod tests {
             Ok(value)
         }
 
-        fn token(&mut self, key: &str) -> Result<String> {
+        fn token(&mut self, _label: &str, key: &str) -> Result<String> {
             self.asked.push(Asked {
                 key: key.to_owned(),
                 default: None,
@@ -461,6 +438,34 @@ mod tests {
             });
             Ok(self.tokens.pop_front().expect("scripted token").to_owned())
         }
+    }
+
+    #[test]
+    fn numeric_looking_pat_is_saved_as_a_string() {
+        let (_directory, repo_path, jj) = create_repo(&[]);
+        set_repo_config(&jj, "jj-vine.forge", "github");
+        let mut user = ScriptedUser::new(&[None, Some("owner/repo"), None], &["12345"]);
+        run_wizard(&jj, &repo_path, &mut user).expect("run wizard");
+        let config = crate::config::Config::load(&repo_path).expect("load config");
+        assert_eq!(config.github.token.as_str(), "12345");
+    }
+
+    #[test]
+    fn insecure_existing_host_falls_back_to_derived_https_host() {
+        let (_directory, repo_path, jj) =
+            create_repo(&[("origin", "git@github.com:owner/repo.git", None)]);
+        set_repo_config(
+            &jj,
+            "jj-vine.github.host",
+            "http://insecure.example.com/api/v3",
+        );
+        let mut user = ScriptedUser::new(&[None, None, None], &["fixture-pat"]);
+        run_wizard(&jj, &repo_path, &mut user).expect("use derived HTTPS host");
+        assert_eq!(
+            user.asked("jj-vine.github.host")
+                .and_then(|prompt| prompt.default.as_deref()),
+            Some("https://api.github.com")
+        );
     }
 
     fn create_repo(remotes: &[(&str, &str, Option<&str>)]) -> (TempDir, PathBuf, Jujutsu) {
@@ -559,24 +564,24 @@ mod tests {
         let (_directory, repo_path, jj) =
             create_repo(&[("origin", "git@github.com:owner/repo.git", None)]);
         set_repo_config(&jj, "jj-vine.github.host", "http://repo.example.com/api/v3");
-        let mut user = ScriptedUser::new(&[None], &[]);
-        run_wizard(&jj, &repo_path, &mut user).expect_err("known-remote HTTP default rejected");
+        let mut user = ScriptedUser::new(&[None, None, None], &["fixture-pat"]);
+        run_wizard(&jj, &repo_path, &mut user).expect("discard insecure stored host");
         assert_eq!(
             user.asked("jj-vine.github.host")
                 .and_then(|prompt| prompt.default.as_deref()),
-            Some("http://repo.example.com/api/v3")
+            Some("https://api.github.com")
         );
 
         let (_directory, repo_path, jj) = create_isolated_repo(
             &[],
             "[jj-vine.github]\nhost = \"http://global.example.com/api/v3\"\n",
         );
-        let mut user = ScriptedUser::new(&[None], &[]);
-        run_wizard(&jj, &repo_path, &mut user).expect_err("no-remote HTTP default rejected");
+        let mut user = ScriptedUser::new(&[None, Some("owner/repo"), None], &["fixture-pat"]);
+        run_wizard(&jj, &repo_path, &mut user).expect("discard insecure user host");
         assert_eq!(
             user.asked("jj-vine.github.host")
                 .and_then(|prompt| prompt.default.as_deref()),
-            Some("http://global.example.com/api/v3")
+            Some(PUBLIC_API_HOST)
         );
 
         let (_directory, repo_path, jj) = create_isolated_repo(
@@ -887,6 +892,20 @@ mod tests {
         assert_eq!(
             effective(&jj, "jj-vine.github.tokenCommand").as_deref(),
             Some("malformed")
+        );
+    }
+    #[test]
+    fn empty_user_token_command_with_literal_token_completes_init() {
+        let (_directory, repo_path, jj) = create_isolated_repo(
+            &[],
+            "[jj-vine]\nforge = \"github\"\n[jj-vine.github]\ntoken = \"fixture-literal\"\ntokenCommand = []\n",
+        );
+        let mut user = ScriptedUser::new(&[None, Some("owner/repo"), None], &[]);
+        run(&jj, &repo_path, None, &mut user).expect("literal token permits init");
+        assert!(user.asked("jj-vine.github.token").is_none());
+        assert_eq!(
+            effective(&jj, "jj-vine.github.token").as_deref(),
+            Some("fixture-literal")
         );
     }
 

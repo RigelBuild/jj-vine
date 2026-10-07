@@ -2,7 +2,7 @@
 
 use std::{collections::HashMap, path::PathBuf};
 
-use dialoguer::{Input, Select};
+use dialoguer::{Input, Password, Select};
 use owo_colors::OwoColorize as _;
 use serde::Deserialize;
 use strum::VariantArray as _;
@@ -26,6 +26,56 @@ struct Remotes {
     source_push_url: Option<String>,
     upstream: Option<String>,
     target_forge: Option<DetectedForge>,
+}
+
+/// Checks a typed prompt value; the error is shown to the user.
+pub(super) type Validator = fn(&str) -> core::result::Result<(), &'static str>;
+
+/// One text prompt of an adapter wizard.
+pub(super) struct TextPrompt<'a> {
+    pub(super) label: &'a str,
+    pub(super) key: &'a str,
+    /// Accepted when the user enters nothing.
+    pub(super) default: Option<String>,
+    /// Pre-filled text the user can accept or erase.
+    pub(super) initial_text: Option<String>,
+    pub(super) allow_empty: bool,
+    pub(super) validate: Option<Validator>,
+}
+
+/// Source of adapter wizard answers.
+pub(super) trait Prompts {
+    fn text(&mut self, prompt: TextPrompt<'_>) -> Result<String>;
+
+    /// Read a Personal Access Token without echo.
+    fn token(&mut self, label: &str, key: &str) -> Result<String>;
+}
+
+/// Prompts on the user's terminal.
+pub(super) struct TerminalPrompts;
+
+impl Prompts for TerminalPrompts {
+    fn text(&mut self, prompt: TextPrompt<'_>) -> Result<String> {
+        let mut input = Input::<String>::new()
+            .with_prompt(format!("{} {}", prompt.label.bold(), prompt.key.dimmed()))
+            .allow_empty(prompt.allow_empty);
+        if let Some(default) = prompt.default {
+            input = input.default(default);
+        }
+        if let Some(initial_text) = prompt.initial_text {
+            input = input.with_initial_text(initial_text);
+        }
+        if let Some(validate) = prompt.validate {
+            input = input.validate_with(move |value: &String| validate(value));
+        }
+        Ok(input.interact_text()?)
+    }
+
+    fn token(&mut self, label: &str, key: &str) -> Result<String> {
+        Ok(Password::new()
+            .with_prompt(format!("{} {}", label.bold(), key.dimmed()))
+            .interact()?)
+    }
 }
 
 /// Initialize jj-vine configuration for this repository.
@@ -185,6 +235,20 @@ fn get_config(repo_path: impl Into<PathBuf>, key: &str) -> Option<String> {
             } else {
                 Some(value.to_owned())
             }
+        }
+        Err(_) => None,
+    }
+}
+
+/// Get a configuration value without tracing output that may contain a secret.
+pub(super) fn get_config_redacted(repo_path: impl Into<PathBuf>, key: &str) -> Option<String> {
+    match Jujutsu::new(repo_path)
+        .ok()?
+        .exec_redacted(["config", "get", key])
+    {
+        Ok(output) => {
+            let value = output.stdout.trim();
+            (!value.is_empty()).then(|| value.to_owned())
         }
         Err(_) => None,
     }
