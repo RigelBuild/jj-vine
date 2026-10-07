@@ -102,34 +102,42 @@ pub async fn plan(ctx: PlanContext<'_>) -> Result<SubmissionPlan> {
                         let target_branch = mr_base_branch(ctx.forge, bookmark, default_branch);
                         let is_root =
                             matches!(bookmark.parents.first(), None | Some(BookmarkRef::Trunk));
+                        let lookup_configured_base = is_root || ctx.forge.is_fork();
                         let mr = if let Some(configured_base) = ctx
                             .config
                             .default_base_branch
                             .as_deref()
-                            .filter(|_| is_root)
+                            .filter(|_| lookup_configured_base)
                         {
-                            if let Some(mr) = ctx
+                            let configured_base_mr = ctx
                                 .forge
                                 .find_merge_request_by_source_branch_base_branch(
                                     bookmark.name(),
                                     configured_base,
                                 )
-                                .await?
-                            {
-                                Some(mr)
-                            } else if let Some(mr) = ctx
-                                .forge
-                                .find_merge_request_by_source_branch_base_branch(
-                                    bookmark.name(),
-                                    ctx.jj.default_branch()?,
-                                )
-                                .await?
-                            {
+                                .await?;
+                            if let Some(mr) = configured_base_mr {
                                 Some(mr)
                             } else {
-                                ctx.forge
-                                    .find_merge_request_by_source_branch(bookmark.name())
-                                    .await?
+                                // Best-effort: the configured base must work without trunk().
+                                let trunk_mr = match ctx.jj.default_branch() {
+                                    Ok(trunk) if trunk != configured_base => {
+                                        ctx.forge
+                                            .find_merge_request_by_source_branch_base_branch(
+                                                bookmark.name(),
+                                                trunk,
+                                            )
+                                            .await?
+                                    }
+                                    _ => None,
+                                };
+                                if let Some(mr) = trunk_mr {
+                                    Some(mr)
+                                } else {
+                                    ctx.forge
+                                        .find_merge_request_by_source_branch(bookmark.name())
+                                        .await?
+                                }
                             }
                         } else {
                             ctx.forge

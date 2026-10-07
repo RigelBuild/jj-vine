@@ -390,6 +390,94 @@ impl AzureDevOpsForge {
             pull_request,
         }
     }
+
+    async fn find_pull_request_by_source_branch(
+        &self,
+        branch: &str,
+        base_branch: Option<&str>,
+    ) -> Result<Option<MergeRequest>> {
+        let target_repository_id = &self.target_repository().await?.id;
+        let target_ref_name = base_branch.map(|branch| format!("refs/heads/{branch}"));
+
+        let mr_match = if self.is_fork() {
+            const COUNT: u32 = 1000;
+
+            let source_repository_id = &self.source_repository().await?.id;
+
+            let mut page = 0_u32;
+            loop {
+                let all_mrs_from_fork: ListResponse<GitPullRequest> = self
+                    .request_git(
+                        Method::GET,
+                        &self.target_project_id,
+                        format!(
+                            "/repositories/{}/pullRequests?api-version=7.1&$top={COUNT}&$skip={}",
+                            target_repository_id,
+                            COUNT.strict_mul(page)
+                        ),
+                        None::<()>,
+                    )
+                    .await?;
+
+                if all_mrs_from_fork.value.is_empty() {
+                    break None;
+                }
+
+                // Azure's fork source ref is not the PR's source ref.
+                if let Some(pr) = all_mrs_from_fork.value.into_iter().find(|pr| {
+                    pr.fork_source.as_ref().is_some_and(|fork| {
+                        fork.name == format!("refs/heads/{branch}")
+                            && fork.repository.id == *source_repository_id
+                    }) && target_ref_name
+                        .as_deref()
+                        .is_none_or(|target| pr.target_ref_name == target)
+                }) {
+                    break Some(pr);
+                }
+
+                page = page.strict_add(1);
+            }
+        } else {
+            let mut query = format!(
+                "/repositories/{target_repository_id}/pullRequests?api-version=7.1&searchCriteria.sourceRefName=refs/heads/{branch}"
+            );
+            if let Some(target_ref_name) = &target_ref_name {
+                query.push_str("&searchCriteria.targetRefName=");
+                query.push_str(&urlencoding::encode(target_ref_name));
+            }
+
+            self.request_git::<ListResponse<GitPullRequest>>(
+                Method::GET,
+                &self.target_project_id,
+                query,
+                None::<()>,
+            )
+            .await?
+            .value
+            .into_iter()
+            .find(|pr| {
+                target_ref_name
+                    .as_deref()
+                    .is_none_or(|target| pr.target_ref_name == target)
+            })
+        };
+
+        // The list API truncates descriptions.
+        Ok(OptionFuture::from(mr_match.map(|pr| {
+            self.request_git(
+                Method::GET,
+                &self.target_project_id,
+                format!(
+                    "/repositories/{target_repository_id}/pullRequests/{}",
+                    pr.pull_request_id
+                ),
+                None::<()>,
+            )
+        }))
+        .await
+        .transpose()?
+        .map(|pr| self.to_merge_request(pr)))
+    }
 }
 
 impl Forge for AzureDevOpsForge {
@@ -453,80 +541,16 @@ impl Forge for AzureDevOpsForge {
         &self,
         branch: &str,
     ) -> Result<Option<Self::MergeRequest>> {
-        let target_repository_id = &self.target_repository().await?.id;
+        self.find_pull_request_by_source_branch(branch, None).await
+    }
 
-        let mr_match = if self.is_fork() {
-            const COUNT: u32 = 1000;
-
-            let source_repository_id = &self.source_repository().await?.id;
-
-            let mut page = 0_u32;
-            loop {
-                let all_mrs_from_fork: ListResponse<GitPullRequest> = self
-                    .request_git(
-                        Method::GET,
-                        &self.target_project_id,
-                        // I cannot figure out a way to even filter by source repo,
-                        // `sourceRepositoryId` only works in the same project!
-                        format!(
-                            "/repositories/{}/pullRequests?api-version=7.1&$top={COUNT}&$skip={}",
-                            target_repository_id,
-                            COUNT.strict_mul(page)
-                        ),
-                        None::<()>,
-                    )
-                    .await?;
-
-                if all_mrs_from_fork.value.is_empty() {
-                    break None;
-                }
-
-                // sourceRefName doesn't work for forks because the ref is something dumb like
-                // `refs/pull/1/source`. So for forks, iterate all the PRs from the
-                // fork to find it manually, because azure doesn't seem to support filtering by
-                // fork ref name...
-                if let Some(pr) = all_mrs_from_fork.value.into_iter().find(|pr| {
-                    pr.fork_source.as_ref().is_some_and(|fork| {
-                        fork.name == format!("refs/heads/{branch}")
-                            && fork.repository.id == *source_repository_id
-                    })
-                }) {
-                    break Some(pr);
-                }
-
-                page = page.strict_add(1);
-            }
-        } else {
-            self
-            .request_git::<ListResponse<GitPullRequest>>(
-                Method::GET,
-                &self.target_project_id,
-                format!(
-                    "/repositories/{target_repository_id}/pullRequests?api-version=7.1&searchCriteria.sourceRefName=refs/heads/{branch}"
-                ),
-                None::<()>,
-            )
-            .await?
-            .value
-            .into_iter()
-            .next()
-        };
-
-        // The list API truncates descriptions! yay!
-        Ok(OptionFuture::from(mr_match.map(|pr| {
-            self.request_git(
-                Method::GET,
-                &self.target_project_id,
-                format!(
-                    "/repositories/{target_repository_id}/pullRequests/{}",
-                    pr.pull_request_id
-                ),
-                None::<()>,
-            )
-        }))
-        .await
-        .transpose()?
-        .map(|pr| self.to_merge_request(pr)))
+    async fn find_merge_request_by_source_branch_base_branch(
+        &self,
+        source_branch: &str,
+        base_branch: &str,
+    ) -> Result<Option<Self::MergeRequest>> {
+        self.find_pull_request_by_source_branch(source_branch, Some(base_branch))
+            .await
     }
 
     async fn create_merge_request(

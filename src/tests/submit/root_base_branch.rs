@@ -80,6 +80,72 @@ async fn planner_creates_root_mr_with_configured_base_and_keeps_child_parent_bas
 }
 
 #[tokio::test]
+async fn planner_uses_configured_base_when_trunk_is_unavailable() -> Result<()> {
+    let repo = TestRepo::new();
+    let root = repo.bookmark_name("root-without-trunk");
+    repo.create_change_and_tracked_bookmark(&root);
+
+    let config = config(Some("release"));
+    let forge = ForgeImpl::Test(TestForge::default());
+    let changes = repo.jj.log("mine() & bookmarks()")?;
+    let graph = BookmarkGraph::from_changes(&repo.jj, &changes, false)?;
+    let plan = plan_for(&repo, &config, &forge, &graph).await?;
+
+    let target = plan
+        .actions
+        .iter()
+        .flatten()
+        .find_map(|action| match action {
+            Action::CreateMR(action) if action.bookmark.to_string() == root => {
+                Some(action.target_branch.as_str())
+            }
+            _ => None,
+        });
+    assert_eq!(target, Some("release"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn planner_retargets_existing_fork_child_mr_from_trunk_to_configured_base() -> Result<()> {
+    let repo = with_main_trunk();
+    let root = repo.bookmark_name("fork-root");
+    let child = repo.bookmark_name("fork-child");
+    repo.create_change_and_tracked_bookmark(&root)
+        .jj(["new"])?
+        .create_change_and_tracked_bookmark(&child);
+    let forge = ForgeImpl::Test(
+        TestForge::builder()
+            .source_project_id("fork/project".to_owned())
+            .target_project_id("upstream/project".to_owned())
+            .merge_requests(std::collections::HashMap::from([(
+                "1".to_owned(),
+                MergeRequest::builder()
+                    .id("1".to_owned())
+                    .title("Fork child".to_owned())
+                    .source_branch(child.clone())
+                    .target_branch("main".to_owned())
+                    .build(),
+            )]))
+            .build(),
+    );
+    let config = config(Some("release"));
+    let changes = repo.jj.log("mine() & bookmarks()")?;
+    let graph = BookmarkGraph::from_changes(&repo.jj, &changes, false)?;
+    let plan = plan_for(&repo, &config, &forge, &graph).await?;
+
+    assert!(plan.actions.iter().flatten().any(|action| matches!(
+        action,
+        Action::UpdateMRBase(action)
+            if action.bookmark == child && action.new_target_branch == "release"
+    )));
+    assert!(!plan.actions.iter().flatten().any(|action| matches!(
+        action,
+        Action::CreateMR(action) if action.bookmark.to_string() == child
+    )));
+    Ok(())
+}
+
+#[tokio::test]
 async fn planner_retargets_existing_root_mr_from_trunk_to_configured_base() -> Result<()> {
     let repo = with_main_trunk();
     let root = repo.bookmark_name("root-retarget");
