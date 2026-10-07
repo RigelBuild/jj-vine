@@ -16,6 +16,7 @@ use crate::{
             MRUpdate,
             MRUpdateType,
         },
+        find_existing_merge_request,
         mr_base_branch,
     },
 };
@@ -72,19 +73,18 @@ impl ExecuteAction for SyncDependentMergeRequestsAction {
             .ok_or_else::<Error, _>(|| make_whatever!("Bookmark not found: {}", self.bookmark))?;
 
         let default_branch = ctx.execute.config.root_base_branch(ctx.execute.jj)?;
-
-        let mr = ctx
-            .execute
-            .forge
-            .find_merge_request_by_source_branch_base_branch(
-                &bookmark_name,
-                &mr_base_branch(ctx.execute.forge, bookmark, default_branch),
-            )
-            .await?
-            .ok_or_else::<Error, _>(|| {
-                make_whatever!("No merge request found for {}", bookmark_name)
-            })?;
-
+        let target_branch = mr_base_branch(ctx.execute.forge, bookmark, default_branch);
+        let mr = find_existing_merge_request(
+            ctx.execute.forge,
+            ctx.execute.jj,
+            ctx.execute.config,
+            bookmark,
+            &target_branch,
+        )
+        .await?
+        .ok_or_else::<Error, _>(|| {
+            make_whatever!("No merge request found for {}", bookmark_name)
+        })?;
         let dependent_merge_request_iids: Vec<_> = bookmark
             .parents
             .iter()
@@ -93,17 +93,19 @@ impl ExecuteAction for SyncDependentMergeRequestsAction {
                 BookmarkRef::Trunk => None,
             })
             .map(|parent_bookmark| async move {
-                let mr = ctx
-                    .execute
-                    .forge
-                    .find_merge_request_by_source_branch_base_branch(
-                        parent_bookmark.name(),
-                        &mr_base_branch(ctx.execute.forge, parent_bookmark, default_branch),
-                    )
-                    .await?
-                    .ok_or_else::<Error, _>(|| {
-                        make_whatever!("No merge request found for {}", parent_bookmark.name())
-                    })?;
+                let target_branch =
+                    mr_base_branch(ctx.execute.forge, parent_bookmark, default_branch);
+                let mr = find_existing_merge_request(
+                    ctx.execute.forge,
+                    ctx.execute.jj,
+                    ctx.execute.config,
+                    parent_bookmark,
+                    &target_branch,
+                )
+                .await?
+                .ok_or_else::<Error, _>(|| {
+                    make_whatever!("No merge request found for {}", parent_bookmark.name())
+                })?;
                 Ok(mr.iid().to_string())
             })
             .collect::<FuturesUnordered<_>>()

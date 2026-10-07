@@ -89,42 +89,50 @@ pub mod find_pr_by_head_ref {
         RelayConnection,
     };
 
-    pub fn query() -> &'static str {
-        "
-query FindPRByHeadRef($owner: String!, $repositoryName: String!, $headRefName: String!) {
-  repository(owner: $owner, name: $repositoryName) {
-    pullRequests(states: OPEN, headRefName: $headRefName, first: 10) {
-      nodes {
-        number
-        databaseId
-        title
-        body
-        headRefName
-        headRepository { nameWithOwner }
-        headRefOid
-        baseRefName
-        baseRepository { nameWithOwner }
-        baseRefOid
-        state
-        url
-        isDraft
-        merged
-        createdAt
-        author { login }
-        assignees(first: 100) { nodes { databaseId login } }
-        reviewRequests(first: 100) {
-          nodes {
-            requestedReviewer {
-              __typename
-              ... on User { databaseId login }
-            }
-          }
-        }
-      }
+    macro_rules! pr_lookup_query {
+        ($base_variable:literal, $base_argument:literal) => {
+            concat!(
+                "\nquery FindPRByHeadRef($owner: String!, $repositoryName: String!, $headRefName: String!",
+                $base_variable,
+                ") {\n  repository(owner: $owner, name: $repositoryName) {\n    pullRequests(states: OPEN, headRefName: $headRefName",
+                $base_argument,
+                ", first: 10) {\n      nodes {\n",
+                "        number\n",
+                "        databaseId\n",
+                "        title\n",
+                "        body\n",
+                "        headRefName\n",
+                "        headRepository { nameWithOwner }\n",
+                "        headRefOid\n",
+                "        baseRefName\n",
+                "        baseRepository { nameWithOwner }\n",
+                "        baseRefOid\n",
+                "        state\n",
+                "        url\n",
+                "        isDraft\n",
+                "        merged\n",
+                "        createdAt\n",
+                "        author { login }\n",
+                "        assignees(first: 100) { nodes { databaseId login } }\n",
+                "        reviewRequests(first: 100) {\n",
+                "          nodes {\n",
+                "            requestedReviewer {\n",
+                "              __typename\n",
+                "              ... on User { databaseId login }\n",
+                "            }\n",
+                "          }\n",
+                "        }\n",
+                "      }\n    }\n  }\n}\n",
+            )
+        };
     }
-  }
-}
-"
+
+    pub fn query() -> &'static str {
+        pr_lookup_query!("", "")
+    }
+
+    pub fn query_by_head_and_base_ref() -> &'static str {
+        pr_lookup_query!(", $baseRefName: String!", ", baseRefName: $baseRefName")
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize)]

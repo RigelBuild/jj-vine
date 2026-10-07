@@ -287,6 +287,56 @@ async fn planner_keeps_existing_child_mr_target_at_parent_bookmark() -> Result<(
 }
 
 #[tokio::test]
+async fn planner_retargets_existing_child_mr_from_deleted_middle_base() -> Result<()> {
+    let repo = with_main_trunk();
+    let root = repo.bookmark_name("root-deleted-middle");
+    let child = repo.bookmark_name("child-deleted-middle");
+    repo.create_change_and_tracked_bookmark(&root)
+        .jj(["new"])?
+        .create_change_and_tracked_bookmark(&child);
+
+    let forge = ForgeImpl::Test(
+        TestForge::builder()
+            .merge_requests(std::collections::HashMap::from([
+                (
+                    "1".to_owned(),
+                    MergeRequest::builder()
+                        .id("1".to_owned())
+                        .title("Root".to_owned())
+                        .source_branch(root.clone())
+                        .target_branch("main".to_owned())
+                        .build(),
+                ),
+                (
+                    "2".to_owned(),
+                    MergeRequest::builder()
+                        .id("2".to_owned())
+                        .title("Child".to_owned())
+                        .source_branch(child.clone())
+                        .target_branch("deleted-middle".to_owned())
+                        .build(),
+                ),
+            ]))
+            .build(),
+    );
+    let config = config(None);
+    let changes = repo.jj.log("mine() & bookmarks()")?;
+    let graph = BookmarkGraph::from_changes(&repo.jj, &changes, false)?;
+    let plan = plan_for(&repo, &config, &forge, &graph).await?;
+
+    assert!(plan.actions.iter().flatten().any(|action| matches!(
+        action,
+        Action::UpdateMRBase(action)
+            if action.bookmark == child && action.new_target_branch == root
+    )));
+    assert!(!plan.actions.iter().flatten().any(|action| matches!(
+        action,
+        Action::CreateMR(action) if action.bookmark.to_string() == child
+    )));
+    Ok(())
+}
+
+#[tokio::test]
 async fn planner_keeps_trunk_target_when_root_base_is_unset() -> Result<()> {
     let repo = with_main_trunk();
     let root = repo.bookmark_name("root-default");

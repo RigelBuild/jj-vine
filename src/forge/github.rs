@@ -728,6 +728,22 @@ query GetDiscussions($owner: String!, $name: String!, $pr_number: Int!) {
         &self,
         branch: &str,
     ) -> Result<Vec<graphql::find_pr_by_head_ref::PRNode>> {
+        self.find_pull_requests(branch, None).await
+    }
+
+    async fn find_pull_requests_by_head_and_base_ref(
+        &self,
+        branch: &str,
+        base_branch: &str,
+    ) -> Result<Vec<graphql::find_pr_by_head_ref::PRNode>> {
+        self.find_pull_requests(branch, Some(base_branch)).await
+    }
+
+    async fn find_pull_requests(
+        &self,
+        branch: &str,
+        base_branch: Option<&str>,
+    ) -> Result<Vec<graphql::find_pr_by_head_ref::PRNode>> {
         let (target_owner, target_name) = split_project_id(&self.target_project_id)?;
 
         debug!(
@@ -737,16 +753,27 @@ query GetDiscussions($owner: String!, $name: String!, $pr_number: Int!) {
             "Looking up PR by source branch via GraphQL"
         );
 
-        let response: graphql::find_pr_by_head_ref::Response = self
-            .graphql(
+        let (query, variables) = match base_branch {
+            Some(base_branch) => (
+                graphql::find_pr_by_head_ref::query_by_head_and_base_ref(),
+                serde_json::json!({
+                    "owner": target_owner,
+                    "repositoryName": target_name,
+                    "headRefName": branch,
+                    "baseRefName": base_branch,
+                }),
+            ),
+            None => (
                 graphql::find_pr_by_head_ref::query(),
                 serde_json::json!({
                     "owner": target_owner,
                     "repositoryName": target_name,
                     "headRefName": branch,
                 }),
-            )
-            .await?;
+            ),
+        };
+        let response: graphql::find_pr_by_head_ref::Response =
+            self.graphql(query, variables).await?;
 
         let prs: Vec<_> = response
             .repository
@@ -846,7 +873,7 @@ impl Forge for GitHubForge {
         base_branch: &str,
     ) -> Result<Option<Self::MergeRequest>> {
         Ok(self
-            .find_pull_requests_by_head_ref(source_branch)
+            .find_pull_requests_by_head_and_base_ref(source_branch, base_branch)
             .await?
             .into_iter()
             .find(|pr| pr.base_ref_name == base_branch)

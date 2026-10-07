@@ -6,10 +6,10 @@ use std::collections::HashSet;
 use itertools::Itertools as _;
 
 use crate::{
-    bookmark::{BookmarkGraph, BookmarkWithPointers, JJName},
+    bookmark::{BookmarkGraph, BookmarkRef, BookmarkWithPointers, JJName},
     config::Config,
     error::Result,
-    forge::{Forge as _, ForgeImpl},
+    forge::{AnyForgeMergeRequest, Forge as _, ForgeImpl},
     jj::{Change, Jujutsu},
     output::Output,
     submit::plan::SubmissionPlan,
@@ -119,6 +119,38 @@ pub fn mr_base_branch(
     } else {
         bookmark.parent_name(default_branch)
     }
+}
+
+/// Fall back by source branch so stale stack bases cannot create duplicate MRs.
+pub(crate) async fn find_existing_merge_request(
+    forge: &ForgeImpl,
+    jj: &Jujutsu,
+    config: &Config,
+    bookmark: &BookmarkWithPointers<'_>,
+    target_branch: &str,
+) -> Result<Option<AnyForgeMergeRequest>> {
+    if let Some(mr) = forge
+        .find_merge_request_by_source_branch_base_branch(bookmark.name(), target_branch)
+        .await?
+    {
+        return Ok(Some(mr));
+    }
+
+    let is_root = matches!(bookmark.parents.first(), None | Some(BookmarkRef::Trunk));
+    if config.default_base_branch.is_some()
+        && (is_root || forge.is_fork())
+        && let Ok(trunk) = jj.default_branch()
+        && trunk != target_branch
+        && let Some(mr) = forge
+            .find_merge_request_by_source_branch_base_branch(bookmark.name(), trunk)
+            .await?
+    {
+        return Ok(Some(mr));
+    }
+
+    forge
+        .find_merge_request_by_source_branch(bookmark.name())
+        .await
 }
 
 #[derive(Clone)]
