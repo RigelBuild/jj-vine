@@ -1627,6 +1627,7 @@ mod tests {
         let changes = crate::submit::find_changes_to_submit(
             &jj,
             ["b"],
+            core::iter::empty::<&str>(),
             &std::collections::HashSet::<String>::new(),
         )
         .expect("changes to submit");
@@ -2174,7 +2175,7 @@ mod tests {
             .build();
         let output = BufferedOutput::new();
 
-        let changes = find_changes_to_submit(&repo.jj, ["c"], &HashSet::<String>::new())
+        let changes = find_changes_to_submit(&repo.jj, ["c"], ["c"], &HashSet::<String>::new())
             .expect("changes to submit");
         let graph = BookmarkGraph::from_changes(&repo.jj, &changes, false).expect("graph");
         let submission_plan = plan(PlanContext {
@@ -2328,7 +2329,7 @@ mod tests {
             .build();
         let output = BufferedOutput::new();
 
-        let changes = find_changes_to_submit(&repo.jj, ["c"], &HashSet::<String>::new())
+        let changes = find_changes_to_submit(&repo.jj, ["c"], ["c"], &HashSet::<String>::new())
             .expect("changes to submit");
         let graph = BookmarkGraph::from_changes(&repo.jj, &changes, false).expect("graph");
         let submission_plan = plan(PlanContext {
@@ -2459,8 +2460,8 @@ mod tests {
         let output = BufferedOutput::new();
 
         let pending = HashSet::from([pending_change]);
-        let changes =
-            find_changes_to_submit(&repo.jj, ["a", "b"], &pending).expect("changes to submit");
+        let changes = find_changes_to_submit(&repo.jj, ["a", "b"], ["a", "b"], &pending)
+            .expect("changes to submit");
         let graph = BookmarkGraph::from_changes(&repo.jj, &changes, false).expect("graph");
         let submission_plan = plan(PlanContext {
             jj: &repo.jj,
