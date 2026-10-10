@@ -486,7 +486,7 @@ impl GitLabConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GitHubConfig {
     /// GitHub API URL (e.g., `https://api.github.com` or `https://github.example.com/api/v3`).
@@ -517,10 +517,23 @@ pub struct GitHubConfig {
     #[serde(default)]
     pub token_command: Vec<String>,
     /// Register submitted pull requests as GitHub-native stacks with
-    /// `gh-stack`. Defaults to false; enables stack linking after GitHub
-    /// submits.
-    #[serde(default)]
+    /// `gh-stack`. Defaults to true, including when `[github]` is absent; set
+    /// false to skip stack linking after GitHub submits.
+    #[serde(default = "default_true")]
     pub link_stack: bool,
+}
+
+impl Default for GitHubConfig {
+    fn default() -> Self {
+        Self {
+            host: String::new(),
+            project: String::new(),
+            target_project: String::new(),
+            token: String::new(),
+            token_command: Vec::new(),
+            link_stack: true,
+        }
+    }
 }
 
 /// Maximum wall-clock time to wait for a `tokenCommand` helper.
@@ -1114,6 +1127,10 @@ mod tests {
         assert_eq!(config.gitlab.project, "my-group/my-project".to_owned());
         assert_eq!(config.gitlab.token, "glpat-test123".to_owned());
         assert_eq!(config.remote_name, "origin");
+        assert!(
+            config.github.link_stack,
+            "linkStack defaults on with no [github] table"
+        );
     }
 
     #[test]
@@ -1666,10 +1683,15 @@ mod tests {
     }
 
     #[test]
-    fn github_link_stack_defaults_to_false_when_absent() {
+    fn github_link_stack_defaults_to_true_when_absent() {
         let config: GitHubConfig =
             toml::from_str("project = \"owner/repo\"").expect("parse GitHubConfig");
-        assert!(!config.link_stack);
+        assert!(config.link_stack);
+    }
+
+    #[test]
+    fn github_link_stack_defaults_to_true_without_github_table() {
+        assert!(GitHubConfig::default().link_stack);
     }
 
     #[test]
