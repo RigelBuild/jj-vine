@@ -490,6 +490,12 @@ pub(crate) fn build_push_create_argv(
 #[cfg(test)]
 pub(crate) const ISOLATED_TEST_CONFIG: &str = "isolated-user-config.toml";
 
+/// Whether [`Jujutsu`] traces a command's stdout and stderr.
+#[derive(Debug, Clone, Copy)]
+enum OutputLogging {
+    Full,
+    Redacted,
+}
 impl Jujutsu {
     /// Create a new Jujutsu instance for the given working directory.
     pub fn new(cwd: impl Into<PathBuf>) -> Result<Self> {
@@ -548,6 +554,25 @@ impl Jujutsu {
         S: AsRef<OsStr>,
         T: IntoIterator<Item = S>,
     {
+        self.exec_inner(args, OutputLogging::Full)
+    }
+
+    /// Run a jj command whose output may carry secrets, such as remote URLs
+    /// with embedded credentials. Neither traces nor the error include the
+    /// command's stdout or stderr.
+    pub(crate) fn exec_redacted<S, T>(&self, args: T) -> Result<CommandOutput>
+    where
+        S: AsRef<OsStr>,
+        T: IntoIterator<Item = S>,
+    {
+        self.exec_inner(args, OutputLogging::Redacted)
+    }
+
+    fn exec_inner<S, T>(&self, args: T, logging: OutputLogging) -> Result<CommandOutput>
+    where
+        S: AsRef<OsStr>,
+        T: IntoIterator<Item = S>,
+    {
         let args: Vec<_> = args.into_iter().collect();
         let args_string = args.iter().map(|s| s.as_ref().to_string_lossy()).join(" ");
         trace!("Running jj command: jj {args_string}",);
@@ -574,9 +599,18 @@ impl Jujutsu {
         let stderr = String::from_utf8_lossy(&output.stderr);
 
         if !output.status.success() {
-            return Err(JjCommandSnafu {
-                message: format!("jj {args_string} failed: {stderr}"),
-                output: Some(output),
+            return Err(match logging {
+                OutputLogging::Full => JjCommandSnafu {
+                    message: format!("jj {args_string} failed: {stderr}"),
+                    output: Some(output),
+                },
+                OutputLogging::Redacted => JjCommandSnafu {
+                    message: format!(
+                        "jj {args_string} failed with {} (output redacted)",
+                        output.status
+                    ),
+                    output: None,
+                },
             }
             .build());
         }
@@ -584,8 +618,13 @@ impl Jujutsu {
         // TODO interleave
         let stdout = String::from_utf8_lossy(&output.stdout);
 
-        trace!("jj command output: {}", stdout);
-        trace!("jj command stderr: {}", stderr);
+        match logging {
+            OutputLogging::Full => {
+                trace!("jj command output: {}", stdout);
+                trace!("jj command stderr: {}", stderr);
+            }
+            OutputLogging::Redacted => trace!("jj command output redacted"),
+        }
         Ok(CommandOutput {
             status: output.status,
             stdout: stdout.to_string(),
