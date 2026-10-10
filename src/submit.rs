@@ -20,28 +20,89 @@ pub mod plan;
 pub mod stack_link;
 
 /// Find the changes that matter for a submission starting from `targets`:
-/// bookmarked changes authored by the current user that are reachable from
-/// the targets and are not already in the trunk ancestry.
+/// bookmarked changes reachable from the targets that are not already in the
+/// trunk ancestry. Only `explicit_targets` (bookmarks the user named
+/// literally) are included regardless of their author; every other target and
+/// every ancestry-walked bookmark is limited to the current user. A change
+/// included only through the bypass keeps just its explicitly named bookmarks,
+/// so another bookmark on the same change is not submitted with it.
 pub fn find_changes_to_submit(
     jj: &Jujutsu,
     targets: impl IntoIterator<Item = impl JJName>,
+    explicit_targets: impl IntoIterator<Item = impl JJName>,
     change_ids_pending_bookmarks: &HashSet<String, impl BuildHasher>,
 ) -> Result<Vec<Change>> {
-    jj.log_with_pending_bookmarks(
+    let explicit_names: HashSet<String> =
+        explicit_targets.into_iter().map(|t| t.raw_name()).collect();
+    let target_atoms: Vec<String> = targets.into_iter().map(|t| t.name_for_jj()).collect();
+
+    let explicit = if explicit_names.is_empty() {
+        "none()".to_owned()
+    } else {
+        explicit_names
+            .iter()
+            .map(|name| format!("bookmarks(exact:{})", revset_string_literal(name)))
+            .join(" | ")
+    };
+    let target_set = if target_atoms.is_empty() {
+        "none()".to_owned()
+    } else {
+        target_atoms.iter().join(" | ")
+    };
+    let pending = if change_ids_pending_bookmarks.is_empty() {
+        "none()".to_owned()
+    } else {
+        change_ids_pending_bookmarks.iter().join(" | ")
+    };
+
+    // Only a target that is itself submitted seeds the ancestry walk. A target
+    // dropped by `mine()` must not pull in the user's bookmarks below it.
+    let ancestry = format!("::(({target_set}) & (mine() | ({explicit}) | ({pending})))");
+
+    let mut changes = jj.log_with_pending_bookmarks(
         format!(
-            "((({}) & mine() & bookmarks()) | ({})) ~ (::trunk())",
-            targets
-                .into_iter()
-                .map(|t| format!("::{}", t.name_for_jj()))
-                .join(" | "),
-            if change_ids_pending_bookmarks.is_empty() {
-                "none()".to_owned()
-            } else {
-                change_ids_pending_bookmarks.iter().join(" | ")
-            }
+            "(({explicit}) | (({ancestry}) & mine() & bookmarks()) | ({pending})) ~ (::trunk())"
         ),
         change_ids_pending_bookmarks,
-    )
+    )?;
+
+    if !explicit_names.is_empty() {
+        let bypassed: HashSet<String> = jj
+            .log(format!("({explicit}) ~ mine()"))?
+            .into_iter()
+            .map(|change| change.change_id)
+            .collect();
+
+        for change in &mut changes {
+            if bypassed.contains(&change.change_id) {
+                change
+                    .bookmarks
+                    .retain(|bookmark| explicit_names.contains(bookmark.name()));
+            }
+        }
+    }
+
+    Ok(changes)
+}
+
+/// Quote `value` as a jj revset string literal, escaping per jj's grammar.
+fn revset_string_literal(value: &str) -> String {
+    let mut literal = String::with_capacity(value.len().saturating_add(2));
+    literal.push('"');
+    for c in value.chars() {
+        match c {
+            '"' => literal.push_str("\\\""),
+            '\\' => literal.push_str("\\\\"),
+            '\t' => literal.push_str("\\t"),
+            '\r' => literal.push_str("\\r"),
+            '\n' => literal.push_str("\\n"),
+            '\0' => literal.push_str("\\0"),
+            '\x1b' => literal.push_str("\\e"),
+            c => literal.push(c),
+        }
+    }
+    literal.push('"');
+    literal
 }
 
 /// Since we can't make a PR/MR between two fork branches, on the *target*

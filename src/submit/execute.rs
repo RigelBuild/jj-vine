@@ -651,8 +651,8 @@ mod tests {
             .change_id;
         let pending = HashSet::from([change_id.clone()]);
         // `main` contributes nothing past trunk; the pending change is the target.
-        let changes =
-            find_changes_to_submit(&repo.jj, ["main"], &pending).expect("changes to submit");
+        let changes = find_changes_to_submit(&repo.jj, ["main"], ["main"], &pending)
+            .expect("changes to submit");
         assert!(
             changes.iter().all(|change| change.bookmarks.is_empty()),
             "the change starts without a bookmark"

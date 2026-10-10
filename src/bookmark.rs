@@ -5,7 +5,7 @@ use itertools::Itertools as _;
 use owo_colors::OwoColorize as _;
 
 use crate::{
-    error::{BookmarkNotFoundSnafu, Error, Result},
+    error::{BookmarkNotFoundSnafu, Error, InvalidGraphSnafu, Result},
     jj::{BookmarkInfo, Change, Jujutsu},
 };
 
@@ -672,6 +672,13 @@ impl<'a> BookmarkGraph<'a> {
             .filter_map(|b| b.as_pending().map(|c| c.change_id.clone()))
             .collect();
 
+        // Walking past an excluded foreign parent would submit its changes under this
+        // bookmark.
+        let included_names: HashSet<String> = local_bookmarks
+            .iter()
+            .map(|b| b.name().to_owned())
+            .collect();
+
         let mut adjacency_list = BTreeMap::new();
 
         for bookmark in &local_bookmarks {
@@ -682,14 +689,16 @@ impl<'a> BookmarkGraph<'a> {
 
             let parent_bookmark_changes = Self::find_nearest_bookmarked_ancestors(
                 jj,
-                bookmark.change(),
+                bookmark,
                 skip_untracked_local_bookmarks,
+                &included_names,
                 &pending_bookmarks,
             )?;
 
             let parent_bookmark_names = BookmarkOrPending::from_changes(&parent_bookmark_changes)
                 .into_iter()
-                .map(|bookmark| bookmark.name().to_owned());
+                .map(|bookmark| bookmark.name().to_owned())
+                .filter(|name| included_names.contains(name));
 
             adjacency_list
                 .entry(bookmark.name().to_owned())
@@ -860,36 +869,89 @@ impl<'a> BookmarkGraph<'a> {
         component.downstack_of(bookmark_name)
     }
 
-    /// Find the nearest bookmarked ancestors starting from a given commit.
+    /// Find the nearest ancestors of `bookmark` that carry a selected bookmark
+    /// (one of `included_names`) or a pending bookmark.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the walk reaches an unselected, eligible bookmark on a change
+    /// not authored by the current user before any selected ancestor.
     fn find_nearest_bookmarked_ancestors(
         jj: &Jujutsu,
-        from: &Change,
+        bookmark: &BookmarkOrPending<'_>,
         skip_untracked_local_bookmarks: bool,
+        included_names: &HashSet<String>,
         pending_bookmarks: &HashSet<String>,
     ) -> Result<Vec<Change>> {
-        let mut ancestors = Vec::new();
-
-        let parents = jj.log_with_pending_bookmarks(
-            format!("{}- ~ ::trunk()", from.commit_id),
+        Self::walk_nearest_bookmarked_ancestors(
+            bookmark.change(),
+            included_names,
             pending_bookmarks,
-        )?;
+            |change| {
+                jj.log_with_pending_bookmarks(
+                    format!("{}- ~ ::trunk()", change.commit_id),
+                    pending_bookmarks,
+                )
+            },
+            |parent| {
+                let excluded: Vec<&str> = parent
+                    .bookmarks
+                    .iter()
+                    .filter(|info| {
+                        info.is_local() && (!skip_untracked_local_bookmarks || info.is_tracked())
+                    })
+                    .map(BookmarkInfo::name)
+                    .collect();
+                if excluded.is_empty() {
+                    return Ok(());
+                }
+                if jj.any_in_revset(format!("{} & mine()", parent.commit_id))? {
+                    return Ok(());
+                }
 
-        for parent in parents {
-            let bookmarks: Vec<_> = parent
+                let child = bookmark.name();
+                InvalidGraphSnafu {
+                    message: format!(
+                        "`{child}` stacks on {}, which another author owns and mine() excludes. Rebase onto trunk or a bookmark you own, or explicitly select the parent bookmark alongside the child to submit both.",
+                        excluded.iter().map(|name| format!("`{name}`")).join(", "),
+                    ),
+                }
+                .fail()
+            },
+        )
+    }
+
+    /// Visits each commit at most once, so merge paths sharing an unselected
+    /// ancestor cost one `query_parents` call per commit, not per path.
+    /// `check_unselected` sees every visited parent that is neither selected
+    /// nor pending; returning an error stops the walk, otherwise the walk
+    /// continues past it.
+    fn walk_nearest_bookmarked_ancestors(
+        from: &Change,
+        included_names: &HashSet<String>,
+        pending_bookmarks: &HashSet<String>,
+        mut query_parents: impl FnMut(&Change) -> Result<Vec<Change>>,
+        mut check_unselected: impl FnMut(&Change) -> Result<()>,
+    ) -> Result<Vec<Change>> {
+        let mut ancestors = Vec::new();
+        let mut visited = HashSet::from([from.commit_id.clone()]);
+        let mut to_visit: Vec<Change> = query_parents(from)?.into_iter().rev().collect();
+
+        while let Some(parent) = to_visit.pop() {
+            if !visited.insert(parent.commit_id.clone()) {
+                continue;
+            }
+
+            let has_included_bookmark = parent
                 .bookmarks
                 .iter()
-                .filter(|bookmark| !skip_untracked_local_bookmarks || bookmark.is_tracked())
-                .collect();
+                .any(|bookmark| included_names.contains(bookmark.name()));
 
-            if !bookmarks.is_empty() || pending_bookmarks.contains(&parent.change_id) {
+            if has_included_bookmark || pending_bookmarks.contains(&parent.change_id) {
                 ancestors.push(parent);
             } else {
-                ancestors.extend(Self::find_nearest_bookmarked_ancestors(
-                    jj,
-                    &parent,
-                    skip_untracked_local_bookmarks,
-                    pending_bookmarks,
-                )?);
+                check_unselected(&parent)?;
+                to_visit.extend(query_parents(&parent)?.into_iter().rev());
             }
         }
 
@@ -1347,6 +1409,123 @@ mod tests {
         let graph = BookmarkGraph::from_bookmarks(&repo.jj, bookmarks, false)?;
 
         assert_eq!(graph.components().len(), 1);
+
+        Ok(())
+    }
+
+    #[test]
+    fn nearest_ancestors_dedupes_diamond_merges() -> Result<()> {
+        let mut commits: BTreeMap<String, Change> = BTreeMap::new();
+        let mut add = |change: Change| {
+            let commit_id = change.commit_id.clone();
+            commits.insert(commit_id.clone(), change);
+            commit_id
+        };
+
+        add(Change::mock_from_bookmark("sel-a"));
+        add(Change::mock_from_bookmark("sel-b"));
+        let mut base =
+            add(Change::mock_from_bookmark("excluded")
+                .with_mock_parent_bookmarks(["sel-a", "sel-b"]));
+        for level in 0_usize..4 {
+            let left = add(Change::mock_from_change_id(&format!("left-{level}"))
+                .with_mock_parent_commit_ids([base.as_str()]));
+            let right = add(Change::mock_from_change_id(&format!("right-{level}"))
+                .with_mock_parent_commit_ids([base.as_str()]));
+            base = add(Change::mock_from_change_id(&format!("merge-{level}"))
+                .with_mock_parent_commit_ids([left.as_str(), right.as_str()]));
+        }
+        let leaf_id =
+            add(Change::mock_from_bookmark("leaf").with_mock_parent_commit_ids([base.as_str()]));
+
+        let included_names =
+            HashSet::from(["leaf".to_owned(), "sel-a".to_owned(), "sel-b".to_owned()]);
+        let mut queries: BTreeMap<String, usize> = BTreeMap::new();
+
+        let ancestors = BookmarkGraph::walk_nearest_bookmarked_ancestors(
+            &commits[&leaf_id],
+            &included_names,
+            &HashSet::new(),
+            |change| {
+                *queries.entry(change.commit_id.clone()).or_default() += 1;
+                Ok(change
+                    .parent_commit_ids
+                    .iter()
+                    .map(|id| commits[id].clone())
+                    .collect())
+            },
+            |_| Ok(()),
+        )?;
+
+        let names: Vec<_> = BookmarkOrPending::from_changes(&ancestors)
+            .into_iter()
+            .map(|bookmark| bookmark.name().to_owned())
+            .collect();
+        assert_eq!(names, ["sel-a", "sel-b"]);
+        assert!(
+            queries.values().all(|&count| count == 1),
+            "a commit was queried more than once: {queries:?}"
+        );
+        assert_eq!(queries.len(), 14);
+
+        Ok(())
+    }
+
+    #[test]
+    fn nearest_pending_ancestor_stops_diamond_walk() -> Result<()> {
+        let mut commits: BTreeMap<String, Change> = BTreeMap::new();
+        let mut add = |change: Change| {
+            let commit_id = change.commit_id.clone();
+            commits.insert(commit_id.clone(), change);
+            commit_id
+        };
+
+        let mut older_pending = Change::mock_from_change_id("older-pending");
+        older_pending.pending_bookmark = true;
+        let older_pending_id = add(older_pending);
+        let mut nearest_pending = Change::mock_from_change_id("nearest-pending")
+            .with_mock_parent_commit_ids([older_pending_id.as_str()]);
+        nearest_pending.pending_bookmark = true;
+        let nearest_pending_id = add(nearest_pending);
+        let left_id = add(Change::mock_from_change_id("left")
+            .with_mock_parent_commit_ids([nearest_pending_id.as_str()]));
+        let right_id = add(Change::mock_from_change_id("right")
+            .with_mock_parent_commit_ids([nearest_pending_id.as_str()]));
+        let merge_id = add(Change::mock_from_change_id("merge")
+            .with_mock_parent_commit_ids([left_id.as_str(), right_id.as_str()]));
+        let leaf_id = add(
+            Change::mock_from_bookmark("leaf").with_mock_parent_commit_ids([merge_id.as_str()])
+        );
+
+        let included_names = HashSet::from(["leaf".to_owned()]);
+        let pending_change_ids =
+            HashSet::from(["nearest-pending".to_owned(), "older-pending".to_owned()]);
+        let mut queries: BTreeMap<String, usize> = BTreeMap::new();
+
+        let ancestors = BookmarkGraph::walk_nearest_bookmarked_ancestors(
+            &commits[&leaf_id],
+            &included_names,
+            &pending_change_ids,
+            |change| {
+                *queries.entry(change.commit_id.clone()).or_default() += 1;
+                Ok(change
+                    .parent_commit_ids
+                    .iter()
+                    .map(|id| commits[id].clone())
+                    .collect())
+            },
+            |_| Ok(()),
+        )?;
+
+        let pending_ids: Vec<_> = ancestors
+            .iter()
+            .map(|change| change.change_id.as_str())
+            .collect();
+        assert_eq!(pending_ids, ["nearest-pending"]);
+        assert_eq!(
+            queries,
+            BTreeMap::from([(leaf_id, 1), (merge_id, 1), (left_id, 1), (right_id, 1),])
+        );
 
         Ok(())
     }

@@ -3,6 +3,7 @@ use core::fmt::Write as _;
 use std::{
     borrow::Cow,
     collections::{HashMap, HashSet},
+    sync::LazyLock,
 };
 
 use clap::Args;
@@ -13,12 +14,13 @@ use cli_table::{
 };
 use itertools::Itertools as _;
 use owo_colors::OwoColorize as _;
+use regex::Regex;
 use snafu::{ensure_whatever, whatever};
 use tracing::warn;
 use unicode_segmentation::UnicodeSegmentation as _;
 
 use crate::{
-    bookmark::{BookmarkGraph, BookmarkOrPending},
+    bookmark::{BookmarkGraph, BookmarkOrPending, JJName},
     cli::CliConfig,
     commands::{GetBookmarksOptions, StrVisualWidth as _},
     config::{Config, ForgeType},
@@ -223,27 +225,17 @@ pub async fn submit(config: &SubmitCommandConfig, cli_config: &CliConfig<'_>) ->
 
     ensure_whatever!(!bookmarks.is_empty(), "No bookmarks in revset {}", revset);
 
-    let forge = ForgeImpl::new(&repo_config)?;
-
-    output.log_message(&format!(
-        "Submitting bookmarks{}: {}",
-        if config.dry_run {
-            " (dry run)"
-        } else if config.show_plan {
-            " (plan only)"
-        } else {
-            ""
-        },
-        bookmarks.iter().map(|b| b.magenta().to_string()).join(", ")
-    ));
-
-    let changes = find_changes_to_submit(
-        &jj,
-        bookmarks.iter().map(BookmarkOrPending::change_id),
-        &pending_bookmarks,
+    let changes = select_changes_to_submit(&jj, &revset, &bookmarks, &pending_bookmarks)?;
+    let bookmark_graph = BookmarkGraph::from_changes(&jj, &changes, config.revset_options.tracked)?;
+    announce_submission_graph(
+        &bookmark_graph,
+        &bookmarks,
+        config.dry_run,
+        config.show_plan,
+        output,
     )?;
 
-    let bookmark_graph = BookmarkGraph::from_changes(&jj, &changes, config.revset_options.tracked)?;
+    let forge = ForgeImpl::new(&repo_config)?;
 
     let submission_plan = plan::plan(PlanContext {
         jj: &jj,
@@ -414,6 +406,298 @@ pub async fn submit(config: &SubmitCommandConfig, cli_config: &CliConfig<'_>) ->
     }
 
     Ok(())
+}
+
+/// Resolve the full set of changes to submit for `revset` from its resolved
+/// `bookmarks`, applying the named-bookmark bypass.
+pub(crate) fn select_changes_to_submit(
+    jj: &Jujutsu,
+    revset: &str,
+    bookmarks: &[BookmarkOrPending<'_>],
+    pending_bookmarks: &HashSet<String>,
+) -> Result<Vec<crate::jj::Change>> {
+    find_changes_to_submit(
+        jj,
+        bookmarks.iter().map(BookmarkOrPending::change_id),
+        literal_bookmark_targets(jj, revset, bookmarks)?,
+        pending_bookmarks,
+    )
+}
+
+pub(crate) fn announce_submission_graph(
+    bookmark_graph: &BookmarkGraph<'_>,
+    bookmarks: &[BookmarkOrPending<'_>],
+    dry_run: bool,
+    show_plan: bool,
+    output: &impl crate::output::Output,
+) -> Result<()> {
+    let bookmark_names = bookmark_graph
+        .bookmarks_with_pointers()
+        .map(|bookmark| bookmark.bookmark.to_string())
+        .join(", ");
+    ensure_whatever!(
+        !bookmark_names.is_empty(),
+        "No changes to submit for bookmarks {}. Check whether each name is in trunk or resolved as a tag, and whether mine() filtered generalized selections.",
+        bookmarks.iter().map(JJName::raw_name).join(", ")
+    );
+    output.log_message(&format!(
+        "Submitting bookmarks{}: {bookmark_names}",
+        if dry_run {
+            " (dry run)"
+        } else if show_plan {
+            " (plan only)"
+        } else {
+            ""
+        },
+    ));
+    Ok(())
+}
+
+/// Exact top-level union bookmark names bypass `mine()`; other revsets do not.
+/// A same-named tag or bare revset alias prevents that bypass.
+pub(crate) fn literal_bookmark_targets<'b>(
+    jj: &Jujutsu,
+    revset: &str,
+    bookmarks: &'b [BookmarkOrPending<'_>],
+) -> Result<Vec<&'b str>> {
+    let mut literals = HashMap::new();
+    collect_union_literals(&tokenize_revset(revset), &mut literals);
+
+    let candidates: Vec<(&'b str, bool)> = bookmarks
+        .iter()
+        .filter(|bookmark| bookmark.is_bookmark())
+        .filter_map(|bookmark| {
+            literals
+                .get(bookmark.name())
+                .map(|&is_bare| (bookmark.name(), is_bare))
+        })
+        .collect();
+    if candidates.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let tags: HashSet<String> = jj
+        .exec(["tag", "list", "--template", r#"name ++ "\n""#])?
+        .stdout
+        .lines()
+        .map(str::to_owned)
+        .collect();
+
+    let mut targets = Vec::with_capacity(candidates.len());
+    for (name, is_bare) in candidates {
+        if tags.contains(name) || (is_bare && is_revset_alias(jj, name)?) {
+            continue;
+        }
+        targets.push(name);
+    }
+    Ok(targets)
+}
+
+/// Whether jj defines a symbol revset alias named `identifier`. jj expands
+/// such an alias in place of a bare identifier, never in place of a string
+/// literal.
+fn is_revset_alias(jj: &Jujutsu, identifier: &str) -> Result<bool> {
+    // A bare identifier holds no `"` or `\`, so quoting it as a TOML key is
+    // exact.
+    let key = format!(r#"revset-aliases."{identifier}""#);
+    let output = jj.exec([
+        "config",
+        "list",
+        "--include-defaults",
+        "--template",
+        r#"name ++ "\n""#,
+        &key,
+    ])?;
+    Ok(!output.stdout.trim().is_empty())
+}
+
+/// The few revset tokens that decide whether a union member is a literal.
+#[derive(Debug, PartialEq, Eq)]
+enum RevsetToken {
+    /// A bare identifier, which jj may expand as a revset alias.
+    Identifier(String),
+    /// A decoded string literal, which jj never alias-expands.
+    String(String),
+    LParen,
+    RParen,
+    Union,
+    /// Any other token. A member containing one is not a literal.
+    Other,
+}
+
+/// Tokenize `revset` per jj's revset grammar (`revset.pest`), only as far as
+/// recognizing symbol unions requires. Input that would not parse as a jj
+/// symbol becomes [`RevsetToken::Other`], which never yields a literal.
+fn tokenize_revset(revset: &str) -> Vec<RevsetToken> {
+    let mut tokens = Vec::new();
+    let mut chars = revset.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        let token = match c {
+            ' ' | '\t' | '\r' | '\n' | '\x0c' => continue,
+            '(' => RevsetToken::LParen,
+            ')' => RevsetToken::RParen,
+            '|' => RevsetToken::Union,
+            '"' => {
+                decode_string_literal(&mut chars).map_or(RevsetToken::Other, RevsetToken::String)
+            }
+            '\'' => {
+                let mut content = String::new();
+                let mut is_closed = false;
+                for next in chars.by_ref() {
+                    if next == '\'' {
+                        is_closed = true;
+                        break;
+                    }
+                    content.push(next);
+                }
+                if is_closed {
+                    RevsetToken::String(content)
+                } else {
+                    RevsetToken::Other
+                }
+            }
+            c if is_identifier_char(c) => {
+                let mut identifier = String::from(c);
+                while let Some(&next) = chars.peek()
+                    && is_identifier_char(next)
+                {
+                    identifier.push(next);
+                    chars.next();
+                }
+                if is_valid_identifier(&identifier) {
+                    RevsetToken::Identifier(identifier)
+                } else {
+                    RevsetToken::Other
+                }
+            }
+            _ => RevsetToken::Other,
+        };
+        tokens.push(token);
+    }
+
+    tokens
+}
+
+/// Characters a bare jj identifier may contain: any `XID_CONTINUE` character,
+/// plus `_`, `*`, `/`, and revset separators `.` / `-` / `+`.
+fn is_identifier_char(c: char) -> bool {
+    static XID_CONTINUE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"\A\p{XID_Continue}\z").expect("valid XID_Continue regex"));
+
+    let mut encoded = [0; 4];
+    XID_CONTINUE.is_match(c.encode_utf8(&mut encoded))
+        || matches!(c, '_' | '*' | '/' | '.' | '-' | '+')
+}
+
+/// jj's `identifier` rule: parts joined by `.`, a run of `-`, or `+`. Anything
+/// else (`a..b`, `a-`, `a+-`) is an operator expression, not a symbol.
+fn is_valid_identifier(identifier: &str) -> bool {
+    let is_separator = |c: char| matches!(c, '.' | '-' | '+');
+    let mut previous_separator: Option<char> = None;
+
+    for (index, c) in identifier.chars().enumerate() {
+        if is_separator(c) {
+            let joins_dashes = c == '-' && previous_separator == Some('-');
+            if index == 0 || (previous_separator.is_some() && !joins_dashes) {
+                return false;
+            }
+            previous_separator = Some(c);
+        } else {
+            previous_separator = None;
+        }
+    }
+
+    previous_separator.is_none()
+}
+
+/// Decode a `"..."` literal whose opening quote was already consumed, using
+/// jj's escapes. Returns `None` for an escape jj rejects or a missing close.
+fn decode_string_literal(chars: &mut impl Iterator<Item = char>) -> Option<String> {
+    let mut decoded = String::new();
+
+    loop {
+        match chars.next()? {
+            '"' => return Some(decoded),
+            '\\' => decoded.push(match chars.next()? {
+                't' => '\t',
+                'r' => '\r',
+                'n' => '\n',
+                '0' => '\0',
+                'e' => '\x1b',
+                '"' => '"',
+                '\\' => '\\',
+                'x' => {
+                    // jj takes exactly two hex digits and decodes them to the
+                    // character U+00HH, so `\xe9` is `é`.
+                    let hex = [chars.next()?, chars.next()?];
+                    if !hex.iter().all(char::is_ascii_hexdigit) {
+                        return None;
+                    }
+                    char::from(u8::from_str_radix(&String::from_iter(hex), 16).ok()?)
+                }
+                _ => return None,
+            }),
+            c => decoded.push(c),
+        }
+    }
+}
+
+/// Collect the literal symbols of the union in `tokens` into `literals`,
+/// mapping each name to whether every spelling of it is a bare identifier.
+fn collect_union_literals(tokens: &[RevsetToken], literals: &mut HashMap<String, bool>) {
+    let mut depth = 0_usize;
+    let mut member_start = 0;
+
+    for (index, token) in tokens.iter().enumerate() {
+        match token {
+            RevsetToken::LParen => depth = depth.saturating_add(1),
+            RevsetToken::RParen => depth = depth.saturating_sub(1),
+            RevsetToken::Union if depth == 0 => {
+                collect_member_literals(&tokens[member_start..index], literals);
+                member_start = index.saturating_add(1);
+            }
+            _ => {}
+        }
+    }
+
+    collect_member_literals(&tokens[member_start..], literals);
+}
+
+/// A union member is a literal when it is one symbol, or a parenthesized
+/// symbol or union.
+fn collect_member_literals(member: &[RevsetToken], literals: &mut HashMap<String, bool>) {
+    match member {
+        [RevsetToken::Identifier(name)] => {
+            literals.entry(name.clone()).or_insert(true);
+        }
+        // A string spelling names the bookmark even if a bare spelling of the
+        // same name elsewhere in the union expands an alias.
+        [RevsetToken::String(name)] => {
+            literals.insert(name.clone(), false);
+        }
+        [RevsetToken::LParen, inner @ .., RevsetToken::RParen] if is_balanced(inner) => {
+            collect_union_literals(inner, literals);
+        }
+        _ => {}
+    }
+}
+
+/// Whether `tokens` never closes a parenthesis it did not open, so stripping
+/// an outer pair around it removes a matching pair (rejects `(a) | (b)`).
+fn is_balanced(tokens: &[RevsetToken]) -> bool {
+    let mut depth = 0_usize;
+    for token in tokens {
+        match token {
+            RevsetToken::LParen => depth = depth.saturating_add(1),
+            RevsetToken::RParen => match depth.checked_sub(1) {
+                Some(next) => depth = next,
+                None => return false,
+            },
+            _ => {}
+        }
+    }
+    depth == 0
 }
 
 fn render_stack_link_outcome(

@@ -122,6 +122,7 @@ async fn plan_and_execute_with_config(
     let changes = find_changes_to_submit(
         &repo.jj,
         bookmarks.iter().map(BookmarkOrPending::change_id),
+        core::iter::empty::<&str>(),
         pending,
     )
     .expect("find changes to submit");
