@@ -144,13 +144,16 @@ impl ExecuteAction for UpdateMRTitleDescriptionAction {
         );
 
         let description_user_part = if let Some(description) = &self.description {
-            description // Stack part will be inserted after
+            description // Stack part will be inserted according to configured placement.
         } else {
             current_mr.description()
         };
 
-        let new_description =
-            insert_stack_into_description(&stack_description, description_user_part);
+        let new_description = insert_stack_into_description(
+            &stack_description,
+            description_user_part,
+            ctx.execute.config.description.placement,
+        );
 
         let description_unchanged = current_mr.description() == new_description;
 
@@ -231,5 +234,118 @@ impl ExecuteAction for UpdateMRTitleDescriptionAction {
                 Err(Error::new(error_msg))
             }
         }
+    }
+}
+#[cfg(test)]
+mod tests {
+    use std::{borrow::Cow, collections::HashMap};
+
+    use super::*;
+    use crate::{
+        bookmark::BookmarkGraph,
+        config::{
+            Config,
+            DescriptionConfig,
+            DescriptionDiagramConfig,
+            DescriptionDiagramFormat,
+            ForgeType,
+            StackPlacement,
+        },
+        description::{END_MARKER, START_MARKER},
+        forge::{
+            AnyForgeMergeRequest,
+            ForgeImpl,
+            test::{MergeRequest, TestForge},
+        },
+        output::FlatOutput,
+        submit::{ExecuteContext, plan::SubmissionPlan},
+        tests::TestRepo,
+    };
+
+    #[tokio::test]
+    async fn execute_places_refreshed_stack_above_existing_user_text() -> Result<()> {
+        let repo = TestRepo::with_main();
+        repo.set_config(r#"revset-aliases."trunk()""#, "main");
+        let bookmark = repo.bookmark_name("placement");
+        repo.create_change_and_bookmark(&bookmark);
+        let changes = repo.jj.log("all()")?;
+        let bookmark_graph = BookmarkGraph::from_changes(&repo.jj, &changes, false)?;
+
+        let existing_description =
+            format!("{START_MARKER}\nOutdated stack content\n{END_MARKER}\n\nUser notes");
+        let existing_mr = MergeRequest::builder()
+            .id("1".to_owned())
+            .title("Placement test".to_owned())
+            .description(existing_description)
+            .source_branch(bookmark.clone())
+            .target_branch("main".to_owned())
+            .build();
+        let test_forge = TestForge::builder()
+            .merge_requests(HashMap::from([("1".to_owned(), existing_mr.clone())]))
+            .build();
+        let forge = ForgeImpl::Test(test_forge);
+        let config = Config::builder()
+            .forge(ForgeType::Forgejo)
+            .description(DescriptionConfig {
+                placement: StackPlacement::Top,
+                diagram: DescriptionDiagramConfig {
+                    single: DescriptionDiagramFormat::Linear,
+                    ..DescriptionDiagramConfig::default()
+                },
+                ..DescriptionConfig::default()
+            })
+            .build();
+        let output = FlatOutput::default();
+        let plan = SubmissionPlan {
+            actions: Vec::new(),
+            existing_mrs: HashMap::from([(
+                bookmark.clone(),
+                AnyForgeMergeRequest::new(existing_mr),
+            )]),
+        };
+        let action = UpdateMRTitleDescriptionAction::builder()
+            .bookmark(BookmarkNameOrPendingChangeId::Bookmark(bookmark))
+            .generate_stack_in_description(true)
+            .build();
+
+        let result = action
+            .execute(ExecuteActionContext {
+                execute: ExecuteContext {
+                    jj: &repo.jj,
+                    forge: &forge,
+                    config: &config,
+                    output: &output,
+                    bookmark_graph: &bookmark_graph,
+                    dry_run: false,
+                    no_hooks: false,
+                    plan: &plan,
+                },
+                current_results: Vec::new(),
+            })
+            .await?;
+        assert!(
+            matches!(result, ActionResultData::MRUpdated(_)),
+            "expected action execution to update the merge request",
+        );
+
+        let ForgeImpl::Test(test_forge) = &forge else {
+            return Err(crate::error::Error::new("expected TestForge"));
+        };
+        let updated_mr = test_forge.get_merge_request(Cow::Borrowed("1")).await?;
+        let expected_stack = concat!(
+            "This MR is part of a stack containing 1 MR:\n\n",
+            "1. `main`\n",
+            "2. **\"Placement test\" (this MR)**",
+        );
+        let expected_description =
+            format!("{START_MARKER}\n{expected_stack}\n{END_MARKER}\n\nUser notes");
+
+        assert_eq!(
+            updated_mr.description.as_deref(),
+            Some(expected_description.as_str()),
+            "updated TestForge MR should place regenerated markers above user text",
+        );
+
+        Ok(())
     }
 }

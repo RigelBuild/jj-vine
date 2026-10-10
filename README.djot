@@ -347,6 +347,15 @@ will always be kept in sync with your PR/MR stack upon submitting your bookmark(
 If you would like description generation, but not a stack diagram, you can set each value of `description.diagram` to `none`. Alternatively, if you would
 like to only generate a stack diagram, you can set `description.singleRevision` and `description.multipleRevisions` to `none`.
 
+On resubmission, placement moves an existing stack block to the configured edge. The default
+`bottom` moves the block below user text; `top` moves it above user text. Text previously on the
+other side is reordered, and surrounding whitespace is normalized. If no stack is generated,
+the old marked block is removed.
+
+Rust callers must pass a `StackPlacement` argument to `insert_stack_into_description`. This is a
+source-breaking API change. `DescriptionConfig` struct literals must set `placement` or use
+`..DescriptionConfig::default()`.
+
 ### Configuration{#description-configuration}
 
 | Setting | Description | Type | Required | Default |
@@ -354,6 +363,7 @@ like to only generate a stack diagram, you can set `description.singleRevision` 
 | `description.enabled` | Whether to enable or disable description generation entirely. If false, pull/merge request descriptions will not be touched | Boolean | No | true |
 | `description.sync` | Whether to sync the description of a pull/merge request every time the bookmark is submitted. If this is enabled, any changes you make to the description will be overwritten by the generated description on the next submission. Defaults to false | Boolean | No | false |
 | `description.diagram` | How to render the stack diagram for different types of merge request stacks | Object | No | (see next rows) |
+| `description.placement` | Place the stack block before (`top`) or after (`bottom`) the user description | `top` \| `bottom` | No | `bottom` |
 | `description.singleRevision` | How to generate the non-stack part of the description for a pull/merge request when there is only one revision in the pull/merge request  | `none` \| `notFirstLine` \| `fullMessage` \| `commitListFirstLine` \| `commitListFull` \| `file(path_to_file)` (see below) | No | `notFirstLine` |
 | `description.multipleRevisions` | How to generate the non-stack part of the description for a pull/merge request when there are multiple revisions in the pull/merge request | `none` \| `notFirstLine` \| `fullMessage` \| `commitListFirstLine` \| `commitListFull` \| `file(path_to_file)` (see below) | No | `commitListFull` |
 | `description.diagram.single` | How to render a **single** pull/merge request, without any parents or children besides the trunk | `none` \| `linear` \| `tree` | No | `none` |

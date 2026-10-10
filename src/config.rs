@@ -789,6 +789,18 @@ impl AzureDevOpsConfig {
     }
 }
 
+/// Where to place the stack visualization in a pull/merge request description.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum StackPlacement {
+    /// Place the stack visualization before user content.
+    Top,
+
+    /// Place the stack visualization after user content. This is the default.
+    #[default]
+    Bottom,
+}
+
 fn default_description_single_revision() -> DescriptionMode {
     DescriptionMode::NotFirstLine
 }
@@ -825,6 +837,11 @@ pub struct DescriptionConfig {
     /// stacks.
     #[serde(default)]
     pub diagram: DescriptionDiagramConfig,
+
+    /// Where to place the stack visualization in the description (defaults to
+    /// bottom).
+    #[serde(default)]
+    pub placement: StackPlacement,
 }
 
 impl Default for DescriptionConfig {
@@ -833,6 +850,7 @@ impl Default for DescriptionConfig {
             enabled: true,
             sync: false,
             diagram: DescriptionDiagramConfig::default(),
+            placement: StackPlacement::default(),
             single_revision: DescriptionMode::NotFirstLine,
             multiple_revisions: DescriptionMode::CommitListFull,
         }
@@ -1236,6 +1254,7 @@ mod tests {
             config.description.diagram.complex,
             DescriptionDiagramFormat::Linear
         ));
+        assert_eq!(config.description.placement, StackPlacement::Bottom);
     }
 
     #[test]
@@ -1273,6 +1292,14 @@ mod tests {
             "false",
         ])
         .expect("Failed to set config");
+        jj.exec([
+            "config",
+            "set",
+            "--repo",
+            "jj-vine.description.placement",
+            "top",
+        ])
+        .expect("Failed to set config");
 
         jj.exec(["config", "set", "--repo", "jj-vine.forge", "gitlab"])
             .expect("Failed to set config");
@@ -1296,6 +1323,7 @@ mod tests {
             config.description.diagram.complex,
             DescriptionDiagramFormat::Linear
         ));
+        assert_eq!(config.description.placement, StackPlacement::Top);
     }
 
     #[test]

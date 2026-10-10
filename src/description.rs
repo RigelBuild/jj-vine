@@ -9,7 +9,7 @@ use itertools::Itertools as _;
 
 use crate::{
     bookmark::{BookmarkRef, ChangeComponent},
-    config::{DescriptionConfig, DescriptionDiagramFormat, DescriptionMode},
+    config::{DescriptionConfig, DescriptionDiagramFormat, DescriptionMode, StackPlacement},
     error::Result,
     forge::{AnyForgeMergeRequest, BorrowId, Forge as _, ForgeImpl, MergeRequestLike as _},
     jj::Change,
@@ -585,12 +585,14 @@ pub struct FormatContext<'a, 'forge, 'lookup, S: BuildHasher = RandomState> {
     pub format_merge_request: &'forge ForgeImpl,
 }
 
-/// Generate a new description with stack visualization and user content.
+/// Insert or replace the marked stack block at `placement`. An empty stack
+/// removes the block; retained user text is trimmed and may reorder.
 #[must_use]
 #[expect(clippy::module_name_repetitions, reason = "is sentence")]
 pub fn insert_stack_into_description(
     stack_description: &str,
     existing_description: &str,
+    placement: StackPlacement,
 ) -> String {
     let mut result = String::new();
 
@@ -614,16 +616,32 @@ pub fn insert_stack_into_description(
         if !after.is_empty() {
             write!(result, "\n{after}").unwrap();
         }
-    } else {
-        if !before.is_empty() {
-            writeln!(result, "{before}\n").unwrap();
-        }
-
+    } else if placement == StackPlacement::Top {
         write!(result, "{START_MARKER}\n{stack_description}\n{END_MARKER}").unwrap();
+
+        if !before.is_empty() {
+            write!(result, "\n\n{before}").unwrap();
+        }
 
         if !after.is_empty() {
             write!(result, "\n\n{after}").unwrap();
         }
+    } else {
+        if !before.is_empty() {
+            write!(result, "{before}").unwrap();
+        }
+
+        if !after.is_empty() {
+            if !result.is_empty() {
+                write!(result, "\n\n").unwrap();
+            }
+            write!(result, "{after}").unwrap();
+        }
+
+        if !result.is_empty() {
+            write!(result, "\n\n").unwrap();
+        }
+        write!(result, "{START_MARKER}\n{stack_description}\n{END_MARKER}").unwrap();
     }
 
     result
@@ -851,22 +869,33 @@ mod tests {
 
     #[test]
     fn parse_empty_description() {
-        assert_str_eq!(insert_stack_into_description("", ""), "");
+        assert_str_eq!(
+            insert_stack_into_description("", "", StackPlacement::Bottom),
+            ""
+        );
     }
 
     #[test]
     fn parse_user_content_only() {
         assert_str_eq!(
-            insert_stack_into_description("", "User's description here"),
+            insert_stack_into_description("", "User's description here", StackPlacement::Bottom),
             "User's description here"
         );
     }
 
     #[test]
-    fn parse_preserves_user_content_after_markers() {
+    fn bottom_stack_placement_follows_unmarked_user_content() {
         assert_str_eq!(
-            insert_stack_into_description("Stack info", "User content"),
+            insert_stack_into_description("Stack info", "User content", StackPlacement::Bottom),
             format!("User content\n\n{START_MARKER}\nStack info\n{END_MARKER}")
+        );
+    }
+
+    #[test]
+    fn top_stack_placement_precedes_user_content() {
+        assert_str_eq!(
+            insert_stack_into_description("Stack info", "User content", StackPlacement::Top),
+            format!("{START_MARKER}\nStack info\n{END_MARKER}\n\nUser content")
         );
     }
 
@@ -2046,16 +2075,45 @@ mod tests {
                 "New stack",
                 &format!(
                     "My notes before\n\n{START_MARKER}\nOld stack\n{END_MARKER}\n\nMy notes after"
-                )
+                ),
+                StackPlacement::Bottom
             ),
-            format!("My notes before\n\n{START_MARKER}\nNew stack\n{END_MARKER}\n\nMy notes after")
+            format!("My notes before\n\nMy notes after\n\n{START_MARKER}\nNew stack\n{END_MARKER}")
+        );
+    }
+
+    #[test]
+    fn bottom_moves_top_block_after_user_content() {
+        let existing = format!("{START_MARKER}\nOld stack\n{END_MARKER}\n\nMy notes");
+        let expected = format!("My notes\n\n{START_MARKER}\nNew stack\n{END_MARKER}");
+        let actual = insert_stack_into_description("New stack", &existing, StackPlacement::Bottom);
+
+        assert_str_eq!(actual, expected);
+        assert_str_eq!(
+            insert_stack_into_description("New stack", &actual, StackPlacement::Bottom),
+            expected
+        );
+    }
+
+    #[test]
+    fn top_round_trip_preserves_user_content_and_is_idempotent() {
+        let existing =
+            format!("My notes before\n\n{START_MARKER}\nOld stack\n{END_MARKER}\n\nMy notes after");
+        let expected =
+            format!("{START_MARKER}\nNew stack\n{END_MARKER}\n\nMy notes before\n\nMy notes after");
+        let actual = insert_stack_into_description("New stack", &existing, StackPlacement::Top);
+
+        assert_str_eq!(actual, expected);
+        assert_str_eq!(
+            insert_stack_into_description("New stack", &actual, StackPlacement::Top),
+            expected
         );
     }
 
     #[test]
     fn generate_no_trailing_whitespace_when_no_user_content() {
         assert_str_eq!(
-            insert_stack_into_description("New stack", ""),
+            insert_stack_into_description("New stack", "", StackPlacement::Bottom),
             format!("{START_MARKER}\nNew stack\n{END_MARKER}")
         );
     }
