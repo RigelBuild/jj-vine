@@ -724,6 +724,78 @@ query GetDiscussions($owner: String!, $name: String!, $pr_number: Int!) {
             .collect())
     }
 
+    async fn find_pull_requests_by_head_ref(
+        &self,
+        branch: &str,
+    ) -> Result<Vec<graphql::find_pr_by_head_ref::PRNode>> {
+        self.find_pull_requests(branch, None).await
+    }
+
+    async fn find_pull_requests_by_head_and_base_ref(
+        &self,
+        branch: &str,
+        base_branch: &str,
+    ) -> Result<Vec<graphql::find_pr_by_head_ref::PRNode>> {
+        self.find_pull_requests(branch, Some(base_branch)).await
+    }
+
+    async fn find_pull_requests(
+        &self,
+        branch: &str,
+        base_branch: Option<&str>,
+    ) -> Result<Vec<graphql::find_pr_by_head_ref::PRNode>> {
+        let (target_owner, target_name) = split_project_id(&self.target_project_id)?;
+
+        debug!(
+            branch,
+            target_project = %self.target_project_id,
+            source_project = %self.source_project_id,
+            "Looking up PR by source branch via GraphQL"
+        );
+
+        let (query, variables) = match base_branch {
+            Some(base_branch) => (
+                graphql::find_pr_by_head_ref::query_by_head_and_base_ref(),
+                serde_json::json!({
+                    "owner": target_owner,
+                    "repositoryName": target_name,
+                    "headRefName": branch,
+                    "baseRefName": base_branch,
+                }),
+            ),
+            None => (
+                graphql::find_pr_by_head_ref::query(),
+                serde_json::json!({
+                    "owner": target_owner,
+                    "repositoryName": target_name,
+                    "headRefName": branch,
+                }),
+            ),
+        };
+        let response: graphql::find_pr_by_head_ref::Response =
+            self.graphql(query, variables).await?;
+
+        let prs: Vec<_> = response
+            .repository
+            .into_iter()
+            .flat_map(|r| r.pull_requests.nodes)
+            .filter(|pr| {
+                pr.head_repository.as_ref().is_some_and(|r| {
+                    r.name_with_owner
+                        .eq_ignore_ascii_case(&self.source_project_id)
+                })
+            })
+            .collect();
+
+        debug!(
+            count = prs.len(),
+            source_project = %self.source_project_id,
+            "PR lookup result (filtered by head repository)"
+        );
+
+        Ok(prs)
+    }
+
     fn project_url_from_id(&self, project_id: &str) -> String {
         let base_url = if self.base_url.starts_with("https://api.github.com") {
             "https://github.com"
@@ -787,45 +859,25 @@ impl Forge for GitHubForge {
         &self,
         branch: &str,
     ) -> Result<Option<Self::MergeRequest>> {
-        let (target_owner, target_name) = split_project_id(&self.target_project_id)?;
-
-        debug!(
-            branch,
-            target_project = %self.target_project_id,
-            source_project = %self.source_project_id,
-            "Looking up PR by source branch via GraphQL"
-        );
-
-        let response: graphql::find_pr_by_head_ref::Response = self
-            .graphql(
-                graphql::find_pr_by_head_ref::query(),
-                serde_json::json!({
-                    "owner": target_owner,
-                    "repositoryName": target_name,
-                    "headRefName": branch,
-                }),
-            )
-            .await?;
-
-        let prs: Vec<_> = response
-            .repository
+        Ok(self
+            .find_pull_requests_by_head_ref(branch)
+            .await?
             .into_iter()
-            .flat_map(|r| r.pull_requests.nodes)
-            .filter(|pr| {
-                pr.head_repository.as_ref().is_some_and(|r| {
-                    r.name_with_owner
-                        .eq_ignore_ascii_case(&self.source_project_id)
-                })
-            })
-            .collect();
+            .next()
+            .map(PRNode::into_pull_request))
+    }
 
-        debug!(
-            count = prs.len(),
-            source_project = %self.source_project_id,
-            "PR lookup result (filtered by head repository)"
-        );
-
-        Ok(prs.into_iter().next().map(PRNode::into_pull_request))
+    async fn find_merge_request_by_source_branch_base_branch(
+        &self,
+        source_branch: &str,
+        base_branch: &str,
+    ) -> Result<Option<Self::MergeRequest>> {
+        Ok(self
+            .find_pull_requests_by_head_and_base_ref(source_branch, base_branch)
+            .await?
+            .into_iter()
+            .find(|pr| pr.base_ref_name == base_branch)
+            .map(PRNode::into_pull_request))
     }
 
     async fn create_merge_request(

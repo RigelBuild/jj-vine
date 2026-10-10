@@ -23,6 +23,7 @@ use crate::{
             update_mr_base::UpdateMRBaseAction,
             update_mr_title_description::UpdateMRTitleDescriptionAction,
         },
+        find_existing_merge_request,
         mr_base_branch,
     },
     title::get_mr_title,
@@ -81,7 +82,7 @@ impl PlanMergeRequest {
 pub async fn plan(ctx: PlanContext<'_>) -> Result<SubmissionPlan> {
     ctx.output.log_current("Planning submission");
 
-    let default_branch = ctx.jj.default_branch()?;
+    let default_branch = ctx.config.root_base_branch(ctx.jj)?;
 
     let mut batches: Vec<Vec<Action>> = Vec::new();
 
@@ -99,18 +100,16 @@ pub async fn plan(ctx: PlanContext<'_>) -> Result<SubmissionPlan> {
                             .output
                             .start_substep(&bookmark.name().magenta().to_string());
 
-                        if let Some(mr) = ctx
-                            .forge
-                            .find_merge_request_by_source_branch_base_branch(
-                                bookmark.name(),
-                                &mr_base_branch(ctx.forge, bookmark, default_branch),
-                            )
-                            .await?
-                        {
-                            Ok(Some((bookmark.name().to_owned(), mr)))
-                        } else {
-                            Ok(None)
-                        }
+                        let target_branch = mr_base_branch(ctx.forge, bookmark, default_branch);
+                        let mr = find_existing_merge_request(
+                            ctx.forge,
+                            ctx.jj,
+                            ctx.config,
+                            bookmark,
+                            &target_branch,
+                        )
+                        .await?;
+                        Ok(mr.map(|mr| (bookmark.name().to_owned(), mr)))
                     })
                     .collect::<FuturesUnordered<_>>()
                     .collect::<Vec<_>>()
@@ -229,8 +228,7 @@ pub async fn plan(ctx: PlanContext<'_>) -> Result<SubmissionPlan> {
                 }
             } else {
                 let revisions = bookmark.revisions(ctx.jj)?;
-                let title =
-                    get_mr_title(ctx.jj, &ctx.config.title, bookmark, component, revisions)?;
+                let title = get_mr_title(ctx.jj, ctx.config, bookmark, component, revisions)?;
 
                 let description = generate_description(
                     &ctx.config.description,
@@ -289,13 +287,8 @@ pub async fn plan(ctx: PlanContext<'_>) -> Result<SubmissionPlan> {
                         };
 
                         let maybe_title = if should_sync_title {
-                            let new_title = get_mr_title(
-                                ctx.jj,
-                                &ctx.config.title,
-                                bookmark,
-                                component,
-                                revisions,
-                            )?;
+                            let new_title =
+                                get_mr_title(ctx.jj, ctx.config, bookmark, component, revisions)?;
 
                             if new_title == *current_title {
                                 None

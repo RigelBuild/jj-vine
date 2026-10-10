@@ -194,6 +194,25 @@ impl GitLabForge {
         urlencoding::encode(&self.target_project_id).to_string()
     }
 
+    async fn find_merge_request_by_source_branch_with_base(
+        &self,
+        source_branch: &str,
+        base_branch: Option<&str>,
+    ) -> Result<Option<MergeRequest>> {
+        let mut path = format!(
+            "/api/v4/projects/{}/merge_requests?source_branch={}&state=opened",
+            self.encoded_target_project_id(),
+            urlencoding::encode(source_branch)
+        );
+        if let Some(base_branch) = base_branch {
+            path.push_str("&target_branch=");
+            path.push_str(&urlencoding::encode(base_branch));
+        }
+
+        let mrs: Vec<MergeRequest> = self.request(Method::GET, path, None::<()>).await?;
+        Ok(mrs.into_iter().next())
+    }
+
     fn api_error_message(
         &self,
         method: &Method,
@@ -406,18 +425,17 @@ impl Forge for GitLabForge {
         &self,
         branch: &str,
     ) -> Result<Option<Self::MergeRequest>> {
-        let mrs: Vec<MergeRequest> = self
-            .request(
-                Method::GET,
-                format!(
-                    "/api/v4/projects/{}/merge_requests?source_branch={}&state=opened",
-                    self.encoded_target_project_id(),
-                    urlencoding::encode(branch)
-                ),
-                None::<()>,
-            )
-            .await?;
-        Ok(mrs.into_iter().next())
+        self.find_merge_request_by_source_branch_with_base(branch, None)
+            .await
+    }
+
+    async fn find_merge_request_by_source_branch_base_branch(
+        &self,
+        source_branch: &str,
+        base_branch: &str,
+    ) -> Result<Option<Self::MergeRequest>> {
+        self.find_merge_request_by_source_branch_with_base(source_branch, Some(base_branch))
+            .await
     }
 
     /// Create a new merge request.

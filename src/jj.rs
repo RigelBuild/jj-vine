@@ -952,7 +952,7 @@ impl Jujutsu {
                             .ok_or_else(|| {
                                 // At this point, we _could_ try to figure out which bookmark in the list is "the default
                                 // bookmark for the default origin" per jj documentation - but the above is probably good enough for now.
-                                make_whatever!("Could not identify the default branch name. Try setting the `revset-aliases.trunk()` config option or set the `jj-vine.default_base_branch` config option explicitly.")
+                                make_whatever!("Could not identify the default branch name. Try setting the `revset-aliases.trunk()` config option or set the `jj-vine.defaultBaseBranch` config option explicitly.")
                             }),
                     },
                 }
