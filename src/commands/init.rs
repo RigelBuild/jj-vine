@@ -2,8 +2,7 @@
 
 use std::{collections::HashMap, path::PathBuf};
 
-use dialoguer::{Input, Select};
-use itertools::Itertools as _;
+use dialoguer::{Input, Password, Select};
 use owo_colors::OwoColorize as _;
 use serde::Deserialize;
 use strum::VariantArray as _;
@@ -13,6 +12,7 @@ use crate::{
     config::ForgeType,
     error::{Result, make_whatever},
     jj::Jujutsu,
+    remote::{self, DetectedForge},
 };
 
 mod azure;
@@ -21,20 +21,61 @@ mod github;
 mod gitlab;
 
 #[derive(Debug, Clone)]
-struct DetectedForge {
-    forge_type: ForgeType,
-    host: String,
-    project: String,
-
-    /// Only for Azure DevOps, the name of the repository.
-    repository_name: Option<String>,
-}
-
-#[derive(Debug, Clone)]
 struct Remotes {
     origin: String,
+    source_push_url: Option<String>,
     upstream: Option<String>,
     target_forge: Option<DetectedForge>,
+}
+
+/// Checks a typed prompt value; the error is shown to the user.
+pub(super) type Validator = fn(&str) -> core::result::Result<(), &'static str>;
+
+/// One text prompt of an adapter wizard.
+pub(super) struct TextPrompt<'a> {
+    pub(super) label: &'a str,
+    pub(super) key: &'a str,
+    /// Accepted when the user enters nothing.
+    pub(super) default: Option<String>,
+    /// Pre-filled text the user can accept or erase.
+    pub(super) initial_text: Option<String>,
+    pub(super) allow_empty: bool,
+    pub(super) validate: Option<Validator>,
+}
+
+/// Source of adapter wizard answers.
+pub(super) trait Prompts {
+    fn text(&mut self, prompt: TextPrompt<'_>) -> Result<String>;
+
+    /// Read a Personal Access Token without echo.
+    fn token(&mut self, label: &str, key: &str) -> Result<String>;
+}
+
+/// Prompts on the user's terminal.
+pub(super) struct TerminalPrompts;
+
+impl Prompts for TerminalPrompts {
+    fn text(&mut self, prompt: TextPrompt<'_>) -> Result<String> {
+        let mut input = Input::<String>::new()
+            .with_prompt(format!("{} {}", prompt.label.bold(), prompt.key.dimmed()))
+            .allow_empty(prompt.allow_empty);
+        if let Some(default) = prompt.default {
+            input = input.default(default);
+        }
+        if let Some(initial_text) = prompt.initial_text {
+            input = input.with_initial_text(initial_text);
+        }
+        if let Some(validate) = prompt.validate {
+            input = input.validate_with(move |value: &String| validate(value));
+        }
+        Ok(input.interact_text()?)
+    }
+
+    fn token(&mut self, label: &str, key: &str) -> Result<String> {
+        Ok(Password::new()
+            .with_prompt(format!("{} {}", label.bold(), key.dimmed()))
+            .interact()?)
+    }
 }
 
 /// Initialize jj-vine configuration for this repository.
@@ -199,51 +240,141 @@ fn get_config(repo_path: impl Into<PathBuf>, key: &str) -> Option<String> {
     }
 }
 
+/// Get a configuration value without tracing output that may contain a secret.
+pub(super) fn get_config_redacted(repo_path: impl Into<PathBuf>, key: &str) -> Option<String> {
+    match Jujutsu::new(repo_path)
+        .ok()?
+        .exec_redacted(["config", "get", key])
+    {
+        Ok(output) => {
+            let value = output.stdout.trim();
+            (!value.is_empty()).then(|| value.to_owned())
+        }
+        Err(_) => None,
+    }
+}
+
 /// Set a configuration value using jj config set.
 fn set_config(repo_path: impl Into<PathBuf>, key: &str, value: impl AsRef<str>) -> Result<()> {
     Jujutsu::new(repo_path)?.exec(["config", "set", "--repo", key, value.as_ref()])?;
     Ok(())
 }
+/// Unset a repository-level configuration value.
+pub(super) fn unset_config(repo_path: impl Into<PathBuf>, key: &str) -> Result<()> {
+    Jujutsu::new(repo_path)?.exec(["config", "unset", "--repo", key])?;
+    Ok(())
+}
 
-#[expect(clippy::single_call_fn, reason = "seems fine")]
+/// Set a configuration value without exposing its arguments or output to trace
+/// logs.
+pub(super) fn set_config_redacted(
+    repo_path: impl Into<PathBuf>,
+    key: &str,
+    value: &str,
+) -> Result<()> {
+    let value = toml::Value::String(value.to_owned()).to_string();
+    Jujutsu::new(repo_path)?.exec_secret(["config", "set", "--repo", key, &value])?;
+    Ok(())
+}
+
+/// Return the source layer for one effective configuration key.
+pub(super) fn config_key_source(jj: &Jujutsu, key: &str) -> Option<String> {
+    let output = jj
+        .exec([
+            "config",
+            "list",
+            "--template",
+            r#"name ++ "\t" ++ source ++ "\n""#,
+            key,
+        ])
+        .ok()?;
+    output.stdout.lines().find_map(|line| {
+        let (name, source) = line.split_once('\t')?;
+        (name == key).then(|| source.to_owned())
+    })
+}
+
+/// List config keys from the repo or workspace layer, without reading values.
+pub(super) fn clone_layer_keys(jj: &Jujutsu, table: &str) -> Option<Vec<String>> {
+    let output = jj
+        .exec([
+            "config",
+            "list",
+            "--template",
+            r#"name ++ "\t" ++ source ++ "\n""#,
+            table,
+        ])
+        .ok()?;
+    Some(
+        output
+            .stdout
+            .lines()
+            .filter_map(|line| line.split_once('\t'))
+            .filter(|(_, source)| matches!(*source, "repo" | "workspace"))
+            .map(|(name, _)| name.to_owned())
+            .collect(),
+    )
+}
+
+/// A non-empty config value is clone-explicit when its key comes from the
+/// repo or workspace layer. Unknown source layers keep the value.
+pub(super) fn clone_layer_nonempty(clone_keys: Option<&[String]>, key: &str, value: &str) -> bool {
+    !value.is_empty() && clone_keys.is_none_or(|keys| keys.iter().any(|name| name == key))
+}
+
+/// Keep clone-explicit values, otherwise prefer a remote-derived default to
+/// an inherited global value.
+pub(super) fn derived_config_default(
+    existing: Option<String>,
+    derived: Option<String>,
+    clone_keys: Option<&[String]>,
+    key: &str,
+) -> Option<String> {
+    let explicit = existing
+        .as_ref()
+        .filter(|value| clone_layer_nonempty(clone_keys, key, value));
+    explicit.cloned().or(derived).or(existing)
+}
+
+fn parse_init_remote_line(line: &str) -> Result<remote::RemoteListEntry<'_>> {
+    remote::parse_remote_list_line(line)
+        .ok_or_else(|| make_whatever!("Failed to parse remote line for <unknown>"))
+}
+
 fn detect_remotes(jj: &Jujutsu) -> Result<Option<Remotes>> {
-    let output = jj.exec(["git", "remote", "list"])?;
+    let output = jj.exec_redacted(["git", "remote", "list"])?;
     let remotes: HashMap<_, _> = output
         .stdout
         .lines()
-        .map(|line| {
-            line.split_whitespace()
-                .collect_tuple()
-                .ok_or_else(|| make_whatever!("Failed to parse remote line: {}", line))
-        })
+        .map(parse_init_remote_line)
+        .map(|entry| entry.map(|entry| (entry.name, entry)))
         .collect::<Result<_>>()?;
 
     let origin = remotes.get("origin");
 
-    if let Some(upstream) = remotes.get("upstream")
-        && let Some(origin) = origin
-    {
+    if let (Some(origin), Some(upstream)) = (origin, remotes.get("upstream")) {
         return Ok(Some(Remotes {
-            origin: origin.to_string(),
-            target_forge: parse_forge_url(upstream),
-            upstream: Some(upstream.to_string()),
+            origin: origin.fetch_url.to_owned(),
+            source_push_url: origin.push_url.map(str::to_owned),
+            target_forge: remote::parse_forge_url(upstream.fetch_url),
+            upstream: Some(upstream.fetch_url.to_owned()),
         }));
     }
 
-    if let Some(fork) = remotes.get("fork")
-        && let Some(origin) = origin
-    {
+    if let (Some(origin), Some(fork)) = (origin, remotes.get("fork")) {
         return Ok(Some(Remotes {
-            origin: fork.to_string(),
-            target_forge: parse_forge_url(origin),
-            upstream: Some(origin.to_string()),
+            origin: fork.fetch_url.to_owned(),
+            source_push_url: fork.push_url.map(str::to_owned),
+            target_forge: remote::parse_forge_url(origin.fetch_url),
+            upstream: Some(origin.fetch_url.to_owned()),
         }));
     }
 
     if let Some(origin) = origin {
         return Ok(Some(Remotes {
-            target_forge: parse_forge_url(origin),
-            origin: origin.to_string(),
+            target_forge: remote::parse_forge_url(origin.fetch_url),
+            origin: origin.fetch_url.to_owned(),
+            source_push_url: origin.push_url.map(str::to_owned),
             upstream: None,
         }));
     }
@@ -251,206 +382,164 @@ fn detect_remotes(jj: &Jujutsu) -> Result<Option<Remotes>> {
     Ok(None)
 }
 
-/// Parse a forge remote URL to detect forge type, host, and project.
-fn parse_forge_url(url: &str) -> Option<DetectedForge> {
-    // SSH format: ssh://git@host:owner/repo.git
-    // or ssh://git@host/owner/repo.git
-    if url.starts_with("git@") || url.starts_with("ssh://git@") {
-        let rest = url.trim_start_matches("ssh://").strip_prefix("git@")?;
-
-        let (host, rest) = if let Some((host, rest)) = rest.split_once(':') {
-            (host, rest)
-        } else {
-            let (host, rest) = rest.split_once('/')?;
-            (host, rest)
-        };
-
-        let forge_type = ForgeType::detect_from_host(host)?;
-
-        let (project, repository_name) = match forge_type {
-            ForgeType::AzureDevOps => {
-                if let Some((_, org, project, repo)) =
-                    rest.trim_end_matches(".git").split('/').collect_tuple()
-                {
-                    (format!("{org}/{project}"), Some(repo.to_owned()))
-                } else {
-                    (rest.trim_end_matches(".git").to_owned(), None)
-                }
-            }
-            _ => (rest.trim_end_matches(".git").to_owned(), None),
-        };
-
-        let api_host = match forge_type {
-            ForgeType::GitHub if host == "github.com" => "https://api.github.com".to_owned(),
-            ForgeType::GitHub => format!("https://{host}/api/v3"),
-            ForgeType::GitLab | ForgeType::Forgejo | ForgeType::AzureDevOps => {
-                format!("https://{host}")
-            }
-        };
-
-        return Some(DetectedForge {
-            forge_type,
-            host: api_host,
-            project: project.clone(),
-            repository_name,
-        });
-    }
-
-    // HTTPS format: https://host/owner/repo.git
-    if url.starts_with("https://") || url.starts_with("http://") {
-        let without_protocol = url
-            .strip_prefix("https://")
-            .or_else(|| url.strip_prefix("http://"))?;
-
-        let (host, path) = without_protocol.split_once('/')?;
-
-        let protocol = if url.starts_with("https://") {
-            "https"
-        } else {
-            "http"
-        };
-
-        let forge_type = ForgeType::detect_from_host(host)?;
-
-        let (project, repository_name) = match forge_type {
-            ForgeType::AzureDevOps => {
-                if let Some((_, org, project, repo)) =
-                    path.trim_end_matches(".git").split('/').collect_tuple()
-                {
-                    (format!("{org}/{project}"), Some(repo.to_owned()))
-                } else {
-                    (path.trim_end_matches(".git").to_owned(), None)
-                }
-            }
-            _ => (path.trim_end_matches(".git").to_owned(), None),
-        };
-
-        let api_host = match forge_type {
-            ForgeType::GitHub if host == "github.com" => "https://api.github.com".to_owned(),
-            ForgeType::GitHub => format!("{protocol}://{host}/api/v3"),
-            ForgeType::GitLab | ForgeType::Forgejo | ForgeType::AzureDevOps => {
-                format!("{protocol}://{host}")
-            }
-        };
-
-        return Some(DetectedForge {
-            forge_type,
-            host: api_host,
-            project: project.clone(),
-            repository_name,
-        });
-    }
-
-    None
-}
-
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
+    use tempfile::TempDir;
+
     use super::*;
 
-    #[test]
-    fn parse_gitlab_url_ssh() {
-        let url = "git@gitlab.example.com:group/project.git";
-        let result = parse_forge_url(url);
-        assert!(result.is_some());
-        let detected = result.unwrap();
-        assert_eq!(detected.forge_type, ForgeType::GitLab);
-        assert_eq!(detected.host, "https://gitlab.example.com");
-        assert_eq!(detected.project, "group/project");
+    /// Captures every tracing event at TRACE level into a shared buffer.
+    #[derive(Clone, Default)]
+    struct CapturedLogs(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLogs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("log buffer").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl CapturedLogs {
+        fn capture(&self, f: impl FnOnce()) -> String {
+            let writer = self.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::TRACE)
+                .with_writer(move || writer.clone())
+                .finish();
+            tracing::subscriber::with_default(subscriber, f);
+            String::from_utf8(self.0.lock().expect("log buffer").clone()).expect("utf-8 logs")
+        }
+    }
+
+    fn create_test_repo() -> (TempDir, PathBuf) {
+        let temp_dir = TempDir::new().expect("create temp directory");
+        let repo_path = temp_dir.path().join("repo");
+        std::fs::create_dir_all(&repo_path).expect("create repo directory");
+        let jj = Jujutsu::new(&repo_path).expect("create Jujutsu instance");
+        jj.exec(["git", "init", "--colocate"])
+            .expect("initialize jj repo");
+        (temp_dir, repo_path)
+    }
+
+    fn add_remote(repo_path: &Path, name: &str, url: &str) {
+        Jujutsu::new(repo_path)
+            .expect("create Jujutsu instance")
+            .exec(["git", "remote", "add", name, url])
+            .expect("add remote");
+    }
+    fn set_push_url(repo_path: &Path, name: &str, url: &str) {
+        Jujutsu::new(repo_path)
+            .expect("create Jujutsu instance")
+            .exec(["git", "remote", "set-url", name, "--push", url])
+            .expect("set push URL");
     }
 
     #[test]
-    fn parse_gitlab_url_https() {
-        let url = "https://gitlab.example.com/group/project.git";
-        let result = parse_forge_url(url);
-        assert!(result.is_some());
-        let detected = result.unwrap();
-        assert_eq!(detected.forge_type, ForgeType::GitLab);
-        assert_eq!(detected.host, "https://gitlab.example.com");
-        assert_eq!(detected.project, "group/project");
-    }
+    fn detect_remotes_keeps_fetch_target_and_push_source_urls() {
+        let (_temp, repo_path) = create_test_repo();
+        add_remote(&repo_path, "origin", "git@github.com:target/repo.git");
+        set_push_url(&repo_path, "origin", "git@github.com:source/repo.git");
 
-    #[test]
-    fn parse_gitlab_url_nested_groups() {
-        let url = "git@gitlab.example.com:group/subgroup/project.git";
-        let result = parse_forge_url(url);
-        assert!(result.is_some());
-        let detected = result.unwrap();
-        assert_eq!(detected.forge_type, ForgeType::GitLab);
-        assert_eq!(detected.project, "group/subgroup/project");
-    }
+        let jj = Jujutsu::new(&repo_path).expect("jj");
+        let remotes = detect_remotes(&jj)
+            .expect("detect remotes")
+            .expect("origin");
 
-    #[test]
-    fn parse_github_url_ssh() {
-        let url = "git@github.com:owner/repo.git";
-        let result = parse_forge_url(url);
-        assert!(result.is_some());
-        let detected = result.unwrap();
-        assert_eq!(detected.forge_type, ForgeType::GitHub);
-        assert_eq!(detected.host, "https://api.github.com");
-        assert_eq!(detected.project, "owner/repo");
-    }
-
-    #[test]
-    fn parse_github_url_https() {
-        let url = "https://github.com/owner/repo.git";
-        let result = parse_forge_url(url);
-        assert!(result.is_some());
-        let detected = result.unwrap();
-        assert_eq!(detected.forge_type, ForgeType::GitHub);
-        assert_eq!(detected.host, "https://api.github.com");
-        assert_eq!(detected.project, "owner/repo");
-    }
-
-    #[test]
-    fn parse_github_enterprise_ssh() {
-        let url = "git@github.example.com:owner/repo.git";
-        let result = parse_forge_url(url);
-        assert!(result.is_some());
-        let detected = result.unwrap();
-        assert_eq!(detected.forge_type, ForgeType::GitHub);
-        assert_eq!(detected.host, "https://github.example.com/api/v3");
-        assert_eq!(detected.project, "owner/repo");
-    }
-
-    #[test]
-    fn parse_github_enterprise_https() {
-        let url = "https://github.example.com/owner/repo.git";
-        let result = parse_forge_url(url);
-        assert!(result.is_some());
-        let detected = result.unwrap();
-        assert_eq!(detected.forge_type, ForgeType::GitHub);
-        assert_eq!(detected.host, "https://github.example.com/api/v3");
-        assert_eq!(detected.project, "owner/repo");
-    }
-
-    #[test]
-    fn detect_forge_from_host_github() {
+        assert_eq!(remotes.origin, "git@github.com:target/repo.git");
         assert_eq!(
-            ForgeType::detect_from_host("github.com"),
-            Some(ForgeType::GitHub)
+            remotes.source_push_url.as_deref(),
+            Some("git@github.com:source/repo.git")
         );
         assert_eq!(
-            ForgeType::detect_from_host("github.example.com"),
-            Some(ForgeType::GitHub)
+            remotes.target_forge.expect("target forge").project,
+            "target/repo"
         );
     }
 
     #[test]
-    fn detect_forge_from_host_gitlab() {
+    fn detect_remotes_selects_fork_as_source_and_origin_as_target() {
+        let (_temp, repo_path) = create_test_repo();
+        add_remote(&repo_path, "fork", "git@github.com:person/fork.git");
+        add_remote(&repo_path, "origin", "git@github.com:owner/repo.git");
+
+        let jj = Jujutsu::new(&repo_path).expect("jj");
+        let remotes = detect_remotes(&jj)
+            .expect("detect remotes")
+            .expect("origin");
+
+        assert_eq!(remotes.origin, "git@github.com:person/fork.git");
+        assert_eq!(remotes.source_push_url, None);
         assert_eq!(
-            ForgeType::detect_from_host("gitlab.com"),
-            Some(ForgeType::GitLab)
+            remotes.upstream.as_deref(),
+            Some("git@github.com:owner/repo.git")
         );
         assert_eq!(
-            ForgeType::detect_from_host("gitlab.example.com"),
-            Some(ForgeType::GitLab)
+            remotes.target_forge.expect("target forge").project,
+            "owner/repo"
         );
     }
 
     #[test]
-    fn detect_forge_from_host_unknown() {
-        assert_eq!(ForgeType::detect_from_host("git.example.com"), None);
-        assert_eq!(ForgeType::detect_from_host("code.example.com"), None);
+    fn detect_remotes_never_traces_remote_userinfo() {
+        let (_temp, repo_path) = create_test_repo();
+        add_remote(
+            &repo_path,
+            "origin",
+            "https://user:safe-fixture-token@github.com/owner/repo.git",
+        );
+        let jj = Jujutsu::new(&repo_path).expect("jj");
+
+        let logs = CapturedLogs::default().capture(|| {
+            let remotes = detect_remotes(&jj)
+                .expect("detect remotes")
+                .expect("origin");
+            assert_eq!(
+                remotes.origin,
+                "https://user:safe-fixture-token@github.com/owner/repo.git"
+            );
+        });
+
+        assert!(
+            logs.contains("git remote list"),
+            "trace capture is live: {logs}"
+        );
+        assert!(
+            !logs.contains("safe-fixture-token"),
+            "remote userinfo leaked: {logs}"
+        );
+    }
+
+    #[test]
+    fn malformed_remote_line_uses_fixed_redacted_diagnostic() {
+        let error = parse_init_remote_line("user:fixture-token@evil <no URL> extra")
+            .expect_err("malformed credential-shaped name must fail");
+        assert!(error.to_string().contains("<unknown>"));
+        assert!(!error.to_string().contains("fixture-token"));
+        assert!(!error.to_string().contains("evil"));
+    }
+
+    #[test]
+    fn detect_remotes_without_upstream_keeps_origin_as_source_and_target() {
+        let (_temp, repo_path) = create_test_repo();
+        add_remote(&repo_path, "origin", "git@github.com:owner/repo.git");
+
+        let jj = Jujutsu::new(&repo_path).expect("jj");
+        let remotes = detect_remotes(&jj)
+            .expect("detect remotes")
+            .expect("origin");
+
+        assert_eq!(remotes.origin, "git@github.com:owner/repo.git");
+        assert_eq!(remotes.source_push_url, None);
+        assert_eq!(remotes.upstream, None);
+        assert_eq!(
+            remotes.target_forge.expect("target forge").project,
+            "owner/repo"
+        );
     }
 }

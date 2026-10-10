@@ -4,8 +4,9 @@ use dialoguer::{Input, Password};
 use owo_colors::OwoColorize as _;
 
 use crate::{
-    commands::init::{Remotes, get_config, parse_forge_url, set_config},
+    commands::init::{Remotes, get_config, set_config},
     error::Result,
+    remote::parse_forge_url,
 };
 
 /// Initialize GitLab-specific configuration.
@@ -27,7 +28,11 @@ pub fn init(repo_path: impl Into<PathBuf>, remotes: Option<&Remotes>) -> Result<
             .or_else(|| parse_forge_url(&r.origin))
     });
 
-    let default_host = existing_host.or(target_forge.as_ref().map(|f| f.host.clone()));
+    let default_host = existing_host.or_else(|| {
+        target_forge
+            .as_ref()
+            .and_then(|forge| forge.host.derived().map(str::to_owned))
+    });
     let default_project = existing_project.or(source_forge
         .as_ref()
         .or(target_forge.as_ref())

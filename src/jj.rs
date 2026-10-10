@@ -495,6 +495,7 @@ pub(crate) const ISOLATED_TEST_CONFIG: &str = "isolated-user-config.toml";
 enum OutputLogging {
     Full,
     Redacted,
+    Secret,
 }
 impl Jujutsu {
     /// Create a new Jujutsu instance for the given working directory.
@@ -567,6 +568,14 @@ impl Jujutsu {
     {
         self.exec_inner(args, OutputLogging::Redacted)
     }
+    /// Run a command with secret arguments and redact its output and errors.
+    pub(crate) fn exec_secret<S, T>(&self, args: T) -> Result<CommandOutput>
+    where
+        S: AsRef<OsStr>,
+        T: IntoIterator<Item = S>,
+    {
+        self.exec_inner(args, OutputLogging::Secret)
+    }
 
     fn exec_inner<S, T>(&self, args: T, logging: OutputLogging) -> Result<CommandOutput>
     where
@@ -574,8 +583,13 @@ impl Jujutsu {
         T: IntoIterator<Item = S>,
     {
         let args: Vec<_> = args.into_iter().collect();
-        let args_string = args.iter().map(|s| s.as_ref().to_string_lossy()).join(" ");
-        trace!("Running jj command: jj {args_string}",);
+        let args_string = match logging {
+            OutputLogging::Full | OutputLogging::Redacted => {
+                args.iter().map(|s| s.as_ref().to_string_lossy()).join(" ")
+            }
+            OutputLogging::Secret => "<redacted>".to_owned(),
+        };
+        trace!("Running jj command: jj {args_string}");
 
         let jj_bin = Self::which()?;
         let mut command = Command::new(&jj_bin);
@@ -595,7 +609,6 @@ impl Jujutsu {
                     .ok_or_else(deadline_passed)?
             }
         };
-
         let stderr = String::from_utf8_lossy(&output.stderr);
 
         if !output.status.success() {
@@ -611,19 +624,23 @@ impl Jujutsu {
                     ),
                     output: None,
                 },
+                OutputLogging::Secret => JjCommandSnafu {
+                    message: format!("jj command failed with {} (output redacted)", output.status),
+                    output: None,
+                },
             }
             .build());
         }
 
-        // TODO interleave
         let stdout = String::from_utf8_lossy(&output.stdout);
-
         match logging {
             OutputLogging::Full => {
                 trace!("jj command output: {}", stdout);
                 trace!("jj command stderr: {}", stderr);
             }
-            OutputLogging::Redacted => trace!("jj command output redacted"),
+            OutputLogging::Redacted | OutputLogging::Secret => {
+                trace!("jj command output redacted");
+            }
         }
         Ok(CommandOutput {
             status: output.status,
