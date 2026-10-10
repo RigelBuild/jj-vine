@@ -685,6 +685,7 @@ impl<'a> BookmarkGraph<'a> {
                 bookmark.change(),
                 skip_untracked_local_bookmarks,
                 &pending_bookmarks,
+                &mut HashSet::new(),
             )?;
 
             let parent_bookmark_names = BookmarkOrPending::from_changes(&parent_bookmark_changes)
@@ -861,11 +862,21 @@ impl<'a> BookmarkGraph<'a> {
     }
 
     /// Find the nearest bookmarked ancestors starting from a given commit.
+    ///
+    /// `visited` records the `commit_id` of every commit whose ancestry has
+    /// already been expanded. Without it, a history with merge commits re-walks
+    /// shared ancestors once per path that reaches them — one `jj log`
+    /// subprocess each — which is exponential in the number of merges and does
+    /// not terminate on a moderately branchy repo. Deduplicating the expansion
+    /// makes the walk linear; the resulting set of boundary ancestors is
+    /// unchanged, because a boundary found on the first visit already bubbles
+    /// up to the root and the caller deduplicates.
     fn find_nearest_bookmarked_ancestors(
         jj: &Jujutsu,
         from: &Change,
         skip_untracked_local_bookmarks: bool,
         pending_bookmarks: &HashSet<String>,
+        visited: &mut HashSet<String>,
     ) -> Result<Vec<Change>> {
         let mut ancestors = Vec::new();
 
@@ -883,12 +894,13 @@ impl<'a> BookmarkGraph<'a> {
 
             if !bookmarks.is_empty() || pending_bookmarks.contains(&parent.change_id) {
                 ancestors.push(parent);
-            } else {
+            } else if visited.insert(parent.commit_id.clone()) {
                 ancestors.extend(Self::find_nearest_bookmarked_ancestors(
                     jj,
                     &parent,
                     skip_untracked_local_bookmarks,
                     pending_bookmarks,
+                    visited,
                 )?);
             }
         }
@@ -1347,6 +1359,91 @@ mod tests {
         let graph = BookmarkGraph::from_bookmarks(&repo.jj, bookmarks, false)?;
 
         assert_eq!(graph.components().len(), 1);
+
+        Ok(())
+    }
+
+    /// Regression: a history with chained merge commits must not re-walk
+    /// shared ancestors combinatorially. The old `find_nearest_bookmarked_
+    /// ancestors` recursed with no visited set and spawned one `jj log` per
+    /// visit, so a ladder of merges produced an exponential number of `jj`
+    /// invocations and did not terminate on a moderately branchy repo. With
+    /// the visited set the walk is linear: the invocation count stays a small
+    /// multiple of the commit count.
+    #[test]
+    fn merge_ladder_does_not_rewalk_combinatorially() -> Result<()> {
+        let repo = TestRepo::new();
+
+        // Build a ladder of diamonds on top of a single bookmarked `base`.
+        // Each rung merges two children of the previous rung, so the previous
+        // rung is a shared ancestor reachable by two paths. Under the old
+        // recursion each rung doubled how many times the lower rungs were
+        // re-expanded (2^depth); the visited set collapses that to one visit
+        // each.
+        //
+        // The interior rungs must carry no bookmark, or the walk stops at the
+        // first one. We use temporary bookmarks only to navigate while
+        // building, then delete them, leaving `base` and `leaf` as the only
+        // bookmarks — so resolving `leaf` descends the whole ladder to `base`.
+        repo.create_change("base.txt", "base", "base")
+            .create_bookmark("base");
+
+        // 8 rungs: without the fix this spawns 514 jj invocations (2.5x the 200
+        // ceiling), so it separates the two regimes decisively at a third less
+        // build cost than a deeper ladder.
+        let rungs: u32 = 8;
+        for i in 0..rungs {
+            let parent = if i == 0 {
+                "base".to_owned()
+            } else {
+                format!("rung{}", i - 1)
+            };
+            repo.jj(["new", &parent])?
+                .create_change(&format!("l{i}.txt"), "l", "left")
+                .jj(["new", &parent])?
+                .create_change(&format!("r{i}.txt"), "r", "right");
+            let rung_name = format!("rung{i}");
+            repo.jj(["new", "@", "@-"])?
+                .create_change(&format!("m{i}.txt"), "m", "merge")
+                .create_bookmark(&rung_name);
+        }
+
+        repo.jj(["new", &format!("rung{}", rungs - 1)])?
+            .create_change("leaf.txt", "leaf", "leaf")
+            .create_bookmark("leaf");
+
+        // Drop the interior rung bookmarks so only `base` and `leaf` remain.
+        for i in 0..rungs {
+            repo.jj(["bookmark", "delete", &format!("rung{i}")])?;
+        }
+
+        let base = repo.jj.log("base")?.into_iter().next().expect("base");
+        let leaf = repo.jj.log("leaf")?.into_iter().next().expect("leaf");
+        let changes = [base, leaf];
+        let bookmarks = BookmarkOrPending::from_changes(&changes);
+
+        let before = repo.jj.exec_count();
+        let graph = BookmarkGraph::from_bookmarks(&repo.jj, bookmarks, false)?;
+        let spawned = repo.jj.exec_count() - before;
+
+        // Linear bound: without the visited set this is exponential in `rungs`
+        // (~514 invocations at 8 rungs) and the test would hang at a deeper
+        // ladder. A generous linear ceiling still separates the two regimes.
+        assert!(
+            spawned <= 200,
+            "resolving `leaf` over {rungs} merge rungs spawned {spawned} jj \
+             invocations; expected a linear count (<=200). A combinatorial \
+             blow-up means the visited-set dedup regressed."
+        );
+
+        // The fix preserves behavior: leaf resolves and its downstack reaches
+        // base through the ladder.
+        assert!(graph.find_bookmark_in_components("leaf").is_some());
+        let downstack = graph.downstack_of("leaf")?;
+        assert!(
+            downstack.iter().any(|b| b.name() == "base"),
+            "leaf's downstack must reach base through the merge ladder, got: {downstack:?}"
+        );
 
         Ok(())
     }
