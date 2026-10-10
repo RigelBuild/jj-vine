@@ -141,7 +141,7 @@ impl GitLabForge {
         accept_non_compliant_certs: bool,
         create_merge_request_dependencies: bool,
     ) -> Result<Self> {
-        let mut client_builder = reqwest::Client::builder();
+        let mut client_builder = crate::forge::http_client_builder();
 
         // Accept non-compliant certificates if configured
         if accept_non_compliant_certs {
