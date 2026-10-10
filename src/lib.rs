@@ -78,6 +78,7 @@ pub mod error;
 pub mod forge;
 pub mod jj;
 pub mod output;
+mod process;
 pub mod submit;
 pub mod title;
 pub mod tracing_formatter;

@@ -970,6 +970,7 @@ dependencies = [
  "indicatif",
  "itertools",
  "jiff",
+ "libc",
  "owo-colors",
  "pluralizer",
  "pretty_assertions",
@@ -989,6 +990,7 @@ dependencies = [
  "urlencoding",
  "uuid",
  "which",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
