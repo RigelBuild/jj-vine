@@ -17,6 +17,7 @@ use crate::{
 
 pub mod execute;
 pub mod plan;
+pub mod stack_link;
 
 /// Find the changes that matter for a submission starting from `targets`:
 /// bookmarked changes authored by the current user that are reachable from

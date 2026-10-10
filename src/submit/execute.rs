@@ -5,7 +5,7 @@ pub mod sync_dependent_merge_requests;
 pub mod update_mr_base;
 pub mod update_mr_title_description;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use bon::bon;
 use enum_dispatch::enum_dispatch;
@@ -24,6 +24,7 @@ use crate::{
     },
     error::{ClonableError, Error, Result},
     forge::AnyForgeMergeRequest,
+    jj::{BookmarkInfo, Change},
     submit::{
         ExecuteContext,
         RootExecuteContext,
@@ -95,6 +96,14 @@ pub struct SubmissionResult {
 
     /// Bookmarks that were successfully pushed.
     pub bookmarks_pushed: Vec<String>,
+
+    /// Changes after execution has assigned names to pending bookmarks.
+    pub changes: Vec<Change>,
+
+    /// Bookmarks whose push or MR base update failed, including when the
+    /// action was skipped because a dependency failed. Their remote head or
+    /// PR base may not match the local stack.
+    pub failed_bookmarks: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -178,6 +187,33 @@ impl ExecuteActionContext<'_> {
             }
         }
     }
+}
+
+/// Collect the bookmarks of every failed push or MR base update. A skipped
+/// action carries an error result, so dependency failures count.
+///
+/// A failed MR creation or `--create` push needs no entry: it leaves the
+/// bookmark without a PR, which the stack link already treats as a gap.
+fn failed_bookmarks(actions: &[Vec<Action>], results: &[ActionResult]) -> BTreeSet<String> {
+    let mut failed = BTreeSet::new();
+    for action in actions.iter().flatten() {
+        let bookmarks = match action {
+            Action::Push(push) => push.bookmarks.as_slice(),
+            Action::UpdateMRBase(update) => core::slice::from_ref(&update.bookmark),
+            Action::PushCreate(_)
+            | Action::CreateMR(_)
+            | Action::UpdateMRTitleDescription(_)
+            | Action::SyncDependentMergeRequests(_) => continue,
+        };
+        let id = action.id();
+        if results
+            .iter()
+            .any(|result| result.id == id && result.data.is_err())
+        {
+            failed.extend(bookmarks.iter().cloned());
+        }
+    }
+    failed
 }
 
 #[enum_dispatch]
@@ -392,6 +428,8 @@ pub async fn execute(mut ctx: RootExecuteContext<'_>) -> Result<SubmissionResult
         }
     }
 
+    let failed_bookmarks = failed_bookmarks(&ctx.plan.actions, &current_results);
+
     for result in current_results {
         match result.data {
             Ok(ActionResultData::Pushed {
@@ -415,6 +453,8 @@ pub async fn execute(mut ctx: RootExecuteContext<'_>) -> Result<SubmissionResult
         merge_requests,
         errors,
         bookmarks_pushed,
+        changes: ctx.changes,
+        failed_bookmarks,
     })
 }
 
@@ -580,5 +620,88 @@ fn targets_unpushed_bookmark(
                         })
                     })
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+
+    use super::*;
+    use crate::{
+        config::{Config, ForgeType},
+        forge::{ForgeImpl, test::TestForge},
+        jj::BookmarkInfo,
+        output::BufferedOutput,
+        submit::{PlanContext, find_changes_to_submit, plan::plan},
+        tests::TestRepo,
+    };
+
+    #[tokio::test]
+    async fn submission_result_changes_carry_solidified_bookmark_names() {
+        let repo = TestRepo::with_local_remote();
+        repo.create_change("new.txt", "new", "New change");
+        let change_id = repo
+            .jj
+            .log("@")
+            .expect("read change")
+            .into_iter()
+            .next()
+            .expect("change exists")
+            .change_id;
+        let pending = HashSet::from([change_id.clone()]);
+        // `main` contributes nothing past trunk; the pending change is the target.
+        let changes =
+            find_changes_to_submit(&repo.jj, ["main"], &pending).expect("changes to submit");
+        assert!(
+            changes.iter().all(|change| change.bookmarks.is_empty()),
+            "the change starts without a bookmark"
+        );
+
+        let forge = ForgeImpl::Test(TestForge::default());
+        let config = Config::builder().forge(ForgeType::Forgejo).build();
+        let output = BufferedOutput::new();
+        let graph = BookmarkGraph::from_changes(&repo.jj, &changes, false).expect("graph");
+        let submission_plan = plan(PlanContext {
+            jj: &repo.jj,
+            forge: &forge,
+            config: &config,
+            output: &output,
+            bookmark_graph: &graph,
+            dry_run: false,
+        })
+        .await
+        .expect("plan");
+
+        let result = execute(RootExecuteContext::new(
+            &repo.jj,
+            &forge,
+            &config,
+            &output,
+            false,
+            submission_plan,
+            changes.clone(),
+            false,
+            false,
+        ))
+        .await
+        .expect("execute");
+
+        let pushed = result
+            .bookmarks_pushed
+            .first()
+            .expect("the push created a bookmark");
+        let change = result
+            .changes
+            .iter()
+            .find(|change| change.change_id == change_id)
+            .expect("change returned in result");
+        let names: Vec<&str> = change.bookmarks.iter().map(BookmarkInfo::name).collect();
+        assert_eq!(
+            names,
+            vec![pushed.as_str()],
+            "result carries the created name"
+        );
+        assert!(!change.pending_bookmark, "the change is no longer pending");
     }
 }

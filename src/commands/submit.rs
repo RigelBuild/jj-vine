@@ -1,6 +1,9 @@
 #![expect(clippy::module_name_repetitions, reason = "seems fine")]
 use core::fmt::Write as _;
-use std::{borrow::Cow, collections::HashSet};
+use std::{
+    borrow::Cow,
+    collections::{HashMap, HashSet},
+};
 
 use clap::Args;
 use cli_table::{
@@ -18,7 +21,7 @@ use crate::{
     bookmark::{BookmarkGraph, BookmarkOrPending},
     cli::CliConfig,
     commands::{GetBookmarksOptions, StrVisualWidth as _},
-    config::Config,
+    config::{Config, ForgeType},
     description::FormatMergeRequest as _,
     error::{AggregateSnafu, Result},
     forge::ForgeImpl,
@@ -30,6 +33,7 @@ use crate::{
         execute::{self, MRUpdate, MRUpdateType},
         find_changes_to_submit,
         plan,
+        stack_link::{self, StackLinkOutcome},
     },
 };
 
@@ -256,6 +260,16 @@ pub async fn submit(config: &SubmitCommandConfig, cli_config: &CliConfig<'_>) ->
         return Ok(());
     }
 
+    // The stack link needs PRs that existed at planning time, including any
+    // that execution leaves unchanged; keep them before the plan is consumed.
+    let link_stack = repo_config.forge == ForgeType::GitHub;
+    let existing_mrs =
+        if link_stack && repo_config.github.link_stack && !config.dry_run && !config.no_hooks {
+            submission_plan.existing_mrs.clone()
+        } else {
+            HashMap::new()
+        };
+
     let result = execute::execute(RootExecuteContext::new(
         &jj,
         &forge,
@@ -270,6 +284,19 @@ pub async fn submit(config: &SubmitCommandConfig, cli_config: &CliConfig<'_>) ->
     .await?;
 
     output.finish();
+
+    if link_stack {
+        let outcome = stack_link::link_stacks(
+            &repo_config.github,
+            &jj,
+            &result,
+            &existing_mrs,
+            config.revset_options.tracked,
+            config.dry_run,
+            config.no_hooks,
+        );
+        render_stack_link_outcome(&mut output, &outcome)?;
+    }
 
     writeln!(output, "\n═══════════════════════════════════════")?;
     writeln!(output, "{}", "Summary".bold())?;
@@ -387,6 +414,112 @@ pub async fn submit(config: &SubmitCommandConfig, cli_config: &CliConfig<'_>) ->
     }
 
     Ok(())
+}
+
+fn render_stack_link_outcome(
+    output: &mut impl core::fmt::Write,
+    outcome: &StackLinkOutcome,
+) -> core::fmt::Result {
+    match outcome {
+        StackLinkOutcome::Linked {
+            stacks,
+            unlinked,
+            warnings,
+        } => {
+            for stack in stacks {
+                let chain = stack
+                    .iter()
+                    .map(|pr| format!("#{pr}"))
+                    .collect::<Vec<_>>()
+                    .join(" → ");
+                writeln!(output, "{} {chain}", "Stacked:".green().bold())?;
+            }
+            for note in unlinked {
+                writeln!(output, "{}", format!("Note: {note}").yellow())?;
+            }
+            for warning in warnings {
+                writeln!(output, "{}", format!("Warning: {warning}").yellow())?;
+            }
+        }
+        StackLinkOutcome::Failed { warning } => {
+            writeln!(output, "{}", format!("Warning: {warning}").yellow())?;
+        }
+        StackLinkOutcome::Skipped(_) => {}
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::render_stack_link_outcome;
+    use crate::submit::stack_link::{SkipReason, StackLinkOutcome};
+
+    #[test]
+    fn linked_stack_renders_pull_request_chain() {
+        let mut output = String::new();
+        let outcome = StackLinkOutcome::Linked {
+            stacks: vec![vec![10, 20, 30]],
+            unlinked: vec![],
+            warnings: vec![],
+        };
+
+        render_stack_link_outcome(&mut output, &outcome).unwrap();
+
+        assert!(
+            output.contains("#10 → #20 → #30"),
+            "chain rendered: {output}"
+        );
+    }
+
+    #[test]
+    fn mixed_stack_link_renders_stacks_notes_and_warnings() {
+        let mut output = String::new();
+        let outcome = StackLinkOutcome::Linked {
+            stacks: vec![vec![1, 2]],
+            unlinked: vec!["solo left out".to_owned()],
+            warnings: vec!["failed to link stack #3 -> #4".to_owned()],
+        };
+
+        render_stack_link_outcome(&mut output, &outcome).unwrap();
+
+        assert!(output.contains("#1 → #2"), "linked stack kept: {output}");
+        assert!(
+            output.contains("Note: solo left out"),
+            "note kept: {output}"
+        );
+        assert!(
+            output.contains("Warning: failed to link stack #3 -> #4"),
+            "warning kept: {output}"
+        );
+    }
+
+    #[test]
+    fn failed_stack_link_renders_warning() {
+        let mut output = String::new();
+        let outcome = StackLinkOutcome::Failed {
+            warning: "gh-stack failed".to_owned(),
+        };
+
+        render_stack_link_outcome(&mut output, &outcome).unwrap();
+
+        assert!(
+            output.contains("Warning: gh-stack failed"),
+            "warning rendered: {output}"
+        );
+    }
+
+    #[test]
+    fn missing_binary_skip_renders_nothing() {
+        let mut output = String::new();
+
+        render_stack_link_outcome(
+            &mut output,
+            &StackLinkOutcome::Skipped(SkipReason::MissingBinary),
+        )
+        .unwrap();
+
+        assert!(output.is_empty());
+    }
 }
 
 trait WrapText {

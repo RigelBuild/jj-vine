@@ -486,7 +486,7 @@ impl GitLabConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GitHubConfig {
     /// GitHub API URL (e.g., `https://api.github.com` or `https://github.example.com/api/v3`).
@@ -516,10 +516,28 @@ pub struct GitHubConfig {
     /// starts another session or group can escape cleanup.
     #[serde(default)]
     pub token_command: Vec<String>,
+    /// Register submitted pull requests as GitHub-native stacks with
+    /// `gh-stack`. Defaults to true, including when `[github]` is absent; set
+    /// false to skip stack linking after GitHub submits.
+    #[serde(default = "default_true")]
+    pub link_stack: bool,
+}
+
+impl Default for GitHubConfig {
+    fn default() -> Self {
+        Self {
+            host: String::new(),
+            project: String::new(),
+            target_project: String::new(),
+            token: String::new(),
+            token_command: Vec::new(),
+            link_stack: true,
+        }
+    }
 }
 
 /// Maximum wall-clock time to wait for a `tokenCommand` helper.
-const TOKEN_COMMAND_TIMEOUT: core::time::Duration = core::time::Duration::from_secs(10);
+pub(crate) const TOKEN_COMMAND_TIMEOUT: core::time::Duration = core::time::Duration::from_secs(10);
 
 impl GitHubConfig {
     /// Get the repository where PRs target.
@@ -548,7 +566,8 @@ impl GitHubConfig {
     /// non-empty literal wins and is trimmed; otherwise the command's trimmed
     /// stdout is used. At most the first 1 MiB of stdout is kept; later bytes
     /// are dropped, and a truncated multibyte character fails UTF-8 validation.
-    /// The command must finish within 10 seconds.
+    /// The command must finish within 10 seconds of this call, `PATH` lookup
+    /// included.
     ///
     /// # Errors
     ///
@@ -565,7 +584,36 @@ impl GitHubConfig {
 
     /// Resolve the token with a caller-supplied timeout for deterministic
     /// tests.
-    fn resolved_token_with_timeout(&self, timeout: core::time::Duration) -> Result<String> {
+    pub(crate) fn resolved_token_with_timeout(
+        &self,
+        timeout: core::time::Duration,
+    ) -> Result<String> {
+        self.resolve_token(timeout, None, |bin| which::which(bin).ok())
+    }
+
+    /// Resolve the token for a phase that must end by `phase_deadline`. As
+    /// [`GitHubConfig::resolved_token`], but the command must also finish by
+    /// `phase_deadline`, and is not spawned once it has passed.
+    pub(crate) fn resolved_token_by_deadline(
+        &self,
+        phase_deadline: std::time::Instant,
+    ) -> Result<String> {
+        self.resolve_token(TOKEN_COMMAND_TIMEOUT, Some(phase_deadline), |bin| {
+            which::which(bin).ok()
+        })
+    }
+
+    /// Resolve the token. The command's `timeout` starts at this call, before
+    /// `find_binary` searches `PATH`, so a slow lookup counts against it. The
+    /// command must finish by the earlier of that limit and `phase_deadline`,
+    /// and is not spawned once that instant has passed.
+    fn resolve_token(
+        &self,
+        timeout: core::time::Duration,
+        phase_deadline: Option<std::time::Instant>,
+        find_binary: impl FnOnce(&str) -> Option<PathBuf>,
+    ) -> Result<String> {
+        let start = std::time::Instant::now();
         let literal = self.token.trim();
         if !literal.is_empty() {
             return Ok(literal.to_owned());
@@ -579,7 +627,13 @@ impl GitHubConfig {
             .build());
         };
 
-        let bin_path = which::which(bin).map_err(|_| {
+        let timeout_end = start
+            .checked_add(timeout)
+            .ok_or_else(|| std::io::Error::other("subprocess timeout is too large"))?;
+        let deadline = phase_deadline.map_or(timeout_end, |phase| phase.min(timeout_end));
+        let budget = deadline.saturating_duration_since(start);
+
+        let bin_path = find_binary(bin).ok_or_else(|| {
             ConfigSnafu {
                 message: "github.tokenCommand binary not found in PATH".to_owned(),
             }
@@ -588,9 +642,9 @@ impl GitHubConfig {
 
         let mut command = std::process::Command::new(&bin_path);
         command.args(args);
-        let Some(output) = crate::process::output_with_timeout(command, timeout)? else {
+        let Some(output) = crate::process::output_by_deadline(command, deadline)? else {
             return Err(ConfigSnafu {
-                message: format!("github.tokenCommand timed out after {timeout:?}"),
+                message: format!("github.tokenCommand timed out after {budget:?}"),
             }
             .build());
         };
@@ -1073,6 +1127,10 @@ mod tests {
         assert_eq!(config.gitlab.project, "my-group/my-project".to_owned());
         assert_eq!(config.gitlab.token, "glpat-test123".to_owned());
         assert_eq!(config.remote_name, "origin");
+        assert!(
+            config.github.link_stack,
+            "linkStack defaults on with no [github] table"
+        );
     }
 
     #[test]
@@ -1616,11 +1674,36 @@ mod tests {
             target_project: String::new(),
             token: "token".to_owned(),
             token_command: Vec::new(),
+            link_stack: true,
         };
 
         assert_eq!(config.target_project(), "myuser/myrepo");
         assert_eq!(config.source_project(), "myuser/myrepo");
         assert!(!config.is_fork_workflow());
+    }
+
+    #[test]
+    fn github_link_stack_defaults_to_true_when_absent() {
+        let config: GitHubConfig =
+            toml::from_str("project = \"owner/repo\"").expect("parse GitHubConfig");
+        assert!(config.link_stack);
+    }
+
+    #[test]
+    fn github_link_stack_defaults_to_true_without_github_table() {
+        assert!(GitHubConfig::default().link_stack);
+    }
+
+    #[test]
+    fn github_link_stack_false_parses_to_false() {
+        let config: GitHubConfig = toml::from_str("linkStack = false").expect("parse GitHubConfig");
+        assert!(!config.link_stack);
+    }
+
+    #[test]
+    fn github_link_stack_true_parses_to_true() {
+        let config: GitHubConfig = toml::from_str("linkStack = true").expect("parse GitHubConfig");
+        assert!(config.link_stack);
     }
 
     #[test]
@@ -1758,6 +1841,79 @@ mod tests {
             .to_string();
         assert!(message.contains("timed out"));
         assert!(start.elapsed() < core::time::Duration::from_secs(5));
+    }
+
+    /// A token command whose run would start a marker file, so a test can
+    /// tell whether it was spawned.
+    #[cfg(unix)]
+    fn marker_token_command(marker: &Path) -> GitHubConfig {
+        GitHubConfig {
+            token_command: vec![
+                "sh".to_owned(),
+                "-c".to_owned(),
+                "touch \"$1\"; printf command-token".to_owned(),
+                "_".to_owned(),
+                marker.display().to_string(),
+            ],
+            ..GitHubConfig::default()
+        }
+    }
+
+    /// A `PATH` lookup that finds `sh` only after `delay`, standing in for a
+    /// slow filesystem.
+    #[cfg(unix)]
+    fn slow_lookup(delay: core::time::Duration) -> impl FnOnce(&str) -> Option<PathBuf> {
+        move |bin| {
+            std::thread::sleep(delay);
+            which::which(bin).ok()
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn token_lookup_past_phase_deadline_never_spawns_helper() {
+        let temp = TempDir::new().expect("tempdir");
+        let marker = temp.path().join("ran");
+        let config = marker_token_command(&marker);
+        let phase_deadline = std::time::Instant::now() + core::time::Duration::from_millis(50);
+
+        let message = config
+            .resolve_token(
+                TOKEN_COMMAND_TIMEOUT,
+                Some(phase_deadline),
+                slow_lookup(core::time::Duration::from_millis(200)),
+            )
+            .expect_err("a lookup that ends past the phase deadline must time out")
+            .to_string();
+
+        assert!(message.contains("timed out"), "got {message}");
+        assert!(
+            !marker.exists(),
+            "the helper must not spawn after the deadline"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn token_timeout_counts_lookup_time() {
+        let temp = TempDir::new().expect("tempdir");
+        let marker = temp.path().join("ran");
+        let config = marker_token_command(&marker);
+
+        let message = config
+            .resolve_token(
+                core::time::Duration::from_millis(50),
+                None,
+                slow_lookup(core::time::Duration::from_millis(200)),
+            )
+            .expect_err("a lookup that outlasts the token timeout must time out")
+            .to_string();
+
+        assert!(message.contains("timed out"), "got {message}");
+        assert!(
+            !marker.exists(),
+            "the helper must not spawn after its timeout"
+        );
     }
 
     #[cfg(unix)]
