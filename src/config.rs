@@ -1,6 +1,6 @@
 #![expect(clippy::module_name_repetitions, reason = "fine for Config")]
 
-use std::path::PathBuf;
+use std::{borrow::Cow, path::PathBuf};
 
 use bon::Builder;
 use serde::{Deserialize, de::Visitor};
@@ -513,7 +513,10 @@ pub struct GitHubConfig {
     /// error. The command must be non-interactive: it gets null stdin and, on
     /// Unix, no controlling terminal. Processes remaining in its Unix process
     /// group or Windows job are killed when it exits. A Unix descendant that
-    /// starts another session or group can escape cleanup.
+    /// starts another session or group can escape cleanup. Each `{host}` in
+    /// the argv becomes the web host of `host` (see [`github_web_host`]).
+    /// Without `{host}`, the command's token is used for whatever `host`
+    /// resolves to, including one derived from the remote.
     #[serde(default)]
     pub token_command: Vec<String>,
     /// Register submitted pull requests as GitHub-native stacks with
@@ -582,6 +585,28 @@ impl GitHubConfig {
         self.resolved_token_with_timeout(TOKEN_COMMAND_TIMEOUT)
     }
 
+    /// The `tokenCommand` argv with each `{host}` replaced by the web host.
+    /// An argv without `{host}` is borrowed unchanged.
+    fn token_command_argv(&self) -> Result<Cow<'_, [String]>> {
+        if !self.token_command.iter().any(|arg| arg.contains("{host}")) {
+            return Ok(Cow::Borrowed(&self.token_command));
+        }
+        let Some(web_host) = github_web_host(&self.host) else {
+            return Err(ConfigSnafu {
+                message: "github.tokenCommand uses {host}, but github.host is not an \
+                          https:// URL with a host"
+                    .to_owned(),
+            }
+            .build());
+        };
+        Ok(Cow::Owned(
+            self.token_command
+                .iter()
+                .map(|arg| arg.replace("{host}", web_host))
+                .collect(),
+        ))
+    }
+
     /// Resolve the token with a caller-supplied timeout for deterministic
     /// tests.
     pub(crate) fn resolved_token_with_timeout(
@@ -619,12 +644,16 @@ impl GitHubConfig {
             return Ok(literal.to_owned());
         }
 
-        let Some((bin, args)) = self.token_command.split_first() else {
+        if self.token_command.is_empty() {
             return Err(ConfigSnafu {
                 message: "github.token or github.tokenCommand is required when forge is github"
                     .to_owned(),
             }
             .build());
+        }
+        let command_argv = self.token_command_argv()?;
+        let Some((bin, args)) = command_argv.split_first() else {
+            unreachable!("argv has one element per tokenCommand element");
         };
 
         let timeout_end = start
@@ -990,6 +1019,37 @@ fn clone_layer_nonempty(clone_keys: Option<&[String]>, key: &str, value: &str) -
             keys.iter()
                 .any(|name| name.strip_prefix("jj-vine.github.") == Some(key))
         })
+}
+
+/// The web host for a GitHub API URL: `github.com` for `api.github.com` on
+/// any port, `<sub>.ghe.com[:port]` for `api.<sub>.ghe.com[:port]`, otherwise
+/// the URL's `host[:port]`. `None` for a non-HTTPS URL or an authority that
+/// is empty or carries user info.
+fn github_web_host(api_host: &str) -> Option<&str> {
+    let rest = api_host
+        .get(..8)
+        .filter(|scheme| scheme.eq_ignore_ascii_case("https://"))
+        .and(api_host.get(8..))?;
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    if authority.is_empty() || authority.contains('@') {
+        return None;
+    }
+    let is_api = authority
+        .get(..4)
+        .is_some_and(|p| p.eq_ignore_ascii_case("api."));
+    let hostname = authority.split(':').next().unwrap_or_default();
+    if hostname.eq_ignore_ascii_case("api.github.com") {
+        return Some("github.com");
+    }
+    let is_ghe_cloud = hostname
+        .len()
+        .checked_sub(8)
+        .and_then(|start| hostname.get(start..))
+        .is_some_and(|suffix| suffix.eq_ignore_ascii_case(".ghe.com"));
+    if is_api && is_ghe_cloud {
+        return authority.get(4..);
+    }
+    Some(authority)
 }
 
 /// Whether a configured API host uses HTTPS, so the token never travels
@@ -2891,6 +2951,128 @@ mod tests {
         assert_eq!(
             config.resolved_token().expect("command token"),
             "command-token"
+        );
+    }
+
+    #[test]
+    fn github_web_host_maps_api_urls() {
+        for (api, web) in [
+            ("https://api.github.com", Some("github.com")),
+            ("HTTPS://API.GitHub.com/", Some("github.com")),
+            (
+                "https://github.example.com/api/v3",
+                Some("github.example.com"),
+            ),
+            (
+                "https://github.example.com:8443/api/v3",
+                Some("github.example.com:8443"),
+            ),
+            ("https://api.github.com:443/", Some("github.com")),
+            ("https://api.octocorp.ghe.com", Some("octocorp.ghe.com")),
+            ("https://API.Octocorp.GHE.com/", Some("Octocorp.GHE.com")),
+            (
+                "https://api.octocorp.ghe.com:8443",
+                Some("octocorp.ghe.com:8443"),
+            ),
+            ("https://octocorp.ghe.com/api/v3", Some("octocorp.ghe.com")),
+            ("http://github.example.com/api/v3", None),
+            ("https:///api/v3", None),
+            ("https://user@github.example.com/api/v3", None),
+            ("", None),
+        ] {
+            assert_eq!(github_web_host(api), web, "{api}");
+        }
+    }
+
+    #[test]
+    fn resolved_token_substitutes_ghe_cloud_web_host() {
+        let config = GitHubConfig {
+            host: "https://api.octocorp.ghe.com".to_owned(),
+            token_command: vec!["printf".to_owned(), "{host}".to_owned()],
+            ..GitHubConfig::default()
+        };
+        assert_eq!(
+            config.resolved_token().expect("command token"),
+            "octocorp.ghe.com"
+        );
+    }
+
+    #[test]
+    fn resolved_token_substitutes_host_placeholder() {
+        let config = GitHubConfig {
+            host: "https://github.example.com/api/v3".to_owned(),
+            token_command: vec![
+                "printf".to_owned(),
+                "%s-{host}".to_owned(),
+                "tok".to_owned(),
+            ],
+            ..GitHubConfig::default()
+        };
+        assert_eq!(
+            config.resolved_token().expect("command token"),
+            "tok-github.example.com"
+        );
+    }
+
+    #[test]
+    fn resolved_token_host_placeholder_without_https_host_errors() {
+        let config = GitHubConfig {
+            host: "http://github.example.com/api/v3".to_owned(),
+            token_command: vec!["printf".to_owned(), "{host}".to_owned()],
+            ..GitHubConfig::default()
+        };
+        let error = config
+            .resolved_token()
+            .expect_err("no web host means no token");
+        assert!(error.to_string().contains("uses {host}"), "{error}");
+    }
+
+    /// A user config whose helper holds only a github.com credential and
+    /// fails for any other host, as `gh auth token --hostname {host}` does.
+    const DOTCOM_ONLY_TOKEN_CONFIG: &str = concat!(
+        "[jj-vine.github]\n",
+        "host = \"https://api.github.com\"\n",
+        "tokenCommand = [\"sh\", \"-c\", ",
+        "'[ \"$1\" = github.com ] && printf dotcom-token', \"_\", \"{host}\"]\n",
+    );
+
+    #[cfg(unix)]
+    fn load_with_dotcom_only_token(remote_url: &str) -> Config {
+        let (temp, repo_path) = create_test_repo();
+        set_repo_config(&repo_path, "jj-vine.forge", "github");
+        std::fs::write(
+            temp.path().join(ISOLATED_TEST_CONFIG),
+            DOTCOM_ONLY_TOKEN_CONFIG,
+        )
+        .expect("write user-level GitHub config");
+        add_git_remote(&repo_path, "origin", remote_url);
+        load_isolated(&repo_path).expect("load config from remote")
+    }
+
+    /// A GHE remote with only a github.com credential resolves no token.
+    #[cfg(unix)]
+    #[test]
+    fn config_load_ghe_remote_with_only_github_com_token_fails_closed() {
+        let config = load_with_dotcom_only_token("https://github.example.com/owner/repo.git");
+
+        assert_eq!(config.github.host, "https://github.example.com/api/v3");
+        let error = config
+            .github
+            .resolved_token()
+            .expect_err("the github.com credential must not reach a GHE host");
+        assert!(error.to_string().contains("tokenCommand failed"), "{error}");
+    }
+
+    /// The same helper still supplies the token for a github.com remote.
+    #[cfg(unix)]
+    #[test]
+    fn config_load_github_com_remote_resolves_host_scoped_token() {
+        let config = load_with_dotcom_only_token("git@github.com:owner/repo.git");
+
+        assert_eq!(config.github.host, "https://api.github.com");
+        assert_eq!(
+            config.github.resolved_token().expect("github.com token"),
+            "dotcom-token"
         );
     }
 
