@@ -317,6 +317,7 @@ mod tests {
                     output: &output,
                     bookmark_graph: &bookmark_graph,
                     dry_run: false,
+                    no_hooks: false,
                     plan: &plan,
                 },
                 current_results: Vec::new(),
