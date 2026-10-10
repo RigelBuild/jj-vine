@@ -154,6 +154,15 @@ impl InteractiveOutput {
             substeps: RwLock::new(Vec::new()),
         }
     }
+
+    /// Whether indicatif is suppressing this spinner's output because stderr is
+    /// not a usable terminal (piped or captured, or `TERM=dumb`/unset). When
+    /// true, the caller should fall back to flat logging so progress stays
+    /// visible.
+    #[must_use]
+    pub fn is_hidden(&self) -> bool {
+        self.spinner.is_hidden()
+    }
 }
 
 impl Default for InteractiveOutput {
