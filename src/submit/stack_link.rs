@@ -373,10 +373,12 @@ fn link_from_graph(
                 break;
             }
             LinkOutcome::Failed { detail } => {
+                // Branch names may hold shell metacharacters; the hint is meant to be pasted.
+                let base = shlex::try_quote(&bottom_pr.target_branch)
+                    .map_or_else(|_| format!("{:?}", bottom_pr.target_branch), Into::into);
                 warnings.push(format!(
-                    "failed to link stack {} ({detail}); rerun by hand: gh-stack link --base {} {}",
+                    "failed to link stack {} ({detail}); rerun by hand: gh-stack link --base {base} {}",
                     format_prs(&prs),
-                    bottom_pr.target_branch,
                     prs.iter().map(u64::to_string).collect::<Vec<_>>().join(" ")
                 ));
                 reported.extend(prs.iter().copied());
@@ -1073,6 +1075,22 @@ mod tests {
     }
 
     #[test]
+    fn merge_request_map_prefers_execution_target_over_planned_target() {
+        let existing = HashMap::from([existing_mr_with_target_branch("a", "10", "main")]);
+
+        let map = build_pr_map(
+            &existing,
+            &[mr_update_with_target_branch("a", "10", "rigel-release")],
+        );
+
+        assert_eq!(
+            map.get("a").map(|pr| pr.target_branch.as_str()),
+            Some("rigel-release"),
+            "a base retargeted this run must link on its new base"
+        );
+    }
+
+    #[test]
     fn unchanged_existing_middle_pull_request_does_not_create_a_gap() {
         let changes = linear_changes(&["a", "b", "c"]);
         let runner = RecordingRunner::new(LinkOutcome::Linked);
@@ -1370,6 +1388,34 @@ mod tests {
                 if warning.contains("gh-stack link --base main 1 2")
                     && warning.contains("network unreachable")
         ));
+    }
+
+    #[test]
+    fn manual_rerun_command_quotes_the_base_branch() {
+        let changes = linear_changes(&["a", "b"]);
+        let runner = RecordingRunner::new(LinkOutcome::Failed {
+            detail: "network unreachable".to_owned(),
+        });
+
+        let outcome = link_from_graph(
+            &runner,
+            &github_config(),
+            &graph(&changes),
+            &pr_map(&[
+                mr_update_with_target_branch("a", "1", "topic;echo"),
+                mr_update_with_target_branch("b", "2", "a"),
+            ]),
+            &BTreeSet::new(),
+        );
+
+        assert!(
+            matches!(
+                &outcome,
+                StackLinkOutcome::Failed { warning }
+                    if warning.contains("gh-stack link --base 'topic;echo' 1 2")
+            ),
+            "rerun hint must quote the base: {outcome:?}"
+        );
     }
 
     #[test]
