@@ -174,6 +174,12 @@ fn link_stacks_with_runner(
     link_from_graph(runner, github, &graph, &pr_map, &result.failed_bookmarks)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PullRequestInfo {
+    number: u64,
+    target_branch: String,
+}
+
 struct ContiguityScan {
     /// PRs from the bottom of the stack up to the first bookmark without one.
     prs: Vec<u64>,
@@ -188,7 +194,7 @@ struct ContiguityScan {
 
 fn scan_contiguous_run(
     ordered: &[BookmarkOrPending<'_>],
-    pr_map: &BTreeMap<String, u64>,
+    pr_map: &BTreeMap<String, PullRequestInfo>,
 ) -> ContiguityScan {
     let mut scan = ContiguityScan {
         prs: Vec::new(),
@@ -199,14 +205,14 @@ fn scan_contiguous_run(
 
     for bookmark in ordered {
         match pr_map.get(bookmark.name()) {
-            Some(&pr) if scan.gap.is_some() => scan.stranded.push(pr),
-            Some(&pr) => match scan.unmapped.first() {
+            Some(pr) if scan.gap.is_some() => scan.stranded.push(pr.number),
+            Some(pr) => match scan.unmapped.first() {
                 // A missing bottom PR is a gap like a missing middle PR.
                 Some(first) => {
                     scan.gap = Some(first.clone());
-                    scan.stranded.push(pr);
+                    scan.stranded.push(pr.number);
                 }
-                None => scan.prs.push(pr),
+                None => scan.prs.push(pr.number),
             },
             None if scan.gap.is_none() => scan.unmapped.push(bookmark.name().to_owned()),
             None => {}
@@ -220,7 +226,7 @@ fn link_from_graph(
     runner: &dyn StackLinkRunner,
     github: &GitHubConfig,
     graph: &BookmarkGraph<'_>,
-    pr_map: &BTreeMap<String, u64>,
+    pr_map: &BTreeMap<String, PullRequestInfo>,
     failed_bookmarks: &BTreeSet<String>,
 ) -> StackLinkOutcome {
     let mut stacks = Vec::new();
@@ -236,7 +242,7 @@ fn link_from_graph(
             let mut prs: Vec<u64> = component
                 .all_bookmarks()
                 .iter()
-                .filter_map(|bookmark| pr_map.get(bookmark.name()).copied())
+                .filter_map(|bookmark| pr_map.get(bookmark.name()).map(|pr| pr.number))
                 .collect();
             prs.sort_unstable();
             if prs.len() >= 2 {
@@ -267,7 +273,7 @@ fn link_from_graph(
         if !failed.is_empty() {
             let prs: Vec<u64> = ordered
                 .iter()
-                .filter_map(|bookmark| pr_map.get(bookmark.name()).copied())
+                .filter_map(|bookmark| pr_map.get(bookmark.name()).map(|pr| pr.number))
                 .collect();
             if prs.is_empty() {
                 debug!("stack link: skipping a failed component without PRs");
@@ -315,7 +321,13 @@ fn link_from_graph(
         // Without a gap, every unmapped bookmark sits above the linked run.
         let trailing_unmapped = unmapped;
 
-        let outcome = runner.run(&prs, github);
+        let Some(bottom_pr) = ordered
+            .iter()
+            .find_map(|bookmark| pr_map.get(bookmark.name()))
+        else {
+            continue;
+        };
+        let outcome = runner.run(&prs, &bottom_pr.target_branch, github);
         binary_found |= outcome != LinkOutcome::MissingBinary;
         match outcome {
             LinkOutcome::Linked => {
@@ -362,8 +374,9 @@ fn link_from_graph(
             }
             LinkOutcome::Failed { detail } => {
                 warnings.push(format!(
-                    "failed to link stack {} ({detail}); rerun by hand: gh-stack link {}",
+                    "failed to link stack {} ({detail}); rerun by hand: gh-stack link --base {} {}",
                     format_prs(&prs),
+                    bottom_pr.target_branch,
                     prs.iter().map(u64::to_string).collect::<Vec<_>>().join(" ")
                 ));
                 reported.extend(prs.iter().copied());
@@ -383,7 +396,7 @@ fn link_from_graph(
     let linked: BTreeSet<u64> = stacks.iter().flatten().copied().collect();
     let mut orphans: Vec<u64> = pr_map
         .values()
-        .copied()
+        .map(|pr| pr.number)
         .filter(|pr| !linked.contains(pr) && !reported.contains(pr))
         .collect();
     orphans.sort_unstable();
@@ -404,12 +417,12 @@ fn link_from_graph(
     }
 }
 
-/// Map each bookmark to its PR number: PRs found at planning time, overlaid
-/// with the PRs execution created or updated.
+/// Map each bookmark to its PR number and target branch: PRs found at planning
+/// time, overlaid with the PRs execution created or updated.
 fn build_pr_map(
     existing_merge_requests: &HashMap<String, AnyForgeMergeRequest>,
     merge_requests: &[MRUpdate],
-) -> BTreeMap<String, u64> {
+) -> BTreeMap<String, PullRequestInfo> {
     let existing = existing_merge_requests
         .iter()
         .map(|(bookmark, mr)| (bookmark, mr));
@@ -420,8 +433,14 @@ fn build_pr_map(
     let mut map = BTreeMap::new();
     for (bookmark, mr) in existing.chain(updated) {
         match mr.iid().parse::<u64>() {
-            Ok(pr) => {
-                map.insert(bookmark.clone(), pr);
+            Ok(number) => {
+                map.insert(
+                    bookmark.clone(),
+                    PullRequestInfo {
+                        number,
+                        target_branch: mr.target_branch().to_owned(),
+                    },
+                );
             }
             Err(_) => {
                 debug!("stack link: ignoring non-numeric pull request id for bookmark {bookmark}")
@@ -459,7 +478,7 @@ enum LinkOutcome {
 }
 
 trait StackLinkRunner {
-    fn run(&self, prs: &[u64], github: &GitHubConfig) -> LinkOutcome;
+    fn run(&self, prs: &[u64], base: &str, github: &GitHubConfig) -> LinkOutcome;
 }
 
 /// The GitHub CLI extensions directory, resolved the way `gh` resolves its
@@ -546,7 +565,13 @@ impl GhStackRunner {
         }
     }
 
-    fn run_with_binary(&self, binary: &Path, prs: &[u64], github: &GitHubConfig) -> LinkOutcome {
+    fn run_with_binary(
+        &self,
+        binary: &Path,
+        prs: &[u64],
+        base: &str,
+        github: &GitHubConfig,
+    ) -> LinkOutcome {
         // A token command must not start, or run, past the shared deadline.
         // The absolute deadline, not a sampled remainder, also bounds the
         // binary lookup that precedes the spawn.
@@ -571,7 +596,7 @@ impl GhStackRunner {
         }
 
         let mut command = std::process::Command::new(binary);
-        command.arg("link");
+        command.arg("link").arg("--base").arg(base);
         for pr in prs {
             command.arg(pr.to_string());
         }
@@ -613,14 +638,14 @@ impl GhStackRunner {
 }
 
 impl StackLinkRunner for GhStackRunner {
-    fn run(&self, prs: &[u64], github: &GitHubConfig) -> LinkOutcome {
+    fn run(&self, prs: &[u64], base: &str, github: &GitHubConfig) -> LinkOutcome {
         let Some(binary) = self.find_binary() else {
             return LinkOutcome::MissingBinary;
         };
         if github.host.trim_end_matches('/') != GITHUB_COM_API_URL {
             return LinkOutcome::UnsupportedHost;
         }
-        self.run_with_binary(&binary, prs, github)
+        self.run_with_binary(&binary, prs, base, github)
     }
 }
 
@@ -638,6 +663,7 @@ mod tests {
 
     struct RecordingRunner {
         calls: RefCell<Vec<Vec<u64>>>,
+        bases: RefCell<Vec<String>>,
         response: LinkOutcome,
     }
 
@@ -645,6 +671,7 @@ mod tests {
         fn new(response: LinkOutcome) -> Self {
             Self {
                 calls: RefCell::new(Vec::new()),
+                bases: RefCell::new(Vec::new()),
                 response,
             }
         }
@@ -652,11 +679,16 @@ mod tests {
         fn calls(&self) -> Vec<Vec<u64>> {
             self.calls.borrow().clone()
         }
+
+        fn bases(&self) -> Vec<String> {
+            self.bases.borrow().clone()
+        }
     }
 
     impl StackLinkRunner for RecordingRunner {
-        fn run(&self, prs: &[u64], _github: &GitHubConfig) -> LinkOutcome {
+        fn run(&self, prs: &[u64], base: &str, _github: &GitHubConfig) -> LinkOutcome {
             self.calls.borrow_mut().push(prs.to_vec());
+            self.bases.borrow_mut().push(base.to_owned());
             self.response.clone()
         }
     }
@@ -677,7 +709,7 @@ mod tests {
     }
 
     impl StackLinkRunner for SequencedRunner {
-        fn run(&self, prs: &[u64], _github: &GitHubConfig) -> LinkOutcome {
+        fn run(&self, prs: &[u64], _base: &str, _github: &GitHubConfig) -> LinkOutcome {
             self.calls.borrow_mut().push(prs.to_vec());
             self.responses
                 .borrow_mut()
@@ -686,20 +718,35 @@ mod tests {
         }
     }
 
-    fn pr_map(updates: &[MRUpdate]) -> BTreeMap<String, u64> {
+    fn pr_map(updates: &[MRUpdate]) -> BTreeMap<String, PullRequestInfo> {
         build_pr_map(&HashMap::new(), updates)
     }
 
     fn existing_mr(bookmark: &str, iid: &str) -> (String, AnyForgeMergeRequest) {
-        (bookmark.to_owned(), mr_update(bookmark, iid).mr)
+        existing_mr_with_target_branch(bookmark, iid, "main")
+    }
+
+    fn existing_mr_with_target_branch(
+        bookmark: &str,
+        iid: &str,
+        target_branch: &str,
+    ) -> (String, AnyForgeMergeRequest) {
+        (
+            bookmark.to_owned(),
+            mr_update_with_target_branch(bookmark, iid, target_branch).mr,
+        )
     }
 
     fn mr_update(bookmark: &str, iid: &str) -> MRUpdate {
+        mr_update_with_target_branch(bookmark, iid, "main")
+    }
+
+    fn mr_update_with_target_branch(bookmark: &str, iid: &str, target_branch: &str) -> MRUpdate {
         let mr = MergeRequest::builder()
             .id(iid.to_owned())
             .title(format!("PR for {bookmark}"))
             .source_branch(bookmark.to_owned())
-            .target_branch("main".to_owned())
+            .target_branch(target_branch.to_owned())
             .build();
         MRUpdate {
             mr: AnyForgeMergeRequest::new(mr),
@@ -749,7 +796,7 @@ mod tests {
             STACK_LINK_TIMEOUT,
         );
 
-        let outcome = runner.run(&[1, 2], &github_config());
+        let outcome = runner.run(&[1, 2], "main", &github_config());
 
         assert_eq!(
             outcome,
@@ -764,7 +811,7 @@ mod tests {
         let runner = GhStackRunner::new(temp.path().to_path_buf(), None, None, STACK_LINK_TIMEOUT);
         let vanished_binary = temp.path().join("gh-stack");
 
-        let outcome = runner.run_with_binary(&vanished_binary, &[1, 2], &github_config());
+        let outcome = runner.run_with_binary(&vanished_binary, &[1, 2], "main", &github_config());
 
         assert!(
             matches!(&outcome, LinkOutcome::Failed { detail } if detail.contains("could not run gh-stack")),
@@ -812,6 +859,29 @@ mod tests {
             StackLinkOutcome::Linked { stacks, .. } if stacks == vec![vec![10, 20, 30]]
         ));
         assert_eq!(runner.calls(), vec![vec![10, 20, 30]]);
+    }
+
+    #[test]
+    fn stack_links_use_bottom_pull_request_target_branch_as_base() {
+        let changes = linear_changes(&["a", "b"]);
+        let runner = RecordingRunner::new(LinkOutcome::Linked);
+
+        let outcome = link_from_graph(
+            &runner,
+            &github_config(),
+            &graph(&changes),
+            &build_pr_map(
+                &HashMap::from([existing_mr_with_target_branch("a", "10", "rigel-release")]),
+                &[mr_update("b", "20")],
+            ),
+            &BTreeSet::new(),
+        );
+
+        assert!(matches!(
+            outcome,
+            StackLinkOutcome::Linked { stacks, .. } if stacks == vec![vec![10, 20]]
+        ));
+        assert_eq!(runner.bases(), vec!["rigel-release"]);
     }
 
     #[test]
@@ -955,7 +1025,16 @@ mod tests {
             mr_update("a", "5"),
             mr_update("b", "not-a-number"),
         ]);
-        assert_eq!(map, BTreeMap::from([("a".to_owned(), 5)]));
+        assert_eq!(
+            map,
+            BTreeMap::from([(
+                "a".to_owned(),
+                PullRequestInfo {
+                    number: 5,
+                    target_branch: "main".to_owned(),
+                },
+            )])
+        );
     }
 
     #[test]
@@ -967,9 +1046,27 @@ mod tests {
         assert_eq!(
             map,
             BTreeMap::from([
-                ("a".to_owned(), 10),
-                ("b".to_owned(), 20),
-                ("c".to_owned(), 30),
+                (
+                    "a".to_owned(),
+                    PullRequestInfo {
+                        number: 10,
+                        target_branch: "main".to_owned(),
+                    },
+                ),
+                (
+                    "b".to_owned(),
+                    PullRequestInfo {
+                        number: 20,
+                        target_branch: "main".to_owned(),
+                    },
+                ),
+                (
+                    "c".to_owned(),
+                    PullRequestInfo {
+                        number: 30,
+                        target_branch: "main".to_owned(),
+                    },
+                ),
             ]),
             "planned PRs that execution left alone must still map"
         );
@@ -1270,7 +1367,7 @@ mod tests {
         assert!(matches!(
             outcome,
             StackLinkOutcome::Failed { warning }
-                if warning.contains("gh-stack link 1 2")
+                if warning.contains("gh-stack link --base main 1 2")
                     && warning.contains("network unreachable")
         ));
     }
@@ -1345,7 +1442,7 @@ mod tests {
         assert_eq!(warnings.len(), 1, "one warning for the failed component");
         assert!(
             warnings[0].contains("network unreachable")
-                && warnings[0].contains("gh-stack link 3 4"),
+                && warnings[0].contains("gh-stack link --base main 3 4"),
             "failure warning keeps rerun command: {warnings:?}"
         );
         assert!(
@@ -1441,7 +1538,7 @@ mod tests {
         let binary = fake_gh_stack(temp.path(), "printf '%s\\n' \"$GH_TOKEN\" >&2\nexit 1");
 
         let outcome = GhStackRunner::new(temp.path().to_path_buf(), None, None, STACK_LINK_TIMEOUT)
-            .run_with_binary(&binary, &[1, 2], &github_config());
+            .run_with_binary(&binary, &[1, 2], "main", &github_config());
 
         assert!(matches!(
             outcome,
@@ -1462,7 +1559,7 @@ mod tests {
             STACK_LINK_TIMEOUT,
         );
 
-        let outcome = runner.run(&[1, 2], &github_config());
+        let outcome = runner.run(&[1, 2], "main", &github_config());
 
         assert_eq!(outcome, LinkOutcome::NotEnabled);
     }
@@ -1486,12 +1583,12 @@ mod tests {
             STACK_LINK_TIMEOUT,
         );
 
-        let outcome = runner.run(&[10, 20, 30], &github_config());
+        let outcome = runner.run(&[10, 20, 30], "rigel-release", &github_config());
 
         assert_eq!(outcome, LinkOutcome::Linked);
         assert_eq!(
             std::fs::read_to_string(&seen).expect("helper recorded its inputs"),
-            "link 10 20 30|test-token|github.com|owner/repo"
+            "link --base rigel-release 10 20 30|test-token|github.com|owner/repo"
         );
     }
 
@@ -1504,7 +1601,7 @@ mod tests {
         let runner = GhStackRunner::new(temp.path().to_path_buf(), None, None, timeout);
 
         let start = std::time::Instant::now();
-        let outcome = runner.run_with_binary(&binary, &[1, 2], &github_config());
+        let outcome = runner.run_with_binary(&binary, &[1, 2], "main", &github_config());
 
         assert!(
             matches!(&outcome, LinkOutcome::Failed { detail } if detail.contains("within the 200ms stack-link deadline")),
@@ -1938,7 +2035,10 @@ mod tests {
             STACK_LINK_TIMEOUT,
         );
 
-        assert_eq!(runner.run(&[1, 2], &github_config()), LinkOutcome::Linked);
+        assert_eq!(
+            runner.run(&[1, 2], "main", &github_config()),
+            LinkOutcome::Linked
+        );
     }
 
     #[test]
@@ -1994,10 +2094,13 @@ mod tests {
             STACK_LINK_TIMEOUT,
         );
 
-        assert_eq!(runner.run(&[1, 2], &github_config()), LinkOutcome::Linked);
+        assert_eq!(
+            runner.run(&[1, 2], "main", &github_config()),
+            LinkOutcome::Linked
+        );
         assert_eq!(
             std::fs::read_to_string(&seen).expect("extension ran"),
-            "link 1 2"
+            "link --base main 1 2"
         );
     }
 
@@ -2014,7 +2117,7 @@ mod tests {
         );
 
         assert_eq!(
-            runner.run(&[1, 2], &github_config()),
+            runner.run(&[1, 2], "main", &github_config()),
             LinkOutcome::MissingBinary
         );
     }
@@ -2041,7 +2144,7 @@ mod tests {
             core::time::Duration::ZERO,
         );
 
-        let outcome = runner.run_with_binary(&binary, &[1, 2], &github);
+        let outcome = runner.run_with_binary(&binary, &[1, 2], "main", &github);
 
         assert!(
             matches!(&outcome, LinkOutcome::Failed { detail } if detail.contains("stack-link deadline passed")),
@@ -2068,7 +2171,7 @@ mod tests {
         );
 
         let start = std::time::Instant::now();
-        let outcome = runner.run_with_binary(&binary, &[1, 2], &github);
+        let outcome = runner.run_with_binary(&binary, &[1, 2], "main", &github);
 
         assert!(
             start.elapsed() < core::time::Duration::from_secs(5),
@@ -2099,11 +2202,11 @@ mod tests {
         let runner = GhStackRunner::new(temp.path().to_path_buf(), None, None, STACK_LINK_TIMEOUT);
 
         assert_eq!(
-            runner.run_with_binary(&binary, &[1, 2], &github),
+            runner.run_with_binary(&binary, &[1, 2], "main", &github),
             LinkOutcome::Linked
         );
         assert_eq!(
-            runner.run_with_binary(&binary, &[3, 4], &github),
+            runner.run_with_binary(&binary, &[3, 4], "main", &github),
             LinkOutcome::Linked
         );
 
