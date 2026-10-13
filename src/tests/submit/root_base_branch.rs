@@ -1,6 +1,6 @@
 use crate::{
     bookmark::BookmarkGraph,
-    config::{Config, ForgeType},
+    config::{Config, ForgeType, TitleConfig, TitleFormat},
     error::Result,
     forge::{
         ForgeImpl,
@@ -11,10 +11,17 @@ use crate::{
     tests::TestRepo,
 };
 
-fn with_main_trunk() -> TestRepo<()> {
-    let repo = TestRepo::with_main();
-    repo.set_config(r#"revset-aliases."trunk()""#, "main");
-    repo
+fn with_main_trunk() -> Result<TestRepo<TestRepo<()>>> {
+    let repo = TestRepo::with_local_remote();
+    repo.set_config(r#"revset-aliases."trunk()""#, "main@origin");
+    repo.jj.exec(["new", "main"])?;
+    repo.create_change("release.txt", "release", "Commit A on configured base")
+        .create_bookmark("release")
+        .push_bookmark("release");
+    repo.jj.exec(["git", "fetch"])?;
+    repo.jj.exec(["bookmark", "delete", "release"])?;
+    repo.jj.exec(["new", "release@origin"])?;
+    Ok(repo)
 }
 
 fn config(default_base_branch: Option<&str>) -> Config {
@@ -24,8 +31,8 @@ fn config(default_base_branch: Option<&str>) -> Config {
         .build()
 }
 
-async fn plan_for(
-    repo: &TestRepo<()>,
+async fn plan_for<T>(
+    repo: &TestRepo<T>,
     config: &Config,
     forge: &ForgeImpl,
     graph: &BookmarkGraph<'_>,
@@ -44,7 +51,7 @@ async fn plan_for(
 
 #[tokio::test]
 async fn planner_creates_root_mr_with_configured_base_and_keeps_child_parent_base() -> Result<()> {
-    let repo = with_main_trunk();
+    let repo = with_main_trunk()?;
     let root = repo.bookmark_name("root");
     let child = repo.bookmark_name("child");
     repo.create_change_and_tracked_bookmark(&root)
@@ -80,6 +87,52 @@ async fn planner_creates_root_mr_with_configured_base_and_keeps_child_parent_bas
 }
 
 #[tokio::test]
+async fn planner_titles_root_mr_from_configured_remote_base() -> Result<()> {
+    let repo = with_main_trunk()?;
+    let root = repo.bookmark_name("root-configured-base-title");
+    repo.create_change("feature.txt", "feature", "Commit B title\nDetails")
+        .create_bookmark(&root);
+    let config = Config::builder()
+        .forge(ForgeType::GitHub)
+        .maybe_default_base_branch(Some("release".to_owned()))
+        .remote_name("origin".to_owned())
+        .title(TitleConfig {
+            multiple_revisions: TitleFormat::FirstRevisionFirstLine,
+            ..Default::default()
+        })
+        .build();
+    let forge = ForgeImpl::Test(TestForge::default());
+    let changes = repo.jj.log("mine() & bookmarks()")?;
+    let graph = BookmarkGraph::from_changes(&repo.jj, &changes, false)?;
+    let plan = plan_for(&repo, &config, &forge, &graph).await?;
+
+    let title = plan
+        .actions
+        .iter()
+        .flatten()
+        .find_map(|action| match action {
+            Action::CreateMR(action) if action.bookmark.to_string() == root => {
+                Some(action.title.as_str())
+            }
+            _ => None,
+        });
+    assert_eq!(title, Some("Commit B title"));
+
+    let create_description = plan
+        .actions
+        .iter()
+        .flatten()
+        .find_map(|action| match action {
+            Action::CreateMR(action) if action.bookmark.to_string() == root => {
+                Some(action.description.as_str())
+            }
+            _ => None,
+        });
+    assert_eq!(create_description, Some("Details"));
+    Ok(())
+}
+
+#[tokio::test]
 async fn planner_uses_configured_base_when_trunk_is_unavailable() -> Result<()> {
     let repo = TestRepo::new();
     let root = repo.bookmark_name("root-without-trunk");
@@ -107,7 +160,7 @@ async fn planner_uses_configured_base_when_trunk_is_unavailable() -> Result<()> 
 
 #[tokio::test]
 async fn planner_retargets_existing_fork_child_mr_from_trunk_to_configured_base() -> Result<()> {
-    let repo = with_main_trunk();
+    let repo = with_main_trunk()?;
     let root = repo.bookmark_name("fork-root");
     let child = repo.bookmark_name("fork-child");
     repo.create_change_and_tracked_bookmark(&root)
@@ -147,7 +200,7 @@ async fn planner_retargets_existing_fork_child_mr_from_trunk_to_configured_base(
 
 #[tokio::test]
 async fn planner_retargets_existing_root_mr_from_trunk_to_configured_base() -> Result<()> {
-    let repo = with_main_trunk();
+    let repo = with_main_trunk()?;
     let root = repo.bookmark_name("root-retarget");
     repo.create_change_and_tracked_bookmark(&root);
 
@@ -190,7 +243,7 @@ async fn planner_retargets_existing_root_mr_from_trunk_to_configured_base() -> R
 
 #[tokio::test]
 async fn planner_prefers_existing_root_mr_on_configured_base() -> Result<()> {
-    let repo = with_main_trunk();
+    let repo = with_main_trunk()?;
     let root = repo.bookmark_name("root-configured-base");
     repo.create_change_and_tracked_bookmark(&root);
 
@@ -236,7 +289,7 @@ async fn planner_prefers_existing_root_mr_on_configured_base() -> Result<()> {
 
 #[tokio::test]
 async fn planner_keeps_existing_child_mr_target_at_parent_bookmark() -> Result<()> {
-    let repo = with_main_trunk();
+    let repo = with_main_trunk()?;
     let root = repo.bookmark_name("root-child-target");
     let child = repo.bookmark_name("child-target");
     repo.create_change_and_tracked_bookmark(&root)
@@ -288,7 +341,7 @@ async fn planner_keeps_existing_child_mr_target_at_parent_bookmark() -> Result<(
 
 #[tokio::test]
 async fn planner_retargets_existing_child_mr_from_deleted_middle_base() -> Result<()> {
-    let repo = with_main_trunk();
+    let repo = with_main_trunk()?;
     let root = repo.bookmark_name("root-deleted-middle");
     let child = repo.bookmark_name("child-deleted-middle");
     repo.create_change_and_tracked_bookmark(&root)
@@ -338,7 +391,7 @@ async fn planner_retargets_existing_child_mr_from_deleted_middle_base() -> Resul
 
 #[tokio::test]
 async fn planner_keeps_trunk_target_when_root_base_is_unset() -> Result<()> {
-    let repo = with_main_trunk();
+    let repo = with_main_trunk()?;
     let root = repo.bookmark_name("root-default");
     repo.create_change_and_tracked_bookmark(&root);
 

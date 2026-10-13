@@ -595,18 +595,20 @@ impl BookmarkWithPointers<'_> {
         self.parents.iter().any(|p| p == parent)
     }
 
-    /// Gets the revisions that are unique to this bookmark (i.e. what would be
-    /// merged into its parents).
-    pub fn revisions(&self, jj: &Jujutsu) -> Result<Vec<Change>> {
-        let revset = [BookmarkRef::Trunk]
-            .into_iter()
+    /// Gets revisions unique to this bookmark, using `root_base_bookmark` as
+    /// the trunk boundary when provided.
+    pub fn revisions(&self, jj: &Jujutsu, root_base_bookmark: Option<&str>) -> Result<Vec<Change>> {
+        let trunk_boundary = root_base_bookmark.map_or_else(
+            || BookmarkRef::Trunk.name_for_jj(),
+            |bookmark| format!("({bookmark})"),
+        );
+        let revset = core::iter::once(format!("({trunk_boundary}..{})", self.name_for_jj()))
             .chain(
                 self.parents
                     .iter()
                     .filter(|p| matches!(p, BookmarkRef::Bookmark(..)))
-                    .cloned(),
+                    .map(|p| format!("({}..{})", p.name_for_jj(), self.name_for_jj())),
             )
-            .map(|p| format!("({}..{})", p.name_for_jj(), self.name_for_jj()))
             .join(" & ");
 
         jj.log(revset)
