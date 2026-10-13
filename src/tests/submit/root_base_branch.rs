@@ -24,6 +24,35 @@ fn with_main_trunk() -> Result<TestRepo<TestRepo<()>>> {
     Ok(repo)
 }
 
+fn with_release_behind_trunk() -> Result<(TestRepo<TestRepo<()>>, String)> {
+    let repo = TestRepo::with_local_remote();
+    repo.set_config(r#"revset-aliases."trunk()""#, "main@origin");
+    repo.jj.exec(["new", "main@origin"])?;
+    repo.create_change("release.txt", "release", "Commit A on release")
+        .create_bookmark("release")
+        .push_bookmark("release")
+        .track_bookmark("release");
+    repo.jj
+        .exec(["bookmark", "set", "main", "--to", "release"])?;
+    repo.jj.exec(["new", "main"])?;
+    let trunk_title = "Commit B on trunk only";
+    repo.create_change("trunk.txt", "trunk", trunk_title)
+        .jj(["bookmark", "set", "main", "--to", "@"])?
+        .push_bookmark("main");
+
+    repo.jj.exec(["git", "fetch"])?;
+    repo.jj.exec(["new", "main@origin"])?;
+
+    let root = repo.bookmark_name("root-trunk-commits");
+    repo.create_change(
+        "feature.txt",
+        "feature",
+        "Commit C feature title\nFeature details",
+    )
+    .create_bookmark(&root);
+    Ok((repo, root))
+}
+
 fn config(default_base_branch: Option<&str>) -> Config {
     Config::builder()
         .forge(ForgeType::GitHub)
@@ -129,6 +158,94 @@ async fn planner_titles_root_mr_from_configured_remote_base() -> Result<()> {
             _ => None,
         });
     assert_eq!(create_description, Some("Details"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn planner_uses_configured_base_without_dropping_trunk_commits() -> Result<()> {
+    let (repo, root) = with_release_behind_trunk()?;
+    let config = Config::builder()
+        .forge(ForgeType::GitHub)
+        .maybe_default_base_branch(Some("release".to_owned()))
+        .title(TitleConfig {
+            multiple_revisions: TitleFormat::FirstRevisionFirstLine,
+            ..Default::default()
+        })
+        .build();
+    let forge = ForgeImpl::Test(TestForge::default());
+    let changes = repo.jj.log("mine() & bookmarks()")?;
+    let graph = BookmarkGraph::from_changes(&repo.jj, &changes, false)?;
+    let plan = plan_for(&repo, &config, &forge, &graph).await?;
+
+    let create_mr = plan
+        .actions
+        .iter()
+        .flatten()
+        .find_map(|action| match action {
+            Action::CreateMR(action) if action.bookmark.to_string() == root => Some(action),
+            _ => None,
+        })
+        .expect("root MR is created");
+    assert_eq!(create_mr.title, "Commit B on trunk only");
+    assert!(create_mr.description.contains("Commit B on trunk only"));
+    assert!(create_mr.description.contains("Commit C feature title"));
+    assert!(!create_mr.description.contains("Commit A on release"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn planner_syncs_existing_root_mr_title_and_description_from_trunk_only_commit() -> Result<()>
+{
+    let (repo, root) = with_release_behind_trunk()?;
+    let config = Config::builder()
+        .forge(ForgeType::GitHub)
+        .maybe_default_base_branch(Some("release".to_owned()))
+        .title(TitleConfig {
+            sync_multiple_revisions: true,
+            multiple_revisions: TitleFormat::FirstRevisionFirstLine,
+            ..Default::default()
+        })
+        .description(crate::config::DescriptionConfig {
+            sync: true,
+            ..Default::default()
+        })
+        .build();
+    let forge = ForgeImpl::Test(
+        TestForge::builder()
+            .merge_requests(std::collections::HashMap::from([(
+                "1".to_owned(),
+                MergeRequest::builder()
+                    .id("1".to_owned())
+                    .title("Old title".to_owned())
+                    .source_branch(root.clone())
+                    .target_branch("release".to_owned())
+                    .build(),
+            )]))
+            .build(),
+    );
+    let changes = repo.jj.log("mine() & bookmarks()")?;
+    let graph = BookmarkGraph::from_changes(&repo.jj, &changes, false)?;
+    let plan = plan_for(&repo, &config, &forge, &graph).await?;
+
+    let synced_action = plan
+        .actions
+        .iter()
+        .flatten()
+        .find_map(|action| match action {
+            Action::UpdateMRTitleDescription(action) if action.bookmark.to_string() == root => {
+                Some(action)
+            }
+            _ => None,
+        })
+        .expect("root MR title and description sync");
+    assert_eq!(
+        synced_action.title.as_deref(),
+        Some("Commit B on trunk only")
+    );
+    let description = synced_action.description.as_deref().unwrap_or_default();
+    assert!(description.contains("Commit B on trunk only"));
+    assert!(description.contains("Commit C feature title"));
+    assert!(!description.contains("Commit A on release"));
     Ok(())
 }
 

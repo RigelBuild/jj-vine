@@ -83,12 +83,10 @@ pub async fn plan(ctx: PlanContext<'_>) -> Result<SubmissionPlan> {
     ctx.output.log_current("Planning submission");
 
     let default_branch = ctx.config.root_base_branch(ctx.jj)?;
-    // Union with trunk() so an unfetched base still yields a valid boundary.
     let root_base_bookmark = ctx.config.default_base_branch.as_deref().map(|branch| {
-        format!(
-            "trunk() | remote_bookmarks(exact:{branch:?}, exact:{:?})",
-            ctx.config.remote_name
-        )
+        let branch = crate::jj::revset_string_literal(branch);
+        let remote = crate::jj::revset_string_literal(&ctx.config.remote_name);
+        format!("coalesce(remote_bookmarks(exact:{branch}, exact:{remote}), trunk())")
     });
     let mut batches: Vec<Vec<Action>> = Vec::new();
 
