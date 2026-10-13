@@ -12,10 +12,12 @@ usage() {
 
 version_at() {
   local commit="$1" required="${2:-yes}" versions=()
-  mapfile -t versions < <(git show "${commit}:.github/rigel-version" 2>/dev/null | sed -n 'p')
+  # Only the `[package]` table's version; dependency tables carry their own `version` keys.
+  mapfile -t versions < <(git show "${commit}:Cargo.toml" 2>/dev/null |
+    awk '/^\[/ { pkg = ($0 == "[package]") } pkg && /^version = "[^"]*"$/ { sub(/^version = "/, ""); sub(/"$/, ""); print }')
   if [ "${#versions[@]}" -ne 1 ]; then
     if [ "$required" = yes ]; then
-      echo "::error::expected exactly one .github/rigel-version line at ${commit}, found ${#versions[@]}" >&2
+      echo "::error::expected exactly one Cargo.toml [package] version at ${commit}, found ${#versions[@]}" >&2
       return 1
     fi
     return 0
@@ -75,14 +77,14 @@ validate_next_version() {
 
 check_pr() {
   local base_sha="$1" head_sha="$2" base_version head_version
-  if git diff --quiet "$base_sha" "$head_sha" -- .github/rigel-version; then
-    echo '.github/rigel-version is unchanged; no release version check is needed'
+  if git diff --quiet "$base_sha" "$head_sha" -- Cargo.toml; then
+    echo 'Cargo.toml is unchanged; no release version check is needed'
     return 0
   fi
   base_version="$(version_at "$base_sha" no)"
   head_version="$(version_at "$head_sha")"
   if [ "$base_version" = "$head_version" ]; then
-    echo '.github/rigel-version version is unchanged; no release check is needed'
+    echo 'Cargo.toml version is unchanged; no release check is needed'
     return 0
   fi
   validate_next_version "$head_version"
