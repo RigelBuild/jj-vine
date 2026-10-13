@@ -59,8 +59,11 @@ jobs:
         run: just
 
   nix-eval:
-    name: Nix eval (no IFD)
+    name: Nix eval (no IFD) - ${{ matrix.system }}
     runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        system: [x86_64-linux, aarch64-linux, aarch64-darwin]
     steps:
       - uses: actions/checkout@v6
 
@@ -68,12 +71,8 @@ jobs:
 
       # Fleet consumers evaluate this package with IFD disabled; a toolchain that
       # imports a fetched manifest would break their evals.
-      - name: Evaluate the package for every consumer system
-        run: |
-          for system in x86_64-linux aarch64-linux aarch64-darwin; do
-            nix eval --option allow-import-from-derivation false --raw ".#packages.${system}.jj-vine.drvPath"
-            echo
-          done
+      - name: Evaluate the package
+        run: nix eval --option allow-import-from-derivation false --raw ".#packages.${{ matrix.system }}.jj-vine.drvPath"
 
   build:
     name: Build - ${{ matrix.platform.target }}
