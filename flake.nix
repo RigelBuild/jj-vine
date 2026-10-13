@@ -4,7 +4,7 @@
   # `github:RigelBuild/jj-vine` flake input (pinned by flake.lock rev), instead
   # of vendoring the source as a subtree.
   #
-  # Built against the fork's own dated-nightly rust-toolchain.toml via fenix (the
+  # Built against the fork's own dated-nightly rust-toolchain.toml via rust-overlay (the
   # crate is edition 2024 and needs nightly rustfmt/clippy), NOT nixpkgs' stable
   # rustPlatform. The GitHub Actions CI (.github/workflows/ci.yml) runs the
   # cargo fmt/clippy/build/test gate; this build only produces the binary
@@ -13,8 +13,8 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-    fenix = {
-      url = "github:nix-community/fenix";
+    rust-overlay = {
+      url = "github:oxalica/rust-overlay";
       inputs.nixpkgs.follows = "nixpkgs";
     };
     flake-utils.url = "github:numtide/flake-utils";
@@ -23,7 +23,7 @@
   outputs =
     {
       nixpkgs,
-      fenix,
+      rust-overlay,
       flake-utils,
       ...
     }:
@@ -33,13 +33,9 @@
         pkgs = nixpkgs.legacyPackages.${system};
         lib = pkgs.lib;
 
-        # Exact toolchain from the fork's rust-toolchain.toml (dated nightly),
-        # built by fenix. The sha256 pins the resolved toolchain components; bump
-        # it in lockstep with the channel date in rust-toolchain.toml.
-        rustToolchain = fenix.packages.${system}.fromToolchainFile {
-          file = ./rust-toolchain.toml;
-          sha256 = "sha256-PDDMZVp1SdCzABXNAy+Unocj2lrQOfZy0EUgu66k520=";
-        };
+        # Exact toolchain from the fork's rust-toolchain.toml (dated nightly).
+        # rust-overlay's in-tree channel manifests keep evaluation pure (no IFD).
+        rustToolchain = (rust-overlay.lib.mkRustBin { } pkgs).fromRustupToolchainFile ./rust-toolchain.toml;
 
         rustPlatform = pkgs.makeRustPlatform {
           cargo = rustToolchain;
