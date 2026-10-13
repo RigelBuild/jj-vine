@@ -23,6 +23,8 @@ expect 'workflow token has contents read only' "$(yq -r '.permissions | keys | j
 expect 'check validates changed version source' "$(yq -r '.jobs.check.steps | map(select(.name == "Validate a changed release version")) | length' "$release")" 1
 expect 'mint uses release environment' "$(yq -r '.jobs.mint.environment' "$release")" rigel-release
 expect 'dispatch guard is the first mint step' "$(yq -r '.jobs.mint.steps[0].name' "$release")" 'Require release-branch dispatch'
+expect 'dispatch guard fires on a non-release dispatch' "$(yq -r '.jobs.mint.steps[0].if' "$release")" "github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/rigel-release'"
+expect 'dispatch guard fails the job' "$(yq -r '.jobs.mint.steps[0].run' "$release" | sed '/^$/d' | tail -1)" 'exit 1'
 expect 'mint checks out full history' "$(yq -r '.jobs.mint.steps | map(select(.name == "Checkout")) | .[0].with.fetch-depth' "$release")" 0
 token='.jobs.mint.steps | map(select(.uses // "" | test("actions/create-github-app-token"))) | .[0]'
 expect 'mint takes an App token on every run' "$(yq -r ".jobs.mint.steps | map(select(.uses // \"\" | test(\"actions/create-github-app-token\"))) | length" "$release")" 1
