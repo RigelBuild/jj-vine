@@ -83,7 +83,11 @@ pub async fn plan(ctx: PlanContext<'_>) -> Result<SubmissionPlan> {
     ctx.output.log_current("Planning submission");
 
     let default_branch = ctx.config.root_base_branch(ctx.jj)?;
-
+    let root_base_bookmark = ctx.config.default_base_branch.as_deref().map(|branch| {
+        let branch = crate::jj::revset_string_literal(branch);
+        let remote = crate::jj::revset_string_literal(&ctx.config.remote_name);
+        format!("coalesce(remote_bookmarks(exact:{branch}, exact:{remote}), trunk())")
+    });
     let mut batches: Vec<Vec<Action>> = Vec::new();
 
     let existing_mrs: HashMap<_, _> = ctx
@@ -227,12 +231,12 @@ pub async fn plan(ctx: PlanContext<'_>) -> Result<SubmissionPlan> {
                     batches.push(vec![Action::UpdateMRBase(update_mr_base_action)]);
                 }
             } else {
-                let revisions = bookmark.revisions(ctx.jj)?;
-                let title = get_mr_title(ctx.jj, ctx.config, bookmark, component, revisions)?;
+                let revisions = bookmark.revisions(ctx.jj, root_base_bookmark.as_deref())?;
+                let title = get_mr_title(ctx.jj, ctx.config, bookmark, component, &revisions)?;
 
                 let description = generate_description(
                     &ctx.config.description,
-                    &bookmark.revisions(ctx.jj)?,
+                    &revisions,
                     Path::new(&ctx.jj.exec(["root"])?.stdout),
                 );
 
@@ -279,7 +283,8 @@ pub async fn plan(ctx: PlanContext<'_>) -> Result<SubmissionPlan> {
                             whatever!("No MR found for {}", bookmark.name());
                         };
 
-                        let revisions = bookmark.revisions(ctx.jj)?;
+                        let revisions =
+                            bookmark.revisions(ctx.jj, root_base_bookmark.as_deref())?;
 
                         let should_sync_title = match revisions.len() {
                             1 => ctx.config.title.sync_single_revision,
@@ -288,7 +293,7 @@ pub async fn plan(ctx: PlanContext<'_>) -> Result<SubmissionPlan> {
 
                         let maybe_title = if should_sync_title {
                             let new_title =
-                                get_mr_title(ctx.jj, ctx.config, bookmark, component, revisions)?;
+                                get_mr_title(ctx.jj, ctx.config, bookmark, component, &revisions)?;
 
                             if new_title == *current_title {
                                 None
@@ -303,7 +308,7 @@ pub async fn plan(ctx: PlanContext<'_>) -> Result<SubmissionPlan> {
                             if ctx.config.description.enabled && ctx.config.description.sync {
                                 let new_description = generate_description(
                                     &ctx.config.description,
-                                    &bookmark.revisions(ctx.jj)?,
+                                    &revisions,
                                     Path::new(&ctx.jj.exec(["root"])?.stdout),
                                 );
 

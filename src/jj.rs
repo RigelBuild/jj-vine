@@ -1027,7 +1027,7 @@ impl Jujutsu {
 /// Quotes `value` as a jj string literal. JSON and jj share the escapes for
 /// quotes, backslashes, and common whitespace; jj rejects other JSON control
 /// escapes, so such a name fails the command instead of matching wrongly.
-fn revset_string_literal(value: &str) -> String {
+pub(crate) fn revset_string_literal(value: &str) -> String {
     serde_json::Value::String(value.to_owned()).to_string()
 }
 
