@@ -159,7 +159,7 @@ pub struct SubmitCommandRevsetOptions {
     /// Submit all tracked bookmarks.
     ///
     /// While this is roughly equivalent to
-    /// `(mine() & tracked_remote_bookmarks()) ~ trunk()`, it includes the
+    /// `(mine() & tracked_remote_bookmarks()) ~ boundary`, it includes the
     /// additional stipulation that all submitted bookmarks must be already
     /// pushed to the remote. Bookmarks which have non-tracked parents or
     /// children will be skipped over.
@@ -193,7 +193,10 @@ pub async fn submit(config: &SubmitCommandConfig, cli_config: &CliConfig<'_>) ->
         }
     }
 
-    let revset = config.to_get_bookmarks_options()?.to_revset();
+    let merged_boundary_revset = repo_config.merged_boundary_revset();
+    let revset = config
+        .to_get_bookmarks_options()?
+        .to_revset(&merged_boundary_revset);
 
     let mut pending_bookmarks = HashSet::new();
     if let Some(create) = config.create.as_deref() {
@@ -225,8 +228,19 @@ pub async fn submit(config: &SubmitCommandConfig, cli_config: &CliConfig<'_>) ->
 
     ensure_whatever!(!bookmarks.is_empty(), "No bookmarks in revset {}", revset);
 
-    let changes = select_changes_to_submit(&jj, &revset, &bookmarks, &pending_bookmarks)?;
-    let bookmark_graph = BookmarkGraph::from_changes(&jj, &changes, config.revset_options.tracked)?;
+    let changes = select_changes_to_submit(
+        &jj,
+        &revset,
+        &bookmarks,
+        &pending_bookmarks,
+        &merged_boundary_revset,
+    )?;
+    let bookmark_graph = BookmarkGraph::from_changes(
+        &jj,
+        &changes,
+        config.revset_options.tracked,
+        &merged_boundary_revset,
+    )?;
     announce_submission_graph(
         &bookmark_graph,
         &bookmarks,
@@ -284,6 +298,7 @@ pub async fn submit(config: &SubmitCommandConfig, cli_config: &CliConfig<'_>) ->
             &result,
             &existing_mrs,
             config.revset_options.tracked,
+            &merged_boundary_revset,
             config.dry_run,
             config.no_hooks,
         );
@@ -415,12 +430,14 @@ pub(crate) fn select_changes_to_submit(
     revset: &str,
     bookmarks: &[BookmarkOrPending<'_>],
     pending_bookmarks: &HashSet<String>,
+    merged_boundary_revset: &str,
 ) -> Result<Vec<crate::jj::Change>> {
     find_changes_to_submit(
         jj,
         bookmarks.iter().map(BookmarkOrPending::change_id),
         literal_bookmark_targets(jj, revset, bookmarks)?,
         pending_bookmarks,
+        merged_boundary_revset,
     )
 }
 

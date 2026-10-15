@@ -98,7 +98,7 @@ pub struct StatusCommandRevsetOptions {
     #[arg(short = 'r', long)]
     pub revset: Option<String>,
 
-    /// Include only `(mine() & tracked_remote_bookmarks()) ~ trunk()`.
+    /// Include only `(mine() & tracked_remote_bookmarks()) ~ boundary`.
     #[arg(long)]
     pub tracked: bool,
 }
@@ -158,7 +158,10 @@ pub async fn status(
     let forge = ForgeImpl::new(&repo_config)?;
     let mut output = cli_config.output;
 
-    let revset = revset_options.to_get_bookmarks_options().to_revset();
+    let merged_boundary_revset = repo_config.merged_boundary_revset();
+    let revset = revset_options
+        .to_get_bookmarks_options()
+        .to_revset(&merged_boundary_revset);
     let changes = jj.log(revset)?;
     let bookmarks: Vec<_> = Bookmark::from_changes(&changes).into_iter().collect();
 

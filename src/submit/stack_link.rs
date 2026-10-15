@@ -110,6 +110,7 @@ pub fn link_stacks(
     result: &SubmissionResult,
     existing_merge_requests: &HashMap<String, AnyForgeMergeRequest>,
     tracked: bool,
+    merged_boundary_revset: &str,
     dry_run: bool,
     no_hooks: bool,
 ) -> StackLinkOutcome {
@@ -128,6 +129,7 @@ pub fn link_stacks(
         result,
         existing_merge_requests,
         tracked,
+        merged_boundary_revset,
         dry_run,
         no_hooks,
     )
@@ -145,6 +147,7 @@ fn link_stacks_with_runner(
     result: &SubmissionResult,
     existing_merge_requests: &HashMap<String, AnyForgeMergeRequest>,
     tracked: bool,
+    merged_boundary_revset: &str,
     dry_run: bool,
     no_hooks: bool,
 ) -> StackLinkOutcome {
@@ -161,14 +164,15 @@ fn link_stacks_with_runner(
     // The graph rebuild runs jj, so it shares the stack-link deadline: a slow
     // or hung jj command is killed at the deadline and only warns.
     let jj = jj.with_deadline(deadline);
-    let graph = match BookmarkGraph::from_changes(&jj, &result.changes, tracked) {
-        Ok(graph) => graph,
-        Err(error) => {
-            return StackLinkOutcome::Failed {
-                warning: format!("could not rebuild bookmark graph for stack link: {error}"),
-            };
-        }
-    };
+    let graph =
+        match BookmarkGraph::from_changes(&jj, &result.changes, tracked, merged_boundary_revset) {
+            Ok(graph) => graph,
+            Err(error) => {
+                return StackLinkOutcome::Failed {
+                    warning: format!("could not rebuild bookmark graph for stack link: {error}"),
+                };
+            }
+        };
 
     let pr_map = build_pr_map(existing_merge_requests, &result.merge_requests);
     link_from_graph(runner, github, &graph, &pr_map, &result.failed_bookmarks)
@@ -967,6 +971,7 @@ mod tests {
                 &result,
                 &HashMap::new(),
                 false,
+                "trunk()",
                 true,
                 false
             ),
@@ -981,6 +986,7 @@ mod tests {
                 &result,
                 &HashMap::new(),
                 false,
+                "trunk()",
                 false,
                 true
             ),
@@ -1012,6 +1018,7 @@ mod tests {
                 &result,
                 &HashMap::new(),
                 false,
+                "trunk()",
                 false,
                 false
             ),
@@ -1772,6 +1779,7 @@ mod tests {
             ["b"],
             core::iter::empty::<&str>(),
             &std::collections::HashSet::<String>::new(),
+            "trunk()",
         )
         .expect("changes to submit");
         let result = SubmissionResult {
@@ -1800,6 +1808,7 @@ mod tests {
             &result,
             &HashMap::new(),
             false,
+            "trunk()",
             false,
             false,
         );
@@ -1959,6 +1968,7 @@ mod tests {
                 &result,
                 &HashMap::new(),
                 false,
+                "trunk()",
                 false,
                 false,
             );
@@ -2324,9 +2334,17 @@ mod tests {
             .build();
         let output = BufferedOutput::new();
 
-        let changes = find_changes_to_submit(&repo.jj, ["c"], ["c"], &HashSet::<String>::new())
-            .expect("changes to submit");
-        let graph = BookmarkGraph::from_changes(&repo.jj, &changes, false).expect("graph");
+        let merged_boundary_revset = config.merged_boundary_revset();
+        let changes = find_changes_to_submit(
+            &repo.jj,
+            ["c"],
+            ["c"],
+            &HashSet::<String>::new(),
+            &merged_boundary_revset,
+        )
+        .expect("changes to submit");
+        let graph = BookmarkGraph::from_changes(&repo.jj, &changes, false, &merged_boundary_revset)
+            .expect("graph");
         let submission_plan = plan(PlanContext {
             jj: &repo.jj,
             forge: &forge,
@@ -2363,6 +2381,7 @@ mod tests {
             &result,
             &existing,
             false,
+            "trunk()",
             false,
             false,
         );
@@ -2478,9 +2497,17 @@ mod tests {
             .build();
         let output = BufferedOutput::new();
 
-        let changes = find_changes_to_submit(&repo.jj, ["c"], ["c"], &HashSet::<String>::new())
-            .expect("changes to submit");
-        let graph = BookmarkGraph::from_changes(&repo.jj, &changes, false).expect("graph");
+        let merged_boundary_revset = config.merged_boundary_revset();
+        let changes = find_changes_to_submit(
+            &repo.jj,
+            ["c"],
+            ["c"],
+            &HashSet::<String>::new(),
+            &merged_boundary_revset,
+        )
+        .expect("changes to submit");
+        let graph = BookmarkGraph::from_changes(&repo.jj, &changes, false, &merged_boundary_revset)
+            .expect("graph");
         let submission_plan = plan(PlanContext {
             jj: &repo.jj,
             forge: &forge,
@@ -2527,6 +2554,7 @@ mod tests {
             &result,
             &existing,
             false,
+            "trunk()",
             false,
             false,
         );
@@ -2609,9 +2637,17 @@ mod tests {
         let output = BufferedOutput::new();
 
         let pending = HashSet::from([pending_change]);
-        let changes = find_changes_to_submit(&repo.jj, ["a", "b"], ["a", "b"], &pending)
-            .expect("changes to submit");
-        let graph = BookmarkGraph::from_changes(&repo.jj, &changes, false).expect("graph");
+        let merged_boundary_revset = config.merged_boundary_revset();
+        let changes = find_changes_to_submit(
+            &repo.jj,
+            ["a", "b"],
+            ["a", "b"],
+            &pending,
+            &merged_boundary_revset,
+        )
+        .expect("changes to submit");
+        let graph = BookmarkGraph::from_changes(&repo.jj, &changes, false, &merged_boundary_revset)
+            .expect("graph");
         let submission_plan = plan(PlanContext {
             jj: &repo.jj,
             forge: &forge,
@@ -2662,6 +2698,7 @@ mod tests {
             &result,
             &existing,
             false,
+            "trunk()",
             false,
             false,
         );

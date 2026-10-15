@@ -307,8 +307,13 @@ pub async fn execute(mut ctx: RootExecuteContext<'_>) -> Result<SubmissionResult
     let mut absent_mr_bookmarks = HashSet::new();
     let mut current_results: Vec<ActionResult> = Vec::new();
 
-    let mut bookmark_graph =
-        BookmarkGraph::from_changes(ctx.jj, &ctx.changes, ctx.skip_untracked_local_bookmarks)?;
+    let merged_boundary_revset = ctx.config.merged_boundary_revset();
+    let mut bookmark_graph = BookmarkGraph::from_changes(
+        ctx.jj,
+        &ctx.changes,
+        ctx.skip_untracked_local_bookmarks,
+        &merged_boundary_revset,
+    )?;
     let unpushed_targets = unpushed_push_targets(&ctx);
 
     ctx.output.log_current("Preparing submission");
@@ -423,6 +428,7 @@ pub async fn execute(mut ctx: RootExecuteContext<'_>) -> Result<SubmissionResult
                     ctx.jj,
                     &ctx.changes,
                     ctx.skip_untracked_local_bookmarks,
+                    &merged_boundary_revset,
                 )?;
             }
         }
@@ -651,7 +657,7 @@ mod tests {
             .change_id;
         let pending = HashSet::from([change_id.clone()]);
         // `main` contributes nothing past trunk; the pending change is the target.
-        let changes = find_changes_to_submit(&repo.jj, ["main"], ["main"], &pending)
+        let changes = find_changes_to_submit(&repo.jj, ["main"], ["main"], &pending, "trunk()")
             .expect("changes to submit");
         assert!(
             changes.iter().all(|change| change.bookmarks.is_empty()),
@@ -661,7 +667,8 @@ mod tests {
         let forge = ForgeImpl::Test(TestForge::default());
         let config = Config::builder().forge(ForgeType::Forgejo).build();
         let output = BufferedOutput::new();
-        let graph = BookmarkGraph::from_changes(&repo.jj, &changes, false).expect("graph");
+        let graph =
+            BookmarkGraph::from_changes(&repo.jj, &changes, false, "trunk()").expect("graph");
         let submission_plan = plan(PlanContext {
             jj: &repo.jj,
             forge: &forge,

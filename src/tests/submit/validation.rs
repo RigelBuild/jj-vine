@@ -143,8 +143,16 @@ async fn generalized_foreign_target_is_not_announced() -> Result<()> {
     let bookmarks: Vec<_> = BookmarkOrPending::from_changes(&changes)
         .into_iter()
         .collect();
-    let changes = select_changes_to_submit(&repo.jj, "bookmarks()", &bookmarks, &HashSet::new())?;
-    let bookmark_graph = BookmarkGraph::from_changes(&repo.jj, &changes, false)?;
+    let merged_boundary_revset = "trunk()";
+    let changes = select_changes_to_submit(
+        &repo.jj,
+        "bookmarks()",
+        &bookmarks,
+        &HashSet::new(),
+        merged_boundary_revset,
+    )?;
+    let bookmark_graph =
+        BookmarkGraph::from_changes(&repo.jj, &changes, false, merged_boundary_revset)?;
     let output = BufferedOutput::default();
     announce_submission_graph(&bookmark_graph, &bookmarks, true, false, &output)?;
 
@@ -177,13 +185,21 @@ fn tracked_announcement_omits_untracked_local_ancestor() -> Result<()> {
     repo.create_change("tracked-c.txt", "tracked", "Tracked descendant")
         .create_and_push_bookmark("tracked-descendant");
 
-    let revset = GetBookmarksOptions::Tracked.to_revset();
+    let revset = GetBookmarksOptions::Tracked.to_revset("trunk()");
     let changes = repo.jj.log(&revset)?;
     let bookmarks: Vec<_> = BookmarkOrPending::from_changes(&changes)
         .into_iter()
         .collect();
-    let selected = select_changes_to_submit(&repo.jj, &revset, &bookmarks, &HashSet::new())?;
-    let bookmark_graph = BookmarkGraph::from_changes(&repo.jj, &selected, true)?;
+    let merged_boundary_revset = "trunk()";
+    let selected = select_changes_to_submit(
+        &repo.jj,
+        &revset,
+        &bookmarks,
+        &HashSet::new(),
+        merged_boundary_revset,
+    )?;
+    let bookmark_graph =
+        BookmarkGraph::from_changes(&repo.jj, &selected, true, merged_boundary_revset)?;
     let descendant = bookmark_graph
         .find_bookmark_in_components("tracked-descendant")
         .expect("tracked descendant is in the graph");
@@ -198,7 +214,7 @@ fn tracked_announcement_omits_untracked_local_ancestor() -> Result<()> {
     assert_not_contains!(output.get_buffer(), "untracked-ancestor");
 
     let no_changes: [&crate::jj::Change; 0] = [];
-    let empty_graph = BookmarkGraph::from_changes(&repo.jj, no_changes, true)?;
+    let empty_graph = BookmarkGraph::from_changes(&repo.jj, no_changes, true, "trunk()")?;
     let empty_output = BufferedOutput::default();
     let error = announce_submission_graph(&empty_graph, &bookmarks, true, false, &empty_output)
         .unwrap_err()
@@ -222,8 +238,11 @@ fn submission_graph_announcement_includes_pending_bookmarks() -> Result<()> {
     let bookmarks: Vec<_> = BookmarkOrPending::from_changes(&changes)
         .into_iter()
         .collect();
-    let selected = select_changes_to_submit(&repo.jj, "@", &bookmarks, &pending)?;
-    let bookmark_graph = BookmarkGraph::from_changes(&repo.jj, &selected, false)?;
+    let merged_boundary_revset = "trunk()";
+    let selected =
+        select_changes_to_submit(&repo.jj, "@", &bookmarks, &pending, merged_boundary_revset)?;
+    let bookmark_graph =
+        BookmarkGraph::from_changes(&repo.jj, &selected, false, merged_boundary_revset)?;
     let output = BufferedOutput::default();
     announce_submission_graph(&bookmark_graph, &bookmarks, true, false, &output)?;
 

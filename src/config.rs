@@ -119,8 +119,8 @@ pub struct Config {
     /// Which forge to use.
     pub forge: ForgeType,
 
-    /// The base branch for root MRs in a stack. When unset, jj-vine uses the
-    /// bookmark that `trunk()` resolves to.
+    /// Base branch for root MRs and the merged boundary. When unset, jj-vine
+    /// uses the bookmark that `trunk()` resolves to.
     #[serde(default)]
     pub default_base_branch: Option<String>,
 
@@ -1204,6 +1204,19 @@ impl Config {
         }
     }
 
+    /// The revset boundary used to identify changes already merged for
+    /// submission.
+    #[must_use]
+    pub fn merged_boundary_revset(&self) -> String {
+        let Some(branch) = &self.default_base_branch else {
+            return "trunk()".to_owned();
+        };
+
+        let branch = crate::jj::revset_string_literal(branch);
+        let remote = crate::jj::revset_string_literal(&self.remote_name);
+        format!("(trunk() | remote_bookmarks(exact:{branch}, exact:{remote}))")
+    }
+
     pub fn validate(&self) -> Result<()> {
         match self.forge {
             ForgeType::GitLab => crate::forge::gitlab::validate_config(self),
@@ -1231,6 +1244,26 @@ mod tests {
 
     use super::*;
     use crate::jj::ISOLATED_TEST_CONFIG;
+
+    #[test]
+    fn merged_boundary_revset_uses_trunk_when_base_is_unset() {
+        let config = Config::builder().forge(ForgeType::GitHub).build();
+        assert_eq!(config.merged_boundary_revset(), "trunk()");
+    }
+
+    #[test]
+    fn merged_boundary_revset_quotes_base_and_remote() {
+        let config = Config::builder()
+            .forge(ForgeType::GitHub)
+            .default_base_branch("release branch".to_owned())
+            .remote_name("origin/backup".to_owned())
+            .build();
+
+        assert_eq!(
+            config.merged_boundary_revset(),
+            r#"(trunk() | remote_bookmarks(exact:"release branch", exact:"origin/backup"))"#
+        );
+    }
 
     fn isolated_jj(repo_path: &Path) -> Result<Jujutsu> {
         let config_path = repo_path

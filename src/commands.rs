@@ -8,22 +8,24 @@ pub enum GetBookmarksOptions {
     /// Use a manual revset.
     Revset(String),
 
-    /// Include only `(mine() & tracked_remote_bookmarks()) ~ trunk()`.
+    /// Include only `(mine() & tracked_remote_bookmarks()) ~ boundary`.
     Tracked,
 
-    /// Include only `(mine() & bookmarks()) ~ trunk()`.
+    /// Include only `(mine() & bookmarks()) ~ boundary`.
     Mine,
 }
 
 impl GetBookmarksOptions {
     #[must_use]
-    pub fn to_revset(&self) -> String {
+    pub fn to_revset(&self, merged_boundary_revset: &str) -> String {
         match self {
             GetBookmarksOptions::Revset(revset) => revset.clone(),
             GetBookmarksOptions::Tracked => {
-                "(mine() & tracked_remote_bookmarks()) ~ ::trunk()".to_owned()
+                format!("(mine() & tracked_remote_bookmarks()) ~ ::({merged_boundary_revset})")
             }
-            GetBookmarksOptions::Mine => "(mine() & bookmarks()) ~ ::trunk()".to_owned(),
+            GetBookmarksOptions::Mine => {
+                format!("(mine() & bookmarks()) ~ ::({merged_boundary_revset})")
+            }
         }
     }
 }

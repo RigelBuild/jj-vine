@@ -78,6 +78,125 @@ async fn plan_for<T>(
     .await
 }
 
+fn with_merged_release_ancestor() -> Result<TestRepo<TestRepo<()>>> {
+    let repo = with_main_trunk()?;
+    repo.create_change("merged.txt", "merged", "Already merged")
+        .create_bookmark("merged")
+        .push_bookmark("merged")
+        .track_bookmark("merged");
+    repo.jj
+        .exec(["bookmark", "set", "release", "--to", "merged"])?;
+    repo.push_bookmark("release");
+    repo.jj.exec(["git", "fetch"])?;
+    repo.jj.exec(["new", "release@origin"])?;
+    repo.create_change("feature.txt", "feature", "Feature")
+        .create_bookmark("feature");
+    Ok(repo)
+}
+
+#[test]
+fn find_changes_to_submit_excludes_bookmark_merged_into_configured_base() -> Result<()> {
+    let repo = with_merged_release_ancestor()?;
+    let merged_boundary_revset = config(Some("release")).merged_boundary_revset();
+    let changes = crate::submit::find_changes_to_submit(
+        &repo.jj,
+        ["feature"],
+        ["feature"],
+        &std::collections::HashSet::new(),
+        &merged_boundary_revset,
+    )?;
+
+    assert!(
+        changes
+            .iter()
+            .flat_map(|change| &change.bookmarks)
+            .all(|bookmark| bookmark.name() != "merged"),
+        "the merged bookmark must not be selected for submission"
+    );
+    Ok(())
+}
+
+fn selected_bookmarks(
+    repo: &TestRepo<TestRepo<()>>,
+    target: &str,
+    boundary: &str,
+) -> Result<Vec<String>> {
+    Ok(crate::submit::find_changes_to_submit(
+        &repo.jj,
+        [target],
+        [target],
+        &std::collections::HashSet::new(),
+        boundary,
+    )?
+    .iter()
+    .flat_map(|change| change.bookmarks.iter().map(|b| b.name().to_owned()))
+    .collect())
+}
+
+#[test]
+fn explicitly_named_bookmark_merged_into_configured_base_is_not_selected() -> Result<()> {
+    let repo = with_merged_release_ancestor()?;
+    let boundary = config(Some("release")).merged_boundary_revset();
+
+    assert_eq!(
+        selected_bookmarks(&repo, "merged", &boundary)?,
+        Vec::<String>::new()
+    );
+    Ok(())
+}
+
+#[test]
+fn configured_base_behind_trunk_still_excludes_trunk_ancestry() -> Result<()> {
+    let (repo, root) = with_release_behind_trunk()?;
+    let boundary = config(Some("release")).merged_boundary_revset();
+
+    assert_eq!(selected_bookmarks(&repo, &root, &boundary)?, vec![root]);
+    Ok(())
+}
+
+#[test]
+fn unfetched_configured_base_falls_back_to_trunk() -> Result<()> {
+    let repo = with_merged_release_ancestor()?;
+    let boundary = config(Some("not-on-remote")).merged_boundary_revset();
+
+    let selected = selected_bookmarks(&repo, "feature", &boundary)?;
+    assert_eq!(selected, selected_bookmarks(&repo, "feature", "trunk()")?);
+    assert!(selected.contains(&"merged".to_owned()));
+    Ok(())
+}
+
+#[tokio::test]
+async fn planner_uses_configured_base_as_root_for_release_ancestor() -> Result<()> {
+    let repo = with_merged_release_ancestor()?;
+    let config = config(Some("release"));
+    let merged_boundary_revset = config.merged_boundary_revset();
+    let all_changes = repo.jj.log("mine() & bookmarks()")?;
+    let graph =
+        BookmarkGraph::from_changes(&repo.jj, &all_changes, false, &merged_boundary_revset)?;
+    assert!(graph.bookmark("merged").is_none());
+    let feature = graph
+        .find_bookmark_in_components("feature")
+        .expect("feature is in the submission graph");
+    assert!(feature.parents.is_empty(), "feature is a stack root");
+
+    let forge = ForgeImpl::Test(TestForge::default());
+    let plan = plan_for(&repo, &config, &forge, &graph).await?;
+    assert!(plan.actions.iter().flatten().any(|action| matches!(
+        action,
+        Action::CreateMR(action)
+            if action.bookmark.to_string() == "feature" && action.target_branch == "release"
+    )));
+    assert!(!plan.actions.iter().flatten().any(|action| matches!(
+        action,
+        Action::CreateMR(action) if action.bookmark.to_string() == "merged"
+    )));
+    assert!(!plan.actions.iter().flatten().any(|action| matches!(
+        action,
+        Action::UpdateMRBase(action) if action.bookmark.to_string() == "merged"
+    )));
+    Ok(())
+}
+
 #[tokio::test]
 async fn planner_creates_root_mr_with_configured_base_and_keeps_child_parent_base() -> Result<()> {
     let repo = with_main_trunk()?;
@@ -90,7 +209,8 @@ async fn planner_creates_root_mr_with_configured_base_and_keeps_child_parent_bas
     let config = config(Some("release"));
     let forge = ForgeImpl::Test(TestForge::default());
     let changes = repo.jj.log("mine() & bookmarks()")?;
-    let graph = BookmarkGraph::from_changes(&repo.jj, &changes, false)?;
+    let graph =
+        BookmarkGraph::from_changes(&repo.jj, &changes, false, &config.merged_boundary_revset())?;
     let plan = plan_for(&repo, &config, &forge, &graph).await?;
     let create_targets: std::collections::HashMap<_, _> = plan
         .actions
@@ -132,7 +252,8 @@ async fn planner_titles_root_mr_from_configured_remote_base() -> Result<()> {
         .build();
     let forge = ForgeImpl::Test(TestForge::default());
     let changes = repo.jj.log("mine() & bookmarks()")?;
-    let graph = BookmarkGraph::from_changes(&repo.jj, &changes, false)?;
+    let graph =
+        BookmarkGraph::from_changes(&repo.jj, &changes, false, &config.merged_boundary_revset())?;
     let plan = plan_for(&repo, &config, &forge, &graph).await?;
 
     let title = plan
@@ -174,7 +295,8 @@ async fn planner_uses_configured_base_without_dropping_trunk_commits() -> Result
         .build();
     let forge = ForgeImpl::Test(TestForge::default());
     let changes = repo.jj.log("mine() & bookmarks()")?;
-    let graph = BookmarkGraph::from_changes(&repo.jj, &changes, false)?;
+    let graph =
+        BookmarkGraph::from_changes(&repo.jj, &changes, false, &config.merged_boundary_revset())?;
     let plan = plan_for(&repo, &config, &forge, &graph).await?;
 
     let create_mr = plan
@@ -224,7 +346,8 @@ async fn planner_syncs_existing_root_mr_title_and_description_from_trunk_only_co
             .build(),
     );
     let changes = repo.jj.log("mine() & bookmarks()")?;
-    let graph = BookmarkGraph::from_changes(&repo.jj, &changes, false)?;
+    let graph =
+        BookmarkGraph::from_changes(&repo.jj, &changes, false, &config.merged_boundary_revset())?;
     let plan = plan_for(&repo, &config, &forge, &graph).await?;
 
     let synced_action = plan
@@ -258,7 +381,8 @@ async fn planner_uses_configured_base_when_trunk_is_unavailable() -> Result<()> 
     let config = config(Some("release"));
     let forge = ForgeImpl::Test(TestForge::default());
     let changes = repo.jj.log("mine() & bookmarks()")?;
-    let graph = BookmarkGraph::from_changes(&repo.jj, &changes, false)?;
+    let graph =
+        BookmarkGraph::from_changes(&repo.jj, &changes, false, &config.merged_boundary_revset())?;
     let plan = plan_for(&repo, &config, &forge, &graph).await?;
 
     let target = plan
@@ -300,7 +424,8 @@ async fn planner_retargets_existing_fork_child_mr_from_trunk_to_configured_base(
     );
     let config = config(Some("release"));
     let changes = repo.jj.log("mine() & bookmarks()")?;
-    let graph = BookmarkGraph::from_changes(&repo.jj, &changes, false)?;
+    let graph =
+        BookmarkGraph::from_changes(&repo.jj, &changes, false, &config.merged_boundary_revset())?;
     let plan = plan_for(&repo, &config, &forge, &graph).await?;
 
     assert!(plan.actions.iter().flatten().any(|action| matches!(
@@ -336,7 +461,8 @@ async fn planner_retargets_existing_root_mr_from_trunk_to_configured_base() -> R
     );
     let config = config(Some("release"));
     let changes = repo.jj.log("mine() & bookmarks()")?;
-    let graph = BookmarkGraph::from_changes(&repo.jj, &changes, false)?;
+    let graph =
+        BookmarkGraph::from_changes(&repo.jj, &changes, false, &config.merged_boundary_revset())?;
     let plan = plan_for(&repo, &config, &forge, &graph).await?;
     let update = plan
         .actions
@@ -390,7 +516,8 @@ async fn planner_prefers_existing_root_mr_on_configured_base() -> Result<()> {
     );
     let config = config(Some("release"));
     let changes = repo.jj.log("mine() & bookmarks()")?;
-    let graph = BookmarkGraph::from_changes(&repo.jj, &changes, false)?;
+    let graph =
+        BookmarkGraph::from_changes(&repo.jj, &changes, false, &config.merged_boundary_revset())?;
     let plan = plan_for(&repo, &config, &forge, &graph).await?;
 
     assert_eq!(plan.existing_mrs[&root].target_branch(), "release");
@@ -439,7 +566,8 @@ async fn planner_keeps_existing_child_mr_target_at_parent_bookmark() -> Result<(
     );
     let config = config(Some("release"));
     let changes = repo.jj.log("mine() & bookmarks()")?;
-    let graph = BookmarkGraph::from_changes(&repo.jj, &changes, false)?;
+    let graph =
+        BookmarkGraph::from_changes(&repo.jj, &changes, false, &config.merged_boundary_revset())?;
     let plan = plan_for(&repo, &config, &forge, &graph).await?;
     let child_base_updates: Vec<_> = plan
         .actions
@@ -491,7 +619,8 @@ async fn planner_retargets_existing_child_mr_from_deleted_middle_base() -> Resul
     );
     let config = config(None);
     let changes = repo.jj.log("mine() & bookmarks()")?;
-    let graph = BookmarkGraph::from_changes(&repo.jj, &changes, false)?;
+    let graph =
+        BookmarkGraph::from_changes(&repo.jj, &changes, false, &config.merged_boundary_revset())?;
     let plan = plan_for(&repo, &config, &forge, &graph).await?;
 
     assert!(plan.actions.iter().flatten().any(|action| matches!(
@@ -515,7 +644,8 @@ async fn planner_keeps_trunk_target_when_root_base_is_unset() -> Result<()> {
     let config = config(None);
     let forge = ForgeImpl::Test(TestForge::default());
     let changes = repo.jj.log("mine() & bookmarks()")?;
-    let graph = BookmarkGraph::from_changes(&repo.jj, &changes, false)?;
+    let graph =
+        BookmarkGraph::from_changes(&repo.jj, &changes, false, &config.merged_boundary_revset())?;
     let plan = plan_for(&repo, &config, &forge, &graph).await?;
     let target = plan
         .actions
