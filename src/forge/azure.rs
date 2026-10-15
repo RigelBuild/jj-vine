@@ -1371,3 +1371,24 @@ pub enum CommentType {
     CodeChange,
     System,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::AzureDevOpsForge;
+
+    #[test]
+    fn azure_client_carries_the_request_timeout() {
+        let forge = AzureDevOpsForge::builder()
+            .base_url("https://dev.azure.com/org")
+            .source_project_id("org/project")
+            .target_project_id("org/project")
+            .token("t")
+            .vssps_base_url("https://vssps.dev.azure.com")
+            .source_repository_name("repo".to_owned())
+            .maybe_ca_bundle(None::<&str>)
+            .accept_non_compliant_certs(false)
+            .build()
+            .expect("azure forge");
+        crate::forge::http_timeout_tests::assert_production_timeout(&forge.client);
+    }
+}

@@ -1168,6 +1168,7 @@ mod tests {
         assert_eq!(client.source_project_id, "group/project");
         assert_eq!(client.target_project_id, "group/project");
         assert_eq!(client.token, "token123");
+        crate::forge::http_timeout_tests::assert_production_timeout(&client.client);
     }
 
     #[test]
