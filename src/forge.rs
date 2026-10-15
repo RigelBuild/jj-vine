@@ -1317,6 +1317,11 @@ pub(crate) mod http_timeout_tests {
             err.is_timeout(),
             "the error must be a timeout, got: {err:?}"
         );
+        let message = crate::error::Error::from(err).to_string();
+        assert!(
+            message.contains("request timed out: "),
+            "timeout errors must say so, got: {message}"
+        );
     }
 
     #[tokio::test]
