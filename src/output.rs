@@ -139,20 +139,38 @@ pub struct InteractiveOutput {
 impl InteractiveOutput {
     #[must_use]
     pub fn new() -> Self {
-        let pb = ProgressBar::new_spinner();
+        let output = Self::with_spinner(ProgressBar::new_spinner());
+        output
+            .spinner
+            .enable_steady_tick(core::time::Duration::from_millis(80));
+        output
+    }
+
+    /// Wrap `spinner` with the standard style; tests pass one with a fixed
+    /// draw target.
+    #[must_use]
+    pub fn with_spinner(spinner: ProgressBar) -> Self {
         #[expect(clippy::missing_panics_doc, reason = "infallible")]
-        pb.set_style(
+        spinner.set_style(
             ProgressStyle::default_spinner()
                 .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏")
                 .template("{spinner:.green} {msg}")
                 .unwrap(),
         );
-        pb.enable_steady_tick(core::time::Duration::from_millis(80));
         Self {
-            spinner: pb,
+            spinner,
             current_text: RwLock::new(String::new()),
             substeps: RwLock::new(Vec::new()),
         }
+    }
+
+    /// Whether indicatif is suppressing this spinner's output because stderr is
+    /// not a usable terminal (piped or captured, or `TERM=dumb`/unset). When
+    /// true, the caller should fall back to flat logging so progress stays
+    /// visible.
+    #[must_use]
+    pub fn is_hidden(&self) -> bool {
+        self.spinner.is_hidden()
     }
 }
 

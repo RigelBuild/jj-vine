@@ -65,11 +65,10 @@ impl Cli {
             Commands::Init => false,
         };
 
-        let output: SyncOutput = if self.verbose || !can_have_interactive_output {
-            SyncOutput::Flat(FlatOutput::new())
-        } else {
-            SyncOutput::Interactive(InteractiveOutput::new())
-        };
+        let output = select_output(interactive_output_candidate(
+            self.verbose,
+            can_have_interactive_output,
+        ));
 
         let filter = EnvFilter::builder()
             .with_default_directive(Level::INFO.into())
@@ -147,5 +146,109 @@ impl Cli {
                 Ok(())
             }
         }
+    }
+}
+
+/// Build an interactive spinner candidate when the run is eligible for one, or
+/// `None` when it must use flat logging regardless of the terminal.
+///
+/// This decides only the two conditions the caller controls: `verbose` forces
+/// flat logging, and a command that shows no progress (e.g. `init`) is never
+/// interactive. Whether stderr is actually a usable terminal is left to
+/// `indicatif` — the caller checks [`InteractiveOutput::is_hidden`] on the
+/// returned candidate. Deriving the terminal test here (e.g. only
+/// `stderr().is_terminal()`) would miss cases `indicatif` still hides, such as
+/// `TERM=dumb` or an unset `TERM` on a real pty, and the spinner's output would
+/// vanish silently.
+#[must_use]
+fn interactive_output_candidate(
+    verbose: bool,
+    can_have_interactive_output: bool,
+) -> Option<InteractiveOutput> {
+    (!verbose && can_have_interactive_output).then(InteractiveOutput::new)
+}
+
+/// Keep the spinner only if indicatif will draw it. A hidden spinner (stderr
+/// piped or captured, or `TERM=dumb`/unset) drops every `log_message`, so fall
+/// back to flat logging, which stays visible via `tracing`.
+fn select_output(candidate: Option<InteractiveOutput>) -> SyncOutput {
+    match candidate {
+        Some(interactive) if !interactive.is_hidden() => SyncOutput::Interactive(interactive),
+        _ => SyncOutput::Flat(FlatOutput::new()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use indicatif::{ProgressBar, ProgressDrawTarget};
+
+    use super::{interactive_output_candidate, select_output};
+    use crate::output::{InteractiveOutput, SyncOutput};
+
+    fn spinner_with(target: ProgressDrawTarget) -> InteractiveOutput {
+        InteractiveOutput::with_spinner(ProgressBar::with_draw_target(None, target))
+    }
+
+    #[test]
+    fn hidden_spinner_falls_back_to_flat_output() {
+        let output = select_output(Some(spinner_with(ProgressDrawTarget::hidden())));
+        assert!(matches!(output, SyncOutput::Flat(_)));
+    }
+
+    /// A terminal indicatif draws to; every write succeeds and is discarded.
+    #[derive(Debug)]
+    struct NullTerm;
+
+    impl indicatif::TermLike for NullTerm {
+        fn width(&self) -> u16 {
+            80
+        }
+        fn move_cursor_up(&self, _: usize) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn move_cursor_down(&self, _: usize) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn move_cursor_right(&self, _: usize) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn move_cursor_left(&self, _: usize) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn write_line(&self, _: &str) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn write_str(&self, _: &str) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn clear_line(&self) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn flush(&self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn visible_spinner_stays_interactive() {
+        let target = ProgressDrawTarget::term_like(Box::new(NullTerm));
+        let output = select_output(Some(spinner_with(target)));
+        assert!(matches!(output, SyncOutput::Interactive(_)));
+    }
+
+    #[test]
+    fn no_candidate_uses_flat_output() {
+        assert!(matches!(select_output(None), SyncOutput::Flat(_)));
+    }
+
+    #[test]
+    fn candidate_only_when_eligible() {
+        // A command that supports a spinner, not verbose: eligible (the caller
+        // still drops it if indicatif would hide it on a non-terminal).
+        assert!(interactive_output_candidate(false, true).is_some());
+        // Verbose always uses flat logging, even when a spinner is supported.
+        assert!(interactive_output_candidate(true, true).is_none());
+        // A command that cannot show a spinner (e.g. init) is never interactive.
+        assert!(interactive_output_candidate(false, false).is_none());
     }
 }
