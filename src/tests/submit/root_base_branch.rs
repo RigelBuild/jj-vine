@@ -116,6 +116,55 @@ fn find_changes_to_submit_excludes_bookmark_merged_into_configured_base() -> Res
     Ok(())
 }
 
+fn selected_bookmarks(
+    repo: &TestRepo<TestRepo<()>>,
+    target: &str,
+    boundary: &str,
+) -> Result<Vec<String>> {
+    Ok(crate::submit::find_changes_to_submit(
+        &repo.jj,
+        [target],
+        [target],
+        &std::collections::HashSet::new(),
+        boundary,
+    )?
+    .iter()
+    .flat_map(|change| change.bookmarks.iter().map(|b| b.name().to_owned()))
+    .collect())
+}
+
+#[test]
+fn explicitly_named_bookmark_merged_into_configured_base_is_not_selected() -> Result<()> {
+    let repo = with_merged_release_ancestor()?;
+    let boundary = config(Some("release")).merged_boundary_revset();
+
+    assert_eq!(
+        selected_bookmarks(&repo, "merged", &boundary)?,
+        Vec::<String>::new()
+    );
+    Ok(())
+}
+
+#[test]
+fn configured_base_behind_trunk_still_excludes_trunk_ancestry() -> Result<()> {
+    let (repo, root) = with_release_behind_trunk()?;
+    let boundary = config(Some("release")).merged_boundary_revset();
+
+    assert_eq!(selected_bookmarks(&repo, &root, &boundary)?, vec![root]);
+    Ok(())
+}
+
+#[test]
+fn unfetched_configured_base_falls_back_to_trunk() -> Result<()> {
+    let repo = with_merged_release_ancestor()?;
+    let boundary = config(Some("not-on-remote")).merged_boundary_revset();
+
+    let selected = selected_bookmarks(&repo, "feature", &boundary)?;
+    assert_eq!(selected, selected_bookmarks(&repo, "feature", "trunk()")?);
+    assert!(selected.contains(&"merged".to_owned()));
+    Ok(())
+}
+
 #[tokio::test]
 async fn planner_uses_configured_base_as_root_for_release_ancestor() -> Result<()> {
     let repo = with_merged_release_ancestor()?;
