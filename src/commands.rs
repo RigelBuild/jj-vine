@@ -8,10 +8,12 @@ pub enum GetBookmarksOptions {
     /// Use a manual revset.
     Revset(String),
 
-    /// Include only `(mine() & tracked_remote_bookmarks()) ~ boundary`.
+    /// Include only `(mine() & tracked_remote_bookmarks())`, minus merged
+    /// ancestry: `trunk()` and, when set, the remote `defaultBaseBranch`.
     Tracked,
 
-    /// Include only `(mine() & bookmarks()) ~ boundary`.
+    /// Include only `(mine() & bookmarks())`, minus merged ancestry: `trunk()`
+    /// and, when set, the remote `defaultBaseBranch`.
     Mine,
 }
 

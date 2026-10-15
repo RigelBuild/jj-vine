@@ -165,6 +165,29 @@ fn unfetched_configured_base_falls_back_to_trunk() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn default_selectors_exclude_bookmarks_merged_into_configured_base() -> Result<()> {
+    let repo = with_merged_release_ancestor()?;
+    repo.push_bookmark("feature").track_bookmark("feature");
+    repo.jj.exec(["git", "fetch"])?;
+    let boundary = config(Some("release")).merged_boundary_revset();
+
+    for (label, option) in [
+        ("mine", crate::commands::GetBookmarksOptions::Mine),
+        ("tracked", crate::commands::GetBookmarksOptions::Tracked),
+    ] {
+        let names: Vec<String> = repo
+            .jj
+            .log(option.to_revset(&boundary))?
+            .iter()
+            .flat_map(|change| change.bookmarks.iter().map(|b| b.name().to_owned()))
+            .collect();
+        assert!(names.contains(&"feature".to_owned()), "{label}: {names:?}");
+        assert!(!names.contains(&"merged".to_owned()), "{label}: {names:?}");
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn planner_uses_configured_base_as_root_for_release_ancestor() -> Result<()> {
     let repo = with_merged_release_ancestor()?;

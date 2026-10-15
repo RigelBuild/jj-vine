@@ -159,10 +159,10 @@ pub struct SubmitCommandRevsetOptions {
     /// Submit all tracked bookmarks.
     ///
     /// While this is roughly equivalent to
-    /// `(mine() & tracked_remote_bookmarks()) ~ boundary`, it includes the
-    /// additional stipulation that all submitted bookmarks must be already
-    /// pushed to the remote. Bookmarks which have non-tracked parents or
-    /// children will be skipped over.
+    /// `(mine() & tracked_remote_bookmarks())` minus merged ancestry, it
+    /// includes the additional stipulation that all submitted bookmarks
+    /// must be already pushed to the remote. Bookmarks which have
+    /// non-tracked parents or children will be skipped over.
     #[arg(short = 't', long)]
     pub tracked: bool,
 }
@@ -454,7 +454,7 @@ pub(crate) fn announce_submission_graph(
         .join(", ");
     ensure_whatever!(
         !bookmark_names.is_empty(),
-        "No changes to submit for bookmarks {}. Check whether each name is in trunk or resolved as a tag, and whether mine() filtered generalized selections.",
+        "No changes to submit for bookmarks {}. Check whether each name is already merged (in trunk, or in the remote defaultBaseBranch when set) or resolved as a tag, and whether mine() filtered generalized selections.",
         bookmarks.iter().map(JJName::raw_name).join(", ")
     );
     output.log_message(&format!(
