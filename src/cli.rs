@@ -65,10 +65,9 @@ impl Cli {
             Commands::Init => false,
         };
 
-        let output = select_output(interactive_output_candidate(
-            self.verbose,
-            can_have_interactive_output,
-        ));
+        let candidate = wants_interactive_output(self.verbose, can_have_interactive_output)
+            .then(InteractiveOutput::new);
+        let output = select_output(candidate);
 
         let filter = EnvFilter::builder()
             .with_default_directive(Level::INFO.into())
@@ -149,23 +148,13 @@ impl Cli {
     }
 }
 
-/// Build an interactive spinner candidate when the run is eligible for one, or
-/// `None` when it must use flat logging regardless of the terminal.
-///
-/// This decides only the two conditions the caller controls: `verbose` forces
-/// flat logging, and a command that shows no progress (e.g. `init`) is never
-/// interactive. Whether stderr is actually a usable terminal is left to
-/// `indicatif` — the caller checks [`InteractiveOutput::is_hidden`] on the
-/// returned candidate. Deriving the terminal test here (e.g. only
-/// `stderr().is_terminal()`) would miss cases `indicatif` still hides, such as
-/// `TERM=dumb` or an unset `TERM` on a real pty, and the spinner's output would
-/// vanish silently.
+/// Whether the run may use a spinner: `verbose` forces flat logging, and a
+/// command that shows no progress (e.g. `init`) is never interactive. Terminal
+/// usability is left to indicatif via [`InteractiveOutput::is_hidden`], which
+/// also catches `TERM=dumb` or an unset `TERM` on a real pty.
 #[must_use]
-fn interactive_output_candidate(
-    verbose: bool,
-    can_have_interactive_output: bool,
-) -> Option<InteractiveOutput> {
-    (!verbose && can_have_interactive_output).then(InteractiveOutput::new)
+fn wants_interactive_output(verbose: bool, can_have_interactive_output: bool) -> bool {
+    !verbose && can_have_interactive_output
 }
 
 /// Keep the spinner only if indicatif will draw it. A hidden spinner (stderr
@@ -182,7 +171,7 @@ fn select_output(candidate: Option<InteractiveOutput>) -> SyncOutput {
 mod tests {
     use indicatif::{ProgressBar, ProgressDrawTarget};
 
-    use super::{interactive_output_candidate, select_output};
+    use super::{select_output, wants_interactive_output};
     use crate::output::{InteractiveOutput, SyncOutput};
 
     fn spinner_with(target: ProgressDrawTarget) -> InteractiveOutput {
@@ -242,13 +231,9 @@ mod tests {
     }
 
     #[test]
-    fn candidate_only_when_eligible() {
-        // A command that supports a spinner, not verbose: eligible (the caller
-        // still drops it if indicatif would hide it on a non-terminal).
-        assert!(interactive_output_candidate(false, true).is_some());
-        // Verbose always uses flat logging, even when a spinner is supported.
-        assert!(interactive_output_candidate(true, true).is_none());
-        // A command that cannot show a spinner (e.g. init) is never interactive.
-        assert!(interactive_output_candidate(false, false).is_none());
+    fn interactive_only_when_eligible() {
+        assert!(wants_interactive_output(false, true));
+        assert!(!wants_interactive_output(true, true));
+        assert!(!wants_interactive_output(false, false));
     }
 }
