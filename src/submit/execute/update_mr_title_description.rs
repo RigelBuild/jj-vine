@@ -269,7 +269,13 @@ mod tests {
         let bookmark = repo.bookmark_name("placement");
         repo.create_change_and_bookmark(&bookmark);
         let changes = repo.jj.log("all()")?;
-        let bookmark_graph = BookmarkGraph::from_changes(&repo.jj, &changes, false)?;
+        let config = Config::builder().forge(ForgeType::Forgejo).build();
+        let bookmark_graph = BookmarkGraph::from_changes(
+            &repo.jj,
+            &changes,
+            false,
+            &config.merged_boundary_revset(),
+        )?;
 
         let existing_description =
             format!("{START_MARKER}\nOutdated stack content\n{END_MARKER}\n\nUser notes");

@@ -33,7 +33,8 @@ fn deleted_middle_bookmark() -> Result<()> {
         .into_iter()
         .collect();
 
-    let graph = BookmarkGraph::from_bookmarks(&repo.jj, bookmarks.iter().cloned(), false)?;
+    let graph =
+        BookmarkGraph::from_bookmarks(&repo.jj, bookmarks.iter().cloned(), false, "trunk()")?;
 
     let bookmark_a = graph.find_bookmark_in_components("bookmark-a").unwrap();
 
@@ -63,7 +64,8 @@ fn base_branch_not_included_in_submission() -> Result<()> {
         .into_iter()
         .collect();
 
-    let graph = BookmarkGraph::from_bookmarks(&repo.jj, bookmarks.iter().cloned(), false)?;
+    let graph =
+        BookmarkGraph::from_bookmarks(&repo.jj, bookmarks.iter().cloned(), false, "trunk()")?;
     let stack = graph.component_containing("feature-2").unwrap();
 
     assert_contains!(stack, "feature-1");
@@ -84,7 +86,8 @@ fn submit_base_branch_errors() -> Result<()> {
     let bookmarks: Vec<_> = BookmarkOrPending::from_changes(&changes)
         .into_iter()
         .collect();
-    let graph = BookmarkGraph::from_bookmarks(&repo.jj, bookmarks.iter().cloned(), true)?;
+    let graph =
+        BookmarkGraph::from_bookmarks(&repo.jj, bookmarks.iter().cloned(), true, "trunk()")?;
 
     assert_is_empty!(graph.components());
 
@@ -116,7 +119,8 @@ fn graph_skips_default_branch_history() -> Result<()> {
         .into_iter()
         .collect();
 
-    let graph = BookmarkGraph::from_bookmarks(&repo.jj, bookmarks.iter().cloned(), false)?;
+    let graph =
+        BookmarkGraph::from_bookmarks(&repo.jj, bookmarks.iter().cloned(), false, "trunk()")?;
 
     assert_none!(graph.component_containing("main"));
     assert_some!(graph.component_containing("feature-1"));
@@ -148,7 +152,13 @@ fn find_changes_to_submit_with_advanced_main() -> Result<()> {
 
     // From feature-3, we expect the whole downstack back to (but not including)
     // trunk — i.e. feature-2 and feature-3.
-    let changes = find_changes_to_submit(&repo.jj, ["feature-3"], ["feature-3"], &HashSet::new())?;
+    let changes = find_changes_to_submit(
+        &repo.jj,
+        ["feature-3"],
+        ["feature-3"],
+        &HashSet::new(),
+        "trunk()",
+    )?;
     let mut names: Vec<_> = Bookmark::from_changes(&changes)
         .into_iter()
         .map(|b| b.name().to_owned())
@@ -158,7 +168,13 @@ fn find_changes_to_submit_with_advanced_main() -> Result<()> {
 
     // From feature, we expect just feature: it branched off old main but is
     // not in the ancestry of the new trunk, so it should not be filtered out.
-    let changes = find_changes_to_submit(&repo.jj, ["feature"], ["feature"], &HashSet::new())?;
+    let changes = find_changes_to_submit(
+        &repo.jj,
+        ["feature"],
+        ["feature"],
+        &HashSet::new(),
+        "trunk()",
+    )?;
     let names: Vec<_> = Bookmark::from_changes(&changes)
         .into_iter()
         .map(|b| b.name().to_owned())
@@ -184,7 +200,13 @@ fn find_changes_to_submit_includes_foreign_authored_named_target() -> Result<()>
     repo.set_config("user.name", "Current User");
     // The explicitly named bookmark is included even though its commit author
     // differs from the current user.
-    let changes = find_changes_to_submit(&repo.jj, ["feature"], ["feature"], &HashSet::new())?;
+    let changes = find_changes_to_submit(
+        &repo.jj,
+        ["feature"],
+        ["feature"],
+        &HashSet::new(),
+        "trunk()",
+    )?;
     let names: Vec<_> = Bookmark::from_changes(&changes)
         .into_iter()
         .map(|bookmark| bookmark.name().to_owned())
@@ -221,7 +243,7 @@ fn find_changes_to_submit_excludes_foreign_authored_ancestry_companion() -> Resu
 
     // Submitting the top bookmark walks the ancestry, but must omit the foreign
     // middle bookmark.
-    let changes = find_changes_to_submit(&repo.jj, ["b"], ["b"], &HashSet::new())?;
+    let changes = find_changes_to_submit(&repo.jj, ["b"], ["b"], &HashSet::new(), "trunk()")?;
     let mut names: Vec<_> = Bookmark::from_changes(&changes)
         .into_iter()
         .map(|bookmark| bookmark.name().to_owned())
@@ -239,7 +261,8 @@ fn find_changes_to_submit_excludes_foreign_authored_ancestry_companion() -> Resu
     repo.set_config("user.email", "current@example.com");
     repo.set_config("user.name", "Current User");
 
-    let changes = find_changes_to_submit(&repo.jj, ["b", "d"], ["b", "d"], &HashSet::new())?;
+    let changes =
+        find_changes_to_submit(&repo.jj, ["b", "d"], ["b", "d"], &HashSet::new(), "trunk()")?;
     let mut names: Vec<_> = Bookmark::from_changes(&changes)
         .into_iter()
         .map(|bookmark| bookmark.name().to_owned())
@@ -263,6 +286,7 @@ fn find_changes_to_submit_includes_pending_bookmark_without_local_bookmark() -> 
         [change.change_id.as_str()],
         [] as [&str; 0],
         &pending,
+        "trunk()",
     )?;
     assert_eq!(changes.len(), 1);
     assert_eq!(changes[0].change_id, change.change_id);
@@ -298,7 +322,7 @@ fn submission_changes(
     let bookmarks: Vec<_> = BookmarkOrPending::from_changes(&changes)
         .into_iter()
         .collect();
-    select_changes_to_submit(&repo.jj, revset, &bookmarks, &HashSet::new())
+    select_changes_to_submit(&repo.jj, revset, &bookmarks, &HashSet::new(), "trunk()")
 }
 
 fn sorted_names(changes: &[crate::jj::Change]) -> Vec<String> {
@@ -327,7 +351,7 @@ fn graph_rejects_foreign_parent_of_named_target() -> Result<()> {
     let changes = submission_changes(&repo, "y")?;
     assert_eq!(sorted_names(&changes), vec!["y".to_owned()]);
 
-    let error = BookmarkGraph::from_changes(&repo.jj, &changes, false)
+    let error = BookmarkGraph::from_changes(&repo.jj, &changes, false, "trunk()")
         .unwrap_err()
         .to_string();
     assert_contains!(error, "`y` stacks on `x`");
@@ -335,7 +359,7 @@ fn graph_rejects_foreign_parent_of_named_target() -> Result<()> {
 
     // Naming the foreign parent too selects it, so the stack builds.
     let changes = submission_changes(&repo, "y | x")?;
-    let graph = BookmarkGraph::from_changes(&repo.jj, &changes, false)?;
+    let graph = BookmarkGraph::from_changes(&repo.jj, &changes, false, "trunk()")?;
     let x = graph.find_bookmark_in_components("x").unwrap();
     let y = graph.find_bookmark_in_components("y").unwrap();
     assert_eq!(y.parents, vec![BookmarkRef::Bookmark(x.clone())]);
@@ -370,7 +394,7 @@ fn graph_rejects_foreign_middle_bookmark() -> Result<()> {
             "revset {revset}"
         );
 
-        let error = BookmarkGraph::from_changes(&repo.jj, &changes, false)
+        let error = BookmarkGraph::from_changes(&repo.jj, &changes, false, "trunk()")
             .unwrap_err()
             .to_string();
         assert_contains!(error, "`b` stacks on `c`");
@@ -396,7 +420,7 @@ fn graph_walks_past_unbookmarked_foreign_change() -> Result<()> {
         .create_bookmark("b");
 
     let changes = submission_changes(&repo, "b")?;
-    let graph = BookmarkGraph::from_changes(&repo.jj, &changes, false)?;
+    let graph = BookmarkGraph::from_changes(&repo.jj, &changes, false, "trunk()")?;
     let a = graph.find_bookmark_in_components("a").unwrap();
     let b = graph.find_bookmark_in_components("b").unwrap();
     assert_eq!(b.parents, vec![BookmarkRef::Bookmark(a.clone())]);
@@ -422,7 +446,7 @@ fn general_revset_keeps_mine_filter_for_foreign_targets() -> Result<()> {
     let changes = submission_changes(&repo, "bookmarks()")?;
     assert_eq!(sorted_names(&changes), vec!["mine-1".to_owned()]);
 
-    let graph = BookmarkGraph::from_changes(&repo.jj, &changes, false)?;
+    let graph = BookmarkGraph::from_changes(&repo.jj, &changes, false, "trunk()")?;
     assert_some!(graph.component_containing("mine-1"));
     assert_none!(graph.component_containing("foreign-1"));
 
@@ -443,7 +467,7 @@ fn named_foreign_bookmark_builds_graph() -> Result<()> {
         let changes = submission_changes(&repo, revset)?;
         assert_eq!(sorted_names(&changes), vec!["foreign-1".to_owned()]);
 
-        let graph = BookmarkGraph::from_changes(&repo.jj, &changes, false)?;
+        let graph = BookmarkGraph::from_changes(&repo.jj, &changes, false, "trunk()")?;
         let target = graph.find_bookmark_in_components("foreign-1").unwrap();
         assert_eq!(target.parents, vec![]);
     }
@@ -503,7 +527,7 @@ fn named_bypass_excludes_coworker_bookmark_on_same_change() -> Result<()> {
     let changes = submission_changes(&repo, "named")?;
     assert_eq!(sorted_names(&changes), vec!["named".to_owned()]);
 
-    let graph = BookmarkGraph::from_changes(&repo.jj, &changes, false)?;
+    let graph = BookmarkGraph::from_changes(&repo.jj, &changes, false, "trunk()")?;
     assert_some!(graph.find_bookmark_in_components("named"));
     assert_none!(graph.find_bookmark_in_components("coworker"));
 

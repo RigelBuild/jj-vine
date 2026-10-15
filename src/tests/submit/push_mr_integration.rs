@@ -26,7 +26,7 @@ use crate::{
         RootExecuteContext,
         execute::{self, SubmissionResult},
         find_changes_to_submit,
-        plan::{self, SubmissionPlan},
+        plan,
     },
     tests::TestRepo,
 };
@@ -119,14 +119,17 @@ async fn plan_and_execute_with_config(
     let bookmarks: Vec<_> = BookmarkOrPending::from_changes(&targets)
         .into_iter()
         .collect();
+    let merged_boundary_revset = config.merged_boundary_revset();
     let changes = find_changes_to_submit(
         &repo.jj,
         bookmarks.iter().map(BookmarkOrPending::change_id),
         core::iter::empty::<&str>(),
         pending,
+        &merged_boundary_revset,
     )
     .expect("find changes to submit");
-    let graph = BookmarkGraph::from_changes(&repo.jj, &changes, false).expect("build graph");
+    let graph = BookmarkGraph::from_changes(&repo.jj, &changes, false, &merged_boundary_revset)
+        .expect("build graph");
 
     let submission_plan = plan::plan(PlanContext {
         jj: &repo.jj,

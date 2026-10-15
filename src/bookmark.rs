@@ -631,7 +631,8 @@ impl JJName for BookmarkWithPointers<'_> {
 }
 
 /// A set of jj changes that have been grouped into independent components,
-/// which are not connected to any other component except for the trunk.
+/// which are not connected to any other component except for the merged
+/// boundary.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BookmarkGraph<'a> {
     /// All bookmarks in the revset (keyed by name).
@@ -642,22 +643,32 @@ pub struct BookmarkGraph<'a> {
 }
 
 impl<'a> BookmarkGraph<'a> {
+    /// Build a bookmark graph from changes, treating the boundary revset as
+    /// already landed.
     pub fn from_changes(
         jj: &Jujutsu,
         changes: impl IntoIterator<Item = &'a Change>,
         skip_untracked_local_bookmarks: bool,
+        merged_boundary_revset: &str,
     ) -> Result<Self> {
         let bookmarks: Vec<_> = BookmarkOrPending::from_changes(changes)
             .into_iter()
             .collect();
-        Self::from_bookmarks(jj, bookmarks, skip_untracked_local_bookmarks)
+        Self::from_bookmarks(
+            jj,
+            bookmarks,
+            skip_untracked_local_bookmarks,
+            merged_boundary_revset,
+        )
     }
 
-    /// Build a bookmark graph from a list of bookmarks.
+    /// Build a bookmark graph from bookmarks, treating the boundary revset as
+    /// already landed.
     pub fn from_bookmarks(
         jj: &Jujutsu,
         bookmarks: impl IntoIterator<Item = BookmarkOrPending<'a>>,
         skip_untracked_local_bookmarks: bool,
+        merged_boundary_revset: &str,
     ) -> Result<Self> {
         let local_bookmarks: Vec<_> = bookmarks
             .into_iter()
@@ -684,7 +695,10 @@ impl<'a> BookmarkGraph<'a> {
         let mut adjacency_list = BTreeMap::new();
 
         for bookmark in &local_bookmarks {
-            if jj.any_in_revset(format!("({}) & trunk()", bookmark.change_id()))? {
+            if jj.any_in_revset(format!(
+                "({}) & ::({merged_boundary_revset})",
+                bookmark.change_id()
+            ))? {
                 bookmark_lookup.remove(bookmark.name());
                 continue;
             }
@@ -695,6 +709,7 @@ impl<'a> BookmarkGraph<'a> {
                 skip_untracked_local_bookmarks,
                 &included_names,
                 &pending_bookmarks,
+                merged_boundary_revset,
             )?;
 
             let parent_bookmark_names = BookmarkOrPending::from_changes(&parent_bookmark_changes)
@@ -878,12 +893,14 @@ impl<'a> BookmarkGraph<'a> {
     ///
     /// Fails when the walk reaches an unselected, eligible bookmark on a change
     /// not authored by the current user before any selected ancestor.
+    /// `merged_boundary_revset` limits this walk to changes above the boundary.
     fn find_nearest_bookmarked_ancestors(
         jj: &Jujutsu,
         bookmark: &BookmarkOrPending<'_>,
         skip_untracked_local_bookmarks: bool,
         included_names: &HashSet<String>,
         pending_bookmarks: &HashSet<String>,
+        merged_boundary_revset: &str,
     ) -> Result<Vec<Change>> {
         Self::walk_nearest_bookmarked_ancestors(
             bookmark.change(),
@@ -891,7 +908,7 @@ impl<'a> BookmarkGraph<'a> {
             pending_bookmarks,
             |change| {
                 jj.log_with_pending_bookmarks(
-                    format!("{}- ~ ::trunk()", change.commit_id),
+                    format!("{}- ~ ::({merged_boundary_revset})", change.commit_id),
                     pending_bookmarks,
                 )
             },
@@ -1408,7 +1425,7 @@ mod tests {
         let changes = repo.jj.log_with_pending_bookmarks("all()", &change_ids)?;
         let bookmarks = BookmarkOrPending::from_changes(&changes);
 
-        let graph = BookmarkGraph::from_bookmarks(&repo.jj, bookmarks, false)?;
+        let graph = BookmarkGraph::from_bookmarks(&repo.jj, bookmarks, false, "trunk()")?;
 
         assert_eq!(graph.components().len(), 1);
 
