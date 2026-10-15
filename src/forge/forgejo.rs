@@ -1059,6 +1059,7 @@ mod tests {
         assert_eq!(forge.source_repo, "repo");
         assert_eq!(forge.target_owner, "owner");
         assert_eq!(forge.target_repo, "repo");
+        crate::forge::http_timeout_tests::assert_production_timeout(&forge.client);
     }
 
     #[test]

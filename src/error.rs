@@ -318,10 +318,15 @@ impl From<std::io::Error> for Error {
 
 impl From<reqwest::Error> for Error {
     fn from(source: reqwest::Error) -> Self {
-        HttpSnafu {
-            message: source.to_string(),
-        }
-        .build()
+        let message = if source.is_timeout() {
+            format!(
+                "request timed out after {}s: {source}",
+                crate::forge::HTTP_TIMEOUT.as_secs()
+            )
+        } else {
+            source.to_string()
+        };
+        HttpSnafu { message }.build()
     }
 }
 
