@@ -482,7 +482,7 @@ impl GitHubForge {
         let base_url = base_url.into();
         require_https_host(&base_url)?;
 
-        let mut client_builder = reqwest::Client::builder();
+        let mut client_builder = crate::forge::http_client_builder();
 
         if accept_non_compliant_certs {
             client_builder = client_builder.tls_danger_accept_invalid_certs(true);
