@@ -139,9 +139,11 @@ pub struct InteractiveOutput {
 impl InteractiveOutput {
     #[must_use]
     pub fn new() -> Self {
-        let pb = ProgressBar::new_spinner();
-        pb.enable_steady_tick(core::time::Duration::from_millis(80));
-        Self::with_spinner(pb)
+        let output = Self::with_spinner(ProgressBar::new_spinner());
+        output
+            .spinner
+            .enable_steady_tick(core::time::Duration::from_millis(80));
+        output
     }
 
     /// Wrap `spinner` with the standard style; tests pass one with a fixed
