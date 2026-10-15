@@ -65,17 +65,10 @@ impl Cli {
             Commands::Init => false,
         };
 
-        let output: SyncOutput =
-            match interactive_output_candidate(self.verbose, can_have_interactive_output) {
-                // Only keep the spinner if indicatif will actually draw it. On a
-                // non-terminal stderr (piped/captured, or `TERM=dumb`/unset) the
-                // spinner is hidden and every `log_message` through it is dropped,
-                // so fall back to flat logging, which stays visible via `tracing`.
-                Some(interactive) if !interactive.is_hidden() => {
-                    SyncOutput::Interactive(interactive)
-                }
-                _ => SyncOutput::Flat(FlatOutput::new()),
-            };
+        let output = select_output(interactive_output_candidate(
+            self.verbose,
+            can_have_interactive_output,
+        ));
 
         let filter = EnvFilter::builder()
             .with_default_directive(Level::INFO.into())
@@ -175,9 +168,78 @@ fn interactive_output_candidate(
     (!verbose && can_have_interactive_output).then(InteractiveOutput::new)
 }
 
+/// Keep the spinner only if indicatif will draw it. A hidden spinner (stderr
+/// piped or captured, or `TERM=dumb`/unset) drops every `log_message`, so fall
+/// back to flat logging, which stays visible via `tracing`.
+fn select_output(candidate: Option<InteractiveOutput>) -> SyncOutput {
+    match candidate {
+        Some(interactive) if !interactive.is_hidden() => SyncOutput::Interactive(interactive),
+        _ => SyncOutput::Flat(FlatOutput::new()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::interactive_output_candidate;
+    use indicatif::{ProgressBar, ProgressDrawTarget};
+
+    use super::{interactive_output_candidate, select_output};
+    use crate::output::{InteractiveOutput, SyncOutput};
+
+    fn spinner_with(target: ProgressDrawTarget) -> InteractiveOutput {
+        InteractiveOutput::with_spinner(ProgressBar::with_draw_target(None, target))
+    }
+
+    #[test]
+    fn hidden_spinner_falls_back_to_flat_output() {
+        let output = select_output(Some(spinner_with(ProgressDrawTarget::hidden())));
+        assert!(matches!(output, SyncOutput::Flat(_)));
+    }
+
+    /// A terminal indicatif draws to; every write succeeds and is discarded.
+    #[derive(Debug)]
+    struct NullTerm;
+
+    impl indicatif::TermLike for NullTerm {
+        fn width(&self) -> u16 {
+            80
+        }
+        fn move_cursor_up(&self, _: usize) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn move_cursor_down(&self, _: usize) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn move_cursor_right(&self, _: usize) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn move_cursor_left(&self, _: usize) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn write_line(&self, _: &str) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn write_str(&self, _: &str) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn clear_line(&self) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn flush(&self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn visible_spinner_stays_interactive() {
+        let target = ProgressDrawTarget::term_like(Box::new(NullTerm));
+        let output = select_output(Some(spinner_with(target)));
+        assert!(matches!(output, SyncOutput::Interactive(_)));
+    }
+
+    #[test]
+    fn no_candidate_uses_flat_output() {
+        assert!(matches!(select_output(None), SyncOutput::Flat(_)));
+    }
 
     #[test]
     fn candidate_only_when_eligible() {
