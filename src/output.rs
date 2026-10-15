@@ -146,11 +146,10 @@ impl InteractiveOutput {
         output
     }
 
-    /// Wrap `spinner` with the standard style; tests pass one with a fixed
-    /// draw target.
+    /// Wrap `spinner` with the standard style, without a steady tick; tests
+    /// pass one with a fixed draw target.
     #[must_use]
-    pub fn with_spinner(spinner: ProgressBar) -> Self {
-        #[expect(clippy::missing_panics_doc, reason = "infallible")]
+    pub(crate) fn with_spinner(spinner: ProgressBar) -> Self {
         spinner.set_style(
             ProgressStyle::default_spinner()
                 .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏")
@@ -164,12 +163,10 @@ impl InteractiveOutput {
         }
     }
 
-    /// Whether indicatif is suppressing this spinner's output because stderr is
-    /// not a usable terminal (piped or captured, or `TERM=dumb`/unset). When
-    /// true, the caller should fall back to flat logging so progress stays
-    /// visible.
+    /// Whether indicatif suppresses this spinner's drawing (for example, stderr
+    /// is not a usable terminal). Callers then fall back to flat logging.
     #[must_use]
-    pub fn is_hidden(&self) -> bool {
+    pub(crate) fn is_hidden(&self) -> bool {
         self.spinner.is_hidden()
     }
 }
