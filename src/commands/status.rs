@@ -98,7 +98,8 @@ pub struct StatusCommandRevsetOptions {
     #[arg(short = 'r', long)]
     pub revset: Option<String>,
 
-    /// Include only `(mine() & tracked_remote_bookmarks()) ~ boundary`.
+    /// Include only `(mine() & tracked_remote_bookmarks())`, minus merged
+    /// ancestry: `trunk()` and, when set, the remote `defaultBaseBranch`.
     #[arg(long)]
     pub tracked: bool,
 }
