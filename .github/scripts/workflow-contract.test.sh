@@ -31,8 +31,10 @@ expect 'mint takes an App token on every run' "$(yq -r ".jobs.mint.steps | map(s
 expect 'mint token step has no condition' "$(yq -r "$token | .if // \"none\"" "$release")" none
 expect 'mint uses the E1 client ID' "$(yq -r "$token | .with.client-id" "$release")" '${{ vars.AUTOMATION_APP_CLIENT_ID }}'
 expect 'mint uses the E1 private key' "$(yq -r "$token | .with.private-key" "$release")" '${{ secrets.AUTOMATION_APP_PRIVATE_KEY }}'
-expect 'mint token has contents write only' "$(yq -r "$token | .with | keys | map(select(test(\"^permission-\"))) | join(\",\")" "$release")" permission-contents
+# workflows: write lets GitHub create a tag at a commit whose workflow tree matches no branch tip.
+expect 'mint token has contents and workflows only' "$(yq -r "$token | .with | keys | map(select(test(\"^permission-\"))) | sort | join(\",\")" "$release")" permission-contents,permission-workflows
 expect 'mint token has contents write' "$(yq -r "$token | .with.permission-contents" "$release")" write
+expect 'mint token has workflows write' "$(yq -r "$token | .with.permission-workflows" "$release")" write
 expect 'mint token is repository scoped' "$(yq -r "$token | .with.repositories" "$release")" jj-vine
 expect 'mint has no concurrency' "$(yq -r '.jobs.mint.concurrency // "none"' "$release")" none
 # A job that runs a repo script must check out before it; a bare runner has no tree.
