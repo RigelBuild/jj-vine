@@ -374,7 +374,7 @@ impl GitHubForge {
         ca_bundle: Option<impl AsRef<Path>>,
         accept_non_compliant_certs: bool,
     ) -> Result<Self> {
-        let mut client_builder = reqwest::Client::builder();
+        let mut client_builder = crate::forge::http_client_builder();
 
         if accept_non_compliant_certs {
             client_builder = client_builder.tls_danger_accept_invalid_certs(true);
