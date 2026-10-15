@@ -42,6 +42,7 @@ reqwest = { version = "0.13.4", features = [
 ], default-features = false }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
+shlex = "2.0.1"
 snafu = "0.9.1"
 stable_try_trait_v2 = "1.75.1"
 strum = { version = "0.28.0", features = ["derive"] }
