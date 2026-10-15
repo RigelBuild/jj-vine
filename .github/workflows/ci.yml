@@ -58,6 +58,22 @@ jobs:
       - name: Build, lint, and test
         run: just
 
+  nix-eval:
+    name: Nix eval (no IFD) - ${{ matrix.system }}
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        system: [x86_64-linux, aarch64-linux, aarch64-darwin]
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+
+      # Fleet consumers evaluate this package with IFD disabled; a toolchain that
+      # imports a fetched manifest would break their evals.
+      - name: Evaluate the package
+        run: nix eval --option allow-import-from-derivation false --raw ".#packages.${{ matrix.system }}.jj-vine.drvPath"
+
   build:
     name: Build - ${{ matrix.platform.target }}
     runs-on: ${{ matrix.platform.os }}
