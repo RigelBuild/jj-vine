@@ -58,6 +58,11 @@ jobs:
       - name: Build, lint, and test
         run: just
 
+      - name: Test release-tag scripts
+        run: |
+          .github/scripts/release-tag.test.sh
+          .github/scripts/workflow-contract.test.sh
+
   nix-eval:
     name: Nix eval (no IFD) - ${{ matrix.system }}
     runs-on: ubuntu-24.04
