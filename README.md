@@ -366,6 +366,10 @@ Rust callers must pass a `StackPlacement` argument to `insert_stack_into_descrip
 source-breaking API change. `DescriptionConfig` struct literals must set `placement` or use
 `..DescriptionConfig::default()`.
 
+Rust callers of `find_changes_to_submit`, `BookmarkGraph::from_changes`,
+`BookmarkGraph::from_bookmarks` and `GetBookmarksOptions::to_revset` must pass a merged-boundary
+revset, usually `Config::merged_boundary_revset()`. This is a source-breaking API change.
+
 ### Configuration{#description-configuration}
 
 | Setting | Description | Type | Required | Default |
