@@ -683,29 +683,49 @@ pub fn remove_jj_vine_stack_from_description(description: &str) -> String {
 }
 
 /// Splits user text around every complete stack block: the text before the
-/// first block, and all later text joined by blank lines. Each end marker
-/// pairs with the nearest start before it; unpaired markers stay user text.
+/// first block, and all later text joined by blank lines. Markers count only
+/// as whole lines outside code fences; each end closes the nearest open start,
+/// and an enclosing block absorbs nested ones. Unpaired markers stay user text.
+#[expect(clippy::string_slice, reason = "indices are line boundaries")]
 fn split_around_stack_blocks(description: &str) -> (String, String) {
-    let mut segments = Vec::new();
-    let mut pending = String::new();
-    let mut rest = description;
+    let mut blocks: Vec<(usize, usize)> = Vec::new();
+    let mut open_starts = Vec::new();
+    let mut fence: Option<&str> = None;
+    let mut offset = 0_usize;
 
-    #[expect(clippy::string_slice, reason = "indices found via find()/rfind()")]
-    while let Some(end) = rest.find(END_MARKER) {
-        let block_end = end.strict_add(END_MARKER.len());
-        if let Some(start) = rest[..end].rfind(START_MARKER) {
-            pending.push_str(&rest[..start]);
-            segments.push(pending.trim().to_owned());
-            pending.clear();
-        } else {
-            pending.push_str(&rest[..block_end]);
+    for line in description.split_inclusive('\n') {
+        let line_start = offset;
+        offset = offset.strict_add(line.len());
+        let trimmed = line.trim();
+        let opener = ["```", "~~~"].into_iter().find(|f| trimmed.starts_with(f));
+
+        if let Some(open) = fence {
+            if opener == Some(open) {
+                fence = None;
+            }
+        } else if opener.is_some() {
+            fence = opener;
+        } else if trimmed == START_MARKER {
+            open_starts.push(line_start);
+        } else if trimmed == END_MARKER
+            && let Some(start) = open_starts.pop()
+        {
+            while blocks.last().is_some_and(|&(inner, _)| inner > start) {
+                blocks.pop();
+            }
+            blocks.push((start, offset));
         }
-        rest = &rest[block_end..];
     }
-    pending.push_str(rest);
-    segments.push(pending.trim().to_owned());
 
-    let before = segments.remove(0);
+    let mut segments = Vec::new();
+    let mut cursor = 0;
+    for (start, end) in blocks {
+        segments.push(description[cursor..start].trim());
+        cursor = end;
+    }
+    segments.push(description[cursor..].trim());
+
+    let before = segments.remove(0).to_owned();
     let after = segments
         .into_iter()
         .filter(|segment| !segment.is_empty())
@@ -2176,6 +2196,29 @@ mod tests {
                 "Intro\n\n{stray_start}\n\n{stray_end}\n\nOutro\n\n{}",
                 block("New stack")
             )
+        );
+    }
+
+    #[test]
+    fn nested_stack_blocks_are_removed_whole() {
+        let existing = format!(
+            "Intro\n{START_MARKER}\nouter\n{START_MARKER}\ninner\n{END_MARKER}\nmiddle\n{END_MARKER}\nOutro"
+        );
+
+        assert_str_eq!(
+            remove_jj_vine_stack_from_description(&existing),
+            "Intro\n\nOutro"
+        );
+    }
+
+    #[test]
+    fn fenced_marker_example_stays_user_text() {
+        let example = format!("```md\n{START_MARKER}\nExample\n{END_MARKER}\n```");
+        let existing = format!("{START_MARKER}\nOld\n{END_MARKER}\n\n{example}");
+
+        assert_str_eq!(
+            insert_stack_into_description("New stack", &existing, StackPlacement::Bottom),
+            format!("{example}\n\n{START_MARKER}\nNew stack\n{END_MARKER}")
         );
     }
 
