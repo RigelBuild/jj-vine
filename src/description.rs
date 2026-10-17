@@ -689,9 +689,22 @@ pub fn remove_jj_vine_stack_from_description(description: &str) -> String {
 #[expect(clippy::string_slice, reason = "indices are line boundaries")]
 fn split_around_stack_blocks(description: &str) -> (String, String) {
     let lines: Vec<&str> = description.split_inclusive('\n').collect();
+    // Longest bare closing run of each fence char after each line, so an
+    // opener with no closer is skipped without rescanning the tail.
+    let mut later_closers = vec![(0_usize, 0_usize); lines.len()];
+    let mut longest = (0_usize, 0_usize);
+    for (index, line) in lines.iter().enumerate().rev() {
+        later_closers[index] = longest;
+        match fence_closer(line) {
+            Some(('`', len)) => longest.0 = longest.0.max(len),
+            Some((_, len)) => longest.1 = longest.1.max(len),
+            None => {}
+        }
+    }
+
     let mut blocks: Vec<(usize, usize)> = Vec::new();
     let mut open_starts = Vec::new();
-    let mut fence_close: Option<usize> = None;
+    let mut open_fence: Option<(char, usize)> = None;
     let mut offset = 0_usize;
 
     for (index, line) in lines.iter().enumerate() {
@@ -699,16 +712,19 @@ fn split_around_stack_blocks(description: &str) -> (String, String) {
         offset = offset.strict_add(line.len());
         let trimmed = line.trim();
 
-        if let Some(close) = fence_close {
-            if index == close {
-                fence_close = None;
+        if let Some((marker, len)) = open_fence {
+            if fence_closer(line).is_some_and(|(c, n)| c == marker && n >= len) {
+                open_fence = None;
             }
-        } else if let Some((marker, len)) = fence_opener(trimmed)
-            && let Some(close) = lines[index.strict_add(1)..]
-                .iter()
-                .position(|later| closes_fence(later.trim(), marker, len))
+        } else if let Some((marker, len)) = fence_opener(line)
+            && len
+                <= if marker == '`' {
+                    later_closers[index].0
+                } else {
+                    later_closers[index].1
+                }
         {
-            fence_close = Some(index.strict_add(1).strict_add(close));
+            open_fence = Some((marker, len));
         } else if trimmed == START_MARKER {
             open_starts.push(line_start);
         } else if trimmed == END_MARKER
@@ -738,16 +754,29 @@ fn split_around_stack_blocks(description: &str) -> (String, String) {
     (before, after)
 }
 
-/// The fence character and run length when `line` opens a code fence.
-fn fence_opener(line: &str) -> Option<(char, usize)> {
-    let marker = line.chars().next().filter(|c| matches!(c, '`' | '~'))?;
-    let len = line.chars().take_while(|&c| c == marker).count();
-    (len >= 3).then_some((marker, len))
+/// Strips the up-to-three-space indent Markdown allows before a fence.
+fn fence_body(line: &str) -> Option<&str> {
+    let line = line.trim_end_matches(['\n', '\r']);
+    let body = line.trim_start_matches(' ');
+    (line.len().strict_sub(body.len()) <= 3).then_some(body)
 }
 
-/// Whether `line` closes a fence opened by `len` copies of `marker`.
-fn closes_fence(line: &str, marker: char, len: usize) -> bool {
-    !line.is_empty() && line.chars().all(|c| c == marker) && line.chars().count() >= len
+/// The fence character and run length when `line` opens a code fence.
+fn fence_opener(line: &str) -> Option<(char, usize)> {
+    let body = fence_body(line)?;
+    let marker = body.chars().next().filter(|c| matches!(c, '`' | '~'))?;
+    let len = body.chars().take_while(|&c| c == marker).count();
+    // A backtick fence's info string may not contain a backtick.
+    let info_ok = marker == '~' || !body.trim_start_matches('`').contains('`');
+    (len >= 3 && info_ok).then_some((marker, len))
+}
+
+/// The fence character and run length when `line` is a bare closing fence.
+fn fence_closer(line: &str) -> Option<(char, usize)> {
+    let body = fence_body(line)?.trim_end();
+    let marker = body.chars().next().filter(|c| matches!(c, '`' | '~'))?;
+    let len = body.chars().count();
+    (len >= 3 && body.chars().all(|c| c == marker)).then_some((marker, len))
 }
 
 /// Generates the description for a branch based on the commits in the
@@ -2256,6 +2285,55 @@ mod tests {
         assert_str_eq!(
             insert_stack_into_description("New", &first, StackPlacement::Bottom),
             format!("```md\ncode\n\n{START_MARKER}\nNew\n{END_MARKER}")
+        );
+    }
+
+    fn stack_block_count(description: &str) -> usize {
+        description
+            .lines()
+            .filter(|line| line.trim() == START_MARKER)
+            .count()
+    }
+
+    #[test]
+    fn backtick_in_info_string_is_not_a_fence() {
+        let existing = format!("``` a`b\n\n{START_MARKER}\nOld\n{END_MARKER}\n\n```");
+        let updated = insert_stack_into_description("New", &existing, StackPlacement::Bottom);
+
+        assert!(updated.starts_with("``` a`b"));
+        assert!(!updated.contains("Old"));
+        assert_eq!(stack_block_count(&updated), 1);
+    }
+
+    #[test]
+    fn indented_code_line_is_not_a_fence() {
+        let existing = format!("Intro\n    ```\n{START_MARKER}\nOld\n{END_MARKER}\n    ```");
+        let updated = insert_stack_into_description("New", &existing, StackPlacement::Bottom);
+
+        assert!(updated.starts_with("Intro\n    ```"));
+        assert!(!updated.contains("Old"));
+        assert_eq!(stack_block_count(&updated), 1);
+    }
+
+    #[test]
+    fn tilde_fence_closes_on_longer_run() {
+        let example = format!("~~~\n{START_MARKER}\nExample\n{END_MARKER}\n~~~~~");
+        let existing = format!("{START_MARKER}\nOld\n{END_MARKER}\n\n{example}");
+
+        assert_str_eq!(
+            insert_stack_into_description("New", &existing, StackPlacement::Bottom),
+            format!("{example}\n\n{START_MARKER}\nNew\n{END_MARKER}")
+        );
+    }
+
+    #[test]
+    fn fence_ignores_info_string_and_mixed_closers() {
+        let example = format!("```\n```js\n~~~\n{START_MARKER}\nExample\n{END_MARKER}\n```");
+        let existing = format!("{START_MARKER}\nOld\n{END_MARKER}\n\n{example}");
+
+        assert_str_eq!(
+            insert_stack_into_description("New", &existing, StackPlacement::Bottom),
+            format!("{example}\n\n{START_MARKER}\nNew\n{END_MARKER}")
         );
     }
 
