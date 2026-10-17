@@ -596,17 +596,8 @@ pub fn insert_stack_into_description(
 ) -> String {
     let mut result = String::new();
 
-    #[expect(clippy::string_slice, reason = "index found via find()")]
-    let (before, after) = match (
-        existing_description.find(START_MARKER),
-        existing_description.find(END_MARKER),
-    ) {
-        (Some(start), Some(end)) if start < end => (
-            existing_description[..start].trim(),
-            existing_description[end.strict_add(END_MARKER.len())..].trim(),
-        ),
-        _ => (existing_description.trim(), ""),
-    };
+    let (before, after) = split_around_stack_blocks(existing_description);
+    let (before, after) = (before.as_str(), after.as_str());
 
     if stack_description.is_empty() {
         if !before.is_empty() {
@@ -686,16 +677,53 @@ pub fn generate_stack_description(
 #[must_use]
 #[expect(clippy::module_name_repetitions, reason = "is sentence")]
 pub fn remove_jj_vine_stack_from_description(description: &str) -> String {
-    #[expect(clippy::string_slice, reason = "index found via find()")]
-    let (before, after) = match (description.find(START_MARKER), description.find(END_MARKER)) {
-        (Some(start), Some(end)) if start < end => (
-            description[..start].trim(),
-            description[end.strict_add(END_MARKER.len())..].trim(),
-        ),
-        _ => (description.trim(), ""),
-    };
+    let (before, after) = split_around_stack_blocks(description);
 
     format!("{before}\n\n{after}").trim().to_owned()
+}
+
+/// Splits user text around every complete stack block: the text before the
+/// first block, and all later text joined by blank lines. Markers count only
+/// as whole lines; each end closes the nearest open start, and an enclosing
+/// block absorbs nested ones.
+#[expect(clippy::string_slice, reason = "indices are line boundaries")]
+fn split_around_stack_blocks(description: &str) -> (String, String) {
+    let mut blocks: Vec<(usize, usize)> = Vec::new();
+    let mut open_starts = Vec::new();
+    let mut offset = 0_usize;
+
+    for line in description.split_inclusive('\n') {
+        let line_start = offset;
+        offset = offset.strict_add(line.len());
+
+        let trimmed = line.trim();
+        if trimmed == START_MARKER {
+            open_starts.push(line_start);
+        } else if trimmed == END_MARKER
+            && let Some(start) = open_starts.pop()
+        {
+            while blocks.last().is_some_and(|&(inner, _)| inner > start) {
+                blocks.pop();
+            }
+            blocks.push((start, offset));
+        }
+    }
+
+    let mut segments = Vec::new();
+    let mut cursor = 0;
+    for (start, end) in blocks {
+        segments.push(description[cursor..start].trim());
+        cursor = end;
+    }
+    segments.push(description[cursor..].trim());
+
+    let before = segments.remove(0).to_owned();
+    let after = segments
+        .into_iter()
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    (before, after)
 }
 
 /// Generates the description for a branch based on the commits in the
@@ -2107,6 +2135,93 @@ mod tests {
         assert_str_eq!(
             insert_stack_into_description("New stack", &actual, StackPlacement::Top),
             expected
+        );
+    }
+
+    #[test]
+    fn replaces_every_stack_block() {
+        let existing = format!(
+            "Intro\n\n{START_MARKER}\nOld A\n{END_MARKER}\n\nMiddle\n\n{START_MARKER}\nOld B\n{END_MARKER}\n\nOutro"
+        );
+
+        assert_str_eq!(
+            insert_stack_into_description("New stack", &existing, StackPlacement::Bottom),
+            format!("Intro\n\nMiddle\n\nOutro\n\n{START_MARKER}\nNew stack\n{END_MARKER}")
+        );
+        assert_str_eq!(
+            insert_stack_into_description("New stack", &existing, StackPlacement::Top),
+            format!("{START_MARKER}\nNew stack\n{END_MARKER}\n\nIntro\n\nMiddle\n\nOutro")
+        );
+        let removed = insert_stack_into_description("", &existing, StackPlacement::Bottom);
+        assert!(!removed.contains(START_MARKER) && !removed.contains(END_MARKER));
+        assert!(removed.contains("Middle") && removed.contains("Outro"));
+        assert_str_eq!(
+            remove_jj_vine_stack_from_description(&existing),
+            "Intro\n\nMiddle\n\nOutro"
+        );
+    }
+
+    #[test]
+    fn unpaired_start_marker_stays_user_text() {
+        let existing = format!("Notes {START_MARKER} pasted");
+
+        assert_str_eq!(
+            insert_stack_into_description("New stack", &existing, StackPlacement::Bottom),
+            format!("{existing}\n\n{START_MARKER}\nNew stack\n{END_MARKER}")
+        );
+    }
+
+    #[test]
+    fn unpaired_markers_between_blocks_stay_user_text() {
+        let block = |body: &str| format!("{START_MARKER}\n{body}\n{END_MARKER}");
+        let stray_start = format!("Notes {START_MARKER} pasted");
+        let stray_end = format!("Quote {END_MARKER} pasted");
+        let existing = format!(
+            "Intro\n\n{}\n\n{stray_start}\n\n{}\n\n{stray_end}\n\nOutro",
+            block("Old A"),
+            block("Old B")
+        );
+
+        assert_str_eq!(
+            insert_stack_into_description("New stack", &existing, StackPlacement::Bottom),
+            format!(
+                "Intro\n\n{stray_start}\n\n{stray_end}\n\nOutro\n\n{}",
+                block("New stack")
+            )
+        );
+    }
+
+    #[test]
+    fn nested_stack_blocks_are_removed_whole() {
+        let existing = format!(
+            "Intro\n{START_MARKER}\nouter\n{START_MARKER}\ninner\n{END_MARKER}\nmiddle\n{END_MARKER}\nOutro"
+        );
+
+        assert_str_eq!(
+            remove_jj_vine_stack_from_description(&existing),
+            "Intro\n\nOutro"
+        );
+    }
+
+    #[test]
+    fn standalone_unpaired_markers_stay_user_text() {
+        let existing = format!(
+            "{END_MARKER}\nIntro\n{START_MARKER}\nNotes\n\n{START_MARKER}\nOld\n{END_MARKER}\n\nOutro\n{START_MARKER}"
+        );
+
+        assert_str_eq!(
+            remove_jj_vine_stack_from_description(&existing),
+            format!("{END_MARKER}\nIntro\n{START_MARKER}\nNotes\n\nOutro\n{START_MARKER}")
+        );
+    }
+
+    #[test]
+    fn crlf_block_at_end_without_newline_is_replaced() {
+        let existing = format!("Intro\r\n\r\n{START_MARKER}\r\nOld\r\n{END_MARKER}");
+
+        assert_str_eq!(
+            insert_stack_into_description("New", &existing, StackPlacement::Bottom),
+            format!("Intro\n\n{START_MARKER}\nNew\n{END_MARKER}")
         );
     }
 
