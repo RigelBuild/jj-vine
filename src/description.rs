@@ -683,22 +683,29 @@ pub fn remove_jj_vine_stack_from_description(description: &str) -> String {
 }
 
 /// Splits user text around every complete stack block: the text before the
-/// first block, and all later text joined by blank lines. Unpaired markers
-/// stay as user text.
+/// first block, and all later text joined by blank lines. Each end marker
+/// pairs with the nearest start before it; unpaired markers stay user text.
 fn split_around_stack_blocks(description: &str) -> (String, String) {
     let mut segments = Vec::new();
+    let mut pending = String::new();
     let mut rest = description;
 
-    #[expect(clippy::string_slice, reason = "indices found via find()")]
-    while let Some(start) = rest.find(START_MARKER)
-        && let Some(end) = rest[start..].find(END_MARKER)
-    {
-        segments.push(rest[..start].trim());
-        rest = &rest[start.strict_add(end).strict_add(END_MARKER.len())..];
+    #[expect(clippy::string_slice, reason = "indices found via find()/rfind()")]
+    while let Some(end) = rest.find(END_MARKER) {
+        let block_end = end.strict_add(END_MARKER.len());
+        if let Some(start) = rest[..end].rfind(START_MARKER) {
+            pending.push_str(&rest[..start]);
+            segments.push(pending.trim().to_owned());
+            pending.clear();
+        } else {
+            pending.push_str(&rest[..block_end]);
+        }
+        rest = &rest[block_end..];
     }
-    segments.push(rest.trim());
+    pending.push_str(rest);
+    segments.push(pending.trim().to_owned());
 
-    let before = segments.remove(0).to_owned();
+    let before = segments.remove(0);
     let after = segments
         .into_iter()
         .filter(|segment| !segment.is_empty())
@@ -2149,6 +2156,26 @@ mod tests {
         assert_str_eq!(
             insert_stack_into_description("New stack", &existing, StackPlacement::Bottom),
             format!("{existing}\n\n{START_MARKER}\nNew stack\n{END_MARKER}")
+        );
+    }
+
+    #[test]
+    fn unpaired_markers_between_blocks_stay_user_text() {
+        let block = |body: &str| format!("{START_MARKER}\n{body}\n{END_MARKER}");
+        let stray_start = format!("Notes {START_MARKER} pasted");
+        let stray_end = format!("Quote {END_MARKER} pasted");
+        let existing = format!(
+            "Intro\n\n{}\n\n{stray_start}\n\n{}\n\n{stray_end}\n\nOutro",
+            block("Old A"),
+            block("Old B")
+        );
+
+        assert_str_eq!(
+            insert_stack_into_description("New stack", &existing, StackPlacement::Bottom),
+            format!(
+                "Intro\n\n{stray_start}\n\n{stray_end}\n\nOutro\n\n{}",
+                block("New stack")
+            )
         );
     }
 
