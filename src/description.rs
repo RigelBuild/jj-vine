@@ -684,27 +684,31 @@ pub fn remove_jj_vine_stack_from_description(description: &str) -> String {
 
 /// Splits user text around every complete stack block: the text before the
 /// first block, and all later text joined by blank lines. Markers count only
-/// as whole lines outside code fences; each end closes the nearest open start,
-/// and an enclosing block absorbs nested ones. Unpaired markers stay user text.
+/// as whole lines outside closed code fences; each end closes the nearest
+/// open start, and an enclosing block absorbs nested ones.
 #[expect(clippy::string_slice, reason = "indices are line boundaries")]
 fn split_around_stack_blocks(description: &str) -> (String, String) {
+    let lines: Vec<&str> = description.split_inclusive('\n').collect();
     let mut blocks: Vec<(usize, usize)> = Vec::new();
     let mut open_starts = Vec::new();
-    let mut fence: Option<&str> = None;
+    let mut fence_close: Option<usize> = None;
     let mut offset = 0_usize;
 
-    for line in description.split_inclusive('\n') {
+    for (index, line) in lines.iter().enumerate() {
         let line_start = offset;
         offset = offset.strict_add(line.len());
         let trimmed = line.trim();
-        let opener = ["```", "~~~"].into_iter().find(|f| trimmed.starts_with(f));
 
-        if let Some(open) = fence {
-            if opener == Some(open) {
-                fence = None;
+        if let Some(close) = fence_close {
+            if index == close {
+                fence_close = None;
             }
-        } else if opener.is_some() {
-            fence = opener;
+        } else if let Some((marker, len)) = fence_opener(trimmed)
+            && let Some(close) = lines[index.strict_add(1)..]
+                .iter()
+                .position(|later| closes_fence(later.trim(), marker, len))
+        {
+            fence_close = Some(index.strict_add(1).strict_add(close));
         } else if trimmed == START_MARKER {
             open_starts.push(line_start);
         } else if trimmed == END_MARKER
@@ -732,6 +736,18 @@ fn split_around_stack_blocks(description: &str) -> (String, String) {
         .collect::<Vec<_>>()
         .join("\n\n");
     (before, after)
+}
+
+/// The fence character and run length when `line` opens a code fence.
+fn fence_opener(line: &str) -> Option<(char, usize)> {
+    let marker = line.chars().next().filter(|c| matches!(c, '`' | '~'))?;
+    let len = line.chars().take_while(|&c| c == marker).count();
+    (len >= 3).then_some((marker, len))
+}
+
+/// Whether `line` closes a fence opened by `len` copies of `marker`.
+fn closes_fence(line: &str, marker: char, len: usize) -> bool {
+    !line.is_empty() && line.chars().all(|c| c == marker) && line.chars().count() >= len
 }
 
 /// Generates the description for a branch based on the commits in the
@@ -2219,6 +2235,27 @@ mod tests {
         assert_str_eq!(
             insert_stack_into_description("New stack", &existing, StackPlacement::Bottom),
             format!("{example}\n\n{START_MARKER}\nNew stack\n{END_MARKER}")
+        );
+    }
+
+    #[test]
+    fn longer_fence_keeps_inner_backtick_line_as_content() {
+        let example = format!("````md\n```\n{START_MARKER}\nExample\n{END_MARKER}\n```\n````");
+        let existing = format!("Intro\n\n{START_MARKER}\nOld\n{END_MARKER}\n\n{example}");
+
+        assert_str_eq!(
+            remove_jj_vine_stack_from_description(&existing),
+            format!("Intro\n\n{example}")
+        );
+    }
+
+    #[test]
+    fn block_after_unclosed_fence_is_replaced() {
+        let first = insert_stack_into_description("Old", "```md\ncode", StackPlacement::Bottom);
+
+        assert_str_eq!(
+            insert_stack_into_description("New", &first, StackPlacement::Bottom),
+            format!("```md\ncode\n\n{START_MARKER}\nNew\n{END_MARKER}")
         );
     }
 
