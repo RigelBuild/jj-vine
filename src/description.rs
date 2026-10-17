@@ -2204,6 +2204,28 @@ mod tests {
     }
 
     #[test]
+    fn standalone_unpaired_markers_stay_user_text() {
+        let existing = format!(
+            "{END_MARKER}\nIntro\n{START_MARKER}\nNotes\n\n{START_MARKER}\nOld\n{END_MARKER}\n\nOutro\n{START_MARKER}"
+        );
+
+        assert_str_eq!(
+            remove_jj_vine_stack_from_description(&existing),
+            format!("{END_MARKER}\nIntro\n{START_MARKER}\nNotes\n\nOutro\n{START_MARKER}")
+        );
+    }
+
+    #[test]
+    fn crlf_block_at_end_without_newline_is_replaced() {
+        let existing = format!("Intro\r\n\r\n{START_MARKER}\r\nOld\r\n{END_MARKER}");
+
+        assert_str_eq!(
+            insert_stack_into_description("New", &existing, StackPlacement::Bottom),
+            format!("Intro\n\n{START_MARKER}\nNew\n{END_MARKER}")
+        );
+    }
+
+    #[test]
     fn generate_no_trailing_whitespace_when_no_user_content() {
         assert_str_eq!(
             insert_stack_into_description("New stack", "", StackPlacement::Bottom),
