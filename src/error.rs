@@ -318,10 +318,13 @@ impl From<std::io::Error> for Error {
 
 impl From<reqwest::Error> for Error {
     fn from(source: reqwest::Error) -> Self {
-        HttpSnafu {
-            message: source.to_string(),
-        }
-        .build()
+        // is_timeout() also covers connect and transport timeouts, so name no duration.
+        let message = if source.is_timeout() {
+            format!("request timed out: {source}")
+        } else {
+            source.to_string()
+        };
+        HttpSnafu { message }.build()
     }
 }
 
