@@ -1,4 +1,4 @@
-use core::{fmt::Write as _, hash::BuildHasher, ops::Range};
+use core::{fmt::Write as _, hash::BuildHasher};
 use std::{
     collections::{HashMap, HashSet},
     hash::RandomState,
@@ -6,7 +6,6 @@ use std::{
 };
 
 use itertools::Itertools as _;
-use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 
 use crate::{
     bookmark::{BookmarkRef, ChangeComponent},
@@ -685,12 +684,10 @@ pub fn remove_jj_vine_stack_from_description(description: &str) -> String {
 
 /// Splits user text around every complete stack block: the text before the
 /// first block, and all later text joined by blank lines. Markers count only
-/// as whole lines outside code blocks; each end closes the nearest open
-/// start, and an enclosing block absorbs nested ones.
+/// as whole lines; each end closes the nearest open start, and an enclosing
+/// block absorbs nested ones.
 #[expect(clippy::string_slice, reason = "indices are line boundaries")]
 fn split_around_stack_blocks(description: &str) -> (String, String) {
-    let code_blocks = code_block_ranges(description);
-    let mut next_code = code_blocks.iter().peekable();
     let mut blocks: Vec<(usize, usize)> = Vec::new();
     let mut open_starts = Vec::new();
     let mut offset = 0_usize;
@@ -698,10 +695,6 @@ fn split_around_stack_blocks(description: &str) -> (String, String) {
     for line in description.split_inclusive('\n') {
         let line_start = offset;
         offset = offset.strict_add(line.len());
-        while next_code.next_if(|code| code.end <= line_start).is_some() {}
-        if next_code.peek().is_some_and(|code| code.start < offset) {
-            continue;
-        }
 
         let trimmed = line.trim();
         if trimmed == START_MARKER {
@@ -731,58 +724,6 @@ fn split_around_stack_blocks(description: &str) -> (String, String) {
         .collect::<Vec<_>>()
         .join("\n\n");
     (before, after)
-}
-
-/// Byte ranges of the code and HTML blocks in `description`, in order. A
-/// fence left open to the end of the text would swallow a stack block written
-/// after it, so it is skipped to keep that block replaceable.
-#[expect(clippy::string_slice, reason = "parser ranges are char boundaries")]
-fn code_block_ranges(description: &str) -> Vec<Range<usize>> {
-    struct OpenFence {
-        block: Range<usize>,
-        content_end: usize,
-    }
-
-    let text_end = description.trim_end().len();
-    let mut ranges = Vec::new();
-    let mut fence: Option<OpenFence> = None;
-    let parser = Parser::new_ext(description, Options::ENABLE_FOOTNOTES);
-    for (event, range) in parser.into_offset_iter() {
-        match event {
-            Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(_))) => {
-                let opener_end = description[range.clone()]
-                    .find('\n')
-                    .map_or(range.end, |newline| range.start.strict_add(newline));
-                fence = Some(OpenFence {
-                    block: range,
-                    content_end: opener_end,
-                });
-            }
-            Event::Start(Tag::CodeBlock(CodeBlockKind::Indented)) => ranges.push(range),
-            // A stack marker alone on a line is itself an HTML block.
-            Event::Start(Tag::HtmlBlock)
-                if !matches!(description[range.clone()].trim(), START_MARKER | END_MARKER) =>
-            {
-                ranges.push(range);
-            }
-            Event::Text(_) => {
-                if let Some(open) = &mut fence {
-                    open.content_end = range.end;
-                }
-            }
-            Event::End(TagEnd::CodeBlock) => {
-                if let Some(OpenFence { block, content_end }) = fence.take() {
-                    let has_closer = !description[content_end..block.end].trim().is_empty();
-                    if has_closer || block.end < text_end {
-                        ranges.push(block);
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    ranges.sort_by_key(|range| range.start);
-    ranges
 }
 
 /// Generates the description for a branch based on the commits in the
@@ -2263,87 +2204,6 @@ mod tests {
     }
 
     #[test]
-    fn fenced_marker_example_stays_user_text() {
-        let example = format!("```md\n{START_MARKER}\nExample\n{END_MARKER}\n```");
-        let existing = format!("{START_MARKER}\nOld\n{END_MARKER}\n\n{example}");
-
-        assert_str_eq!(
-            insert_stack_into_description("New stack", &existing, StackPlacement::Bottom),
-            format!("{example}\n\n{START_MARKER}\nNew stack\n{END_MARKER}")
-        );
-    }
-
-    #[test]
-    fn longer_fence_keeps_inner_backtick_line_as_content() {
-        let example = format!("````md\n```\n{START_MARKER}\nExample\n{END_MARKER}\n```\n````");
-        let existing = format!("Intro\n\n{START_MARKER}\nOld\n{END_MARKER}\n\n{example}");
-
-        assert_str_eq!(
-            remove_jj_vine_stack_from_description(&existing),
-            format!("Intro\n\n{example}")
-        );
-    }
-
-    #[test]
-    fn block_after_unclosed_fence_is_replaced() {
-        let first = insert_stack_into_description("Old", "```md\ncode", StackPlacement::Bottom);
-
-        assert_str_eq!(
-            insert_stack_into_description("New", &first, StackPlacement::Bottom),
-            format!("```md\ncode\n\n{START_MARKER}\nNew\n{END_MARKER}")
-        );
-    }
-
-    fn stack_block_count(description: &str) -> usize {
-        description
-            .lines()
-            .filter(|line| line.trim() == START_MARKER)
-            .count()
-    }
-
-    #[test]
-    fn backtick_in_info_string_is_not_a_fence() {
-        let existing = format!("``` a`b\n\n{START_MARKER}\nOld\n{END_MARKER}\n\n```");
-        let updated = insert_stack_into_description("New", &existing, StackPlacement::Bottom);
-
-        assert!(updated.starts_with("``` a`b"));
-        assert!(!updated.contains("Old"));
-        assert_eq!(stack_block_count(&updated), 1);
-    }
-
-    #[test]
-    fn indented_code_line_is_not_a_fence() {
-        let existing = format!("Intro\n    ```\n{START_MARKER}\nOld\n{END_MARKER}\n    ```");
-        let updated = insert_stack_into_description("New", &existing, StackPlacement::Bottom);
-
-        assert!(updated.starts_with("Intro\n    ```"));
-        assert!(!updated.contains("Old"));
-        assert_eq!(stack_block_count(&updated), 1);
-    }
-
-    #[test]
-    fn tilde_fence_closes_on_longer_run() {
-        let example = format!("~~~\n{START_MARKER}\nExample\n{END_MARKER}\n~~~~~");
-        let existing = format!("{START_MARKER}\nOld\n{END_MARKER}\n\n{example}");
-
-        assert_str_eq!(
-            insert_stack_into_description("New", &existing, StackPlacement::Bottom),
-            format!("{example}\n\n{START_MARKER}\nNew\n{END_MARKER}")
-        );
-    }
-
-    #[test]
-    fn fence_ignores_info_string_and_mixed_closers() {
-        let example = format!("```\n```js\n~~~\n{START_MARKER}\nExample\n{END_MARKER}\n```");
-        let existing = format!("{START_MARKER}\nOld\n{END_MARKER}\n\n{example}");
-
-        assert_str_eq!(
-            insert_stack_into_description("New", &existing, StackPlacement::Bottom),
-            format!("{example}\n\n{START_MARKER}\nNew\n{END_MARKER}")
-        );
-    }
-
-    #[test]
     fn generate_no_trailing_whitespace_when_no_user_content() {
         assert_str_eq!(
             insert_stack_into_description("New stack", "", StackPlacement::Bottom),
@@ -2382,67 +2242,6 @@ mod tests {
                 Path::new("")
             ),
             ""
-        );
-    }
-
-    fn assert_example_kept(example: &str) {
-        let existing = format!("{START_MARKER}\nOld\n{END_MARKER}\n\n{example}");
-
-        assert_str_eq!(
-            insert_stack_into_description("New", &existing, StackPlacement::Bottom),
-            format!("{example}\n\n{START_MARKER}\nNew\n{END_MARKER}")
-        );
-    }
-
-    #[test]
-    fn fence_in_list_stays_user_text() {
-        assert_example_kept(&format!(
-            "- ```\n  {START_MARKER}\n  Example\n  {END_MARKER}\n  ```"
-        ));
-    }
-
-    #[test]
-    fn unclosed_fence_in_list_with_text_after_stays_user_text() {
-        assert_example_kept(&format!(
-            "- ```\n  {START_MARKER}\n  Example\n  {END_MARKER}\n\nAfter the list"
-        ));
-    }
-
-    #[test]
-    fn fence_in_footnote_stays_user_text() {
-        assert_example_kept(&format!(
-            "See [^1].\n\n[^1]: ```\n    {START_MARKER}\n    Example\n    {END_MARKER}\n    ```"
-        ));
-    }
-
-    #[test]
-    fn markers_in_html_block_stay_user_text() {
-        assert_example_kept(&format!(
-            "<details>\n{START_MARKER}\nExample\n{END_MARKER}\n</details>"
-        ));
-    }
-
-    #[test]
-    fn empty_and_blank_fences_stay_closed() {
-        assert_example_kept(&format!(
-            "```\n```\n\n```\n\n\n```\n\n```\n{START_MARKER}\n{END_MARKER}\n```"
-        ));
-    }
-
-    #[test]
-    fn crlf_fence_stays_user_text() {
-        assert_example_kept(&format!(
-            "```md\r\n{START_MARKER}\r\nExample\r\n{END_MARKER}\r\n```"
-        ));
-    }
-
-    #[test]
-    fn block_after_unclosed_blank_fence_is_replaced() {
-        let first = insert_stack_into_description("Old", "```\n\n", StackPlacement::Bottom);
-
-        assert_str_eq!(
-            insert_stack_into_description("New", &first, StackPlacement::Bottom),
-            format!("```\n\n{START_MARKER}\nNew\n{END_MARKER}")
         );
     }
 
