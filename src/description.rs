@@ -596,17 +596,8 @@ pub fn insert_stack_into_description(
 ) -> String {
     let mut result = String::new();
 
-    #[expect(clippy::string_slice, reason = "index found via find()")]
-    let (before, after) = match (
-        existing_description.find(START_MARKER),
-        existing_description.find(END_MARKER),
-    ) {
-        (Some(start), Some(end)) if start < end => (
-            existing_description[..start].trim(),
-            existing_description[end.strict_add(END_MARKER.len())..].trim(),
-        ),
-        _ => (existing_description.trim(), ""),
-    };
+    let (before, after) = split_around_stack_blocks(existing_description);
+    let (before, after) = (before.as_str(), after.as_str());
 
     if stack_description.is_empty() {
         if !before.is_empty() {
@@ -686,16 +677,34 @@ pub fn generate_stack_description(
 #[must_use]
 #[expect(clippy::module_name_repetitions, reason = "is sentence")]
 pub fn remove_jj_vine_stack_from_description(description: &str) -> String {
-    #[expect(clippy::string_slice, reason = "index found via find()")]
-    let (before, after) = match (description.find(START_MARKER), description.find(END_MARKER)) {
-        (Some(start), Some(end)) if start < end => (
-            description[..start].trim(),
-            description[end.strict_add(END_MARKER.len())..].trim(),
-        ),
-        _ => (description.trim(), ""),
-    };
+    let (before, after) = split_around_stack_blocks(description);
 
     format!("{before}\n\n{after}").trim().to_owned()
+}
+
+/// Splits user text around every complete stack block: the text before the
+/// first block, and all later text joined by blank lines. Unpaired markers
+/// stay as user text.
+fn split_around_stack_blocks(description: &str) -> (String, String) {
+    let mut segments = Vec::new();
+    let mut rest = description;
+
+    #[expect(clippy::string_slice, reason = "indices found via find()")]
+    while let Some(start) = rest.find(START_MARKER)
+        && let Some(end) = rest[start..].find(END_MARKER)
+    {
+        segments.push(rest[..start].trim());
+        rest = &rest[start.strict_add(end).strict_add(END_MARKER.len())..];
+    }
+    segments.push(rest.trim());
+
+    let before = segments.remove(0).to_owned();
+    let after = segments
+        .into_iter()
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    (before, after)
 }
 
 /// Generates the description for a branch based on the commits in the
@@ -2107,6 +2116,39 @@ mod tests {
         assert_str_eq!(
             insert_stack_into_description("New stack", &actual, StackPlacement::Top),
             expected
+        );
+    }
+
+    #[test]
+    fn replaces_every_stack_block() {
+        let existing = format!(
+            "Intro\n\n{START_MARKER}\nOld A\n{END_MARKER}\n\nMiddle\n\n{START_MARKER}\nOld B\n{END_MARKER}\n\nOutro"
+        );
+
+        assert_str_eq!(
+            insert_stack_into_description("New stack", &existing, StackPlacement::Bottom),
+            format!("Intro\n\nMiddle\n\nOutro\n\n{START_MARKER}\nNew stack\n{END_MARKER}")
+        );
+        assert_str_eq!(
+            insert_stack_into_description("New stack", &existing, StackPlacement::Top),
+            format!("{START_MARKER}\nNew stack\n{END_MARKER}\n\nIntro\n\nMiddle\n\nOutro")
+        );
+        let removed = insert_stack_into_description("", &existing, StackPlacement::Bottom);
+        assert!(!removed.contains(START_MARKER) && !removed.contains(END_MARKER));
+        assert!(removed.contains("Middle") && removed.contains("Outro"));
+        assert_str_eq!(
+            remove_jj_vine_stack_from_description(&existing),
+            "Intro\n\nMiddle\n\nOutro"
+        );
+    }
+
+    #[test]
+    fn unpaired_start_marker_stays_user_text() {
+        let existing = format!("Notes {START_MARKER} pasted");
+
+        assert_str_eq!(
+            insert_stack_into_description("New stack", &existing, StackPlacement::Bottom),
+            format!("{existing}\n\n{START_MARKER}\nNew stack\n{END_MARKER}")
         );
     }
 
