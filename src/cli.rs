@@ -72,7 +72,7 @@ impl Cli {
         let filter = EnvFilter::builder()
             .with_default_directive(Level::INFO.into())
             .from_env_lossy();
-        let strip_ansi = !std::io::stdout().is_terminal();
+        let strip_ansi = !stdout_supports_color();
 
         if self.verbose {
             tracing_subscriber::registry()
@@ -154,6 +154,14 @@ impl Cli {
             }
         }
     }
+}
+
+/// Whether `tracing`'s writer, stdout, can show colour: a terminal that is not
+/// `TERM=dumb`, with `NO_COLOR` unset or empty.
+fn stdout_supports_color() -> bool {
+    let no_color = std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty());
+    let dumb = std::env::var_os("TERM").is_some_and(|t| t == "dumb");
+    std::io::stdout().is_terminal() && !no_color && !dumb
 }
 
 /// Whether the run may use a spinner: `verbose` forces flat logging, and a

@@ -268,8 +268,8 @@ impl Drop for InteractiveOutput {
     }
 }
 
-/// Flat logging mode implementation. A quiet one logs only messages and
-/// completions, for runs whose stderr cannot show a spinner.
+/// Flat logging mode implementation. A quiet one skips current-step and
+/// substep progress; messages, completions, and formatted output still log.
 pub struct FlatOutput {
     current_text: RwLock<String>,
     substeps: RwLock<Vec<String>>,
@@ -323,7 +323,7 @@ impl Output for FlatOutput {
     }
 
     fn set_substep(&self, message: &str) {
-        if self.quiet {
+        if self.quiet || message.is_empty() {
             return;
         }
         info!(
@@ -479,37 +479,38 @@ impl Output for BufferedOutput {
 
 #[cfg(test)]
 mod tests {
+    use core::fmt::Write as _;
+    use std::sync::Arc;
+
     use tracing_subscriber::fmt::SubscriberBuilder;
 
     use super::{BufferedOutput, FlatOutput, Output as _, OutputExt as _};
     use crate::tracing_formatter::PlainFormatter;
 
     fn captured_log(output: &FlatOutput) -> String {
-        let buffer: &'static BufferedOutput = Box::leak(Box::new(BufferedOutput::new()));
+        let buffer = Arc::new(BufferedOutput::new());
         let subscriber = SubscriberBuilder::default()
-            .with_writer(move || buffer)
+            .with_writer(Arc::clone(&buffer))
             .event_format(PlainFormatter::new())
             .finish();
         tracing::subscriber::with_default(subscriber, || {
             output.log_current("Planning");
             output.run("fetch", || ());
-            output.log_message("Table");
+            output.log_message("Message");
+            writeln!(&mut &*output, "Table").unwrap();
             output.log_completed("Done");
         });
         buffer.get_buffer()
     }
 
     #[test]
-    fn quiet_flat_logs_only_messages_and_completions() {
-        assert_eq!(captured_log(&FlatOutput::quiet()), "Table\nDone\n");
+    fn quiet_flat_skips_progress_and_keeps_results() {
+        assert_eq!(captured_log(&FlatOutput::quiet()), "Message\nTable\nDone\n");
     }
 
     #[test]
     fn flat_logs_current_and_substeps() {
         let log = strip_ansi::strip_str(&captured_log(&FlatOutput::new())).to_string();
-        assert_eq!(
-            log,
-            "Planning\nPlanning (fetch)\nPlanning ()\nTable\nDone\n"
-        );
+        assert_eq!(log, "Planning\nPlanning (fetch)\nMessage\nTable\nDone\n");
     }
 }

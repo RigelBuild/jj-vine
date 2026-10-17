@@ -100,6 +100,8 @@ impl Visit for MessageVisitor {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use owo_colors::OwoColorize as _;
     use tracing_subscriber::fmt::SubscriberBuilder;
 
@@ -107,9 +109,9 @@ mod tests {
     use crate::output::BufferedOutput;
 
     fn format(formatter: PlainFormatter) -> String {
-        let buffer: &'static BufferedOutput = Box::leak(Box::new(BufferedOutput::new()));
+        let buffer = Arc::new(BufferedOutput::new());
         let subscriber = SubscriberBuilder::default()
-            .with_writer(move || buffer)
+            .with_writer(Arc::clone(&buffer))
             .event_format(formatter)
             .finish();
         tracing::subscriber::with_default(subscriber, || {
