@@ -10,20 +10,18 @@ use tracing_subscriber::{
 };
 
 /// Simple formatter that prints the message field without applying level-based
-/// coloring. This preserves any ANSI codes already in the message.
+/// coloring. ANSI codes in the message are kept unless `strip_ansi` is set.
 #[derive(Default)]
 pub struct PlainFormatter {
     display_level: bool,
     display_timestamp: bool,
+    strip_ansi: bool,
 }
 
 impl PlainFormatter {
     #[must_use]
     pub fn new() -> Self {
-        Self {
-            display_level: false,
-            display_timestamp: false,
-        }
+        Self::default()
     }
 
     #[must_use]
@@ -35,6 +33,13 @@ impl PlainFormatter {
     #[must_use]
     pub fn with_timestamp(mut self, display: bool) -> Self {
         self.display_timestamp = display;
+        self
+    }
+
+    /// Drop ANSI escapes, for a writer that is not a terminal.
+    #[must_use]
+    pub fn with_strip_ansi(mut self, strip: bool) -> Self {
+        self.strip_ansi = strip;
         self
     }
 }
@@ -66,8 +71,11 @@ where
             write!(writer, "{:5} ", metadata.level())?;
         }
 
-        // Write the message as-is, preserving any ANSI codes
-        writeln!(writer, "{message}")
+        if self.strip_ansi {
+            writeln!(writer, "{}", strip_ansi::strip_str(&message))
+        } else {
+            writeln!(writer, "{message}")
+        }
     }
 }
 
@@ -87,5 +95,42 @@ impl Visit for MessageVisitor {
         if field.name() == "message" {
             self.message = Some(format!("{value:?}"));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use owo_colors::OwoColorize as _;
+    use tracing_subscriber::fmt::SubscriberBuilder;
+
+    use super::PlainFormatter;
+    use crate::output::BufferedOutput;
+
+    fn format(formatter: PlainFormatter) -> String {
+        let buffer: &'static BufferedOutput = Box::leak(Box::new(BufferedOutput::new()));
+        let subscriber = SubscriberBuilder::default()
+            .with_writer(move || buffer)
+            .event_format(formatter)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!("{} {}", "plain", "dim".dimmed());
+        });
+        buffer.get_buffer()
+    }
+
+    #[test]
+    fn strip_ansi_drops_escapes() {
+        assert_eq!(
+            format(PlainFormatter::new().with_strip_ansi(true)),
+            "plain dim\n"
+        );
+    }
+
+    #[test]
+    fn default_keeps_escapes() {
+        assert_eq!(
+            format(PlainFormatter::new()),
+            format!("plain {}\n", "dim".dimmed())
+        );
     }
 }
