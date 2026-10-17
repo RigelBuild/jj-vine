@@ -1,4 +1,4 @@
-use core::{fmt::Write as _, hash::BuildHasher};
+use core::{fmt::Write as _, hash::BuildHasher, ops::Range};
 use std::{
     collections::{HashMap, HashSet},
     hash::RandomState,
@@ -6,6 +6,7 @@ use std::{
 };
 
 use itertools::Itertools as _;
+use pulldown_cmark::{CodeBlockKind, Event, Parser, Tag, TagEnd};
 
 use crate::{
     bookmark::{BookmarkRef, ChangeComponent},
@@ -684,48 +685,26 @@ pub fn remove_jj_vine_stack_from_description(description: &str) -> String {
 
 /// Splits user text around every complete stack block: the text before the
 /// first block, and all later text joined by blank lines. Markers count only
-/// as whole lines outside closed code fences; each end closes the nearest
-/// open start, and an enclosing block absorbs nested ones.
+/// as whole lines outside code blocks; each end closes the nearest open
+/// start, and an enclosing block absorbs nested ones.
 #[expect(clippy::string_slice, reason = "indices are line boundaries")]
 fn split_around_stack_blocks(description: &str) -> (String, String) {
-    let lines: Vec<&str> = description.split_inclusive('\n').collect();
-    // Longest bare closing run of each fence char after each line, so an
-    // opener with no closer is skipped without rescanning the tail.
-    let mut later_closers = vec![(0_usize, 0_usize); lines.len()];
-    let mut longest = (0_usize, 0_usize);
-    for (index, line) in lines.iter().enumerate().rev() {
-        later_closers[index] = longest;
-        match fence_closer(line) {
-            Some(('`', len)) => longest.0 = longest.0.max(len),
-            Some((_, len)) => longest.1 = longest.1.max(len),
-            None => {}
-        }
-    }
-
+    let code_blocks = code_block_ranges(description);
+    let mut next_code = code_blocks.iter().peekable();
     let mut blocks: Vec<(usize, usize)> = Vec::new();
     let mut open_starts = Vec::new();
-    let mut open_fence: Option<(char, usize)> = None;
     let mut offset = 0_usize;
 
-    for (index, line) in lines.iter().enumerate() {
+    for line in description.split_inclusive('\n') {
         let line_start = offset;
         offset = offset.strict_add(line.len());
-        let trimmed = line.trim();
+        while next_code.next_if(|code| code.end <= line_start).is_some() {}
+        if next_code.peek().is_some_and(|code| code.start < offset) {
+            continue;
+        }
 
-        if let Some((marker, len)) = open_fence {
-            if fence_closer(line).is_some_and(|(c, n)| c == marker && n >= len) {
-                open_fence = None;
-            }
-        } else if let Some((marker, len)) = fence_opener(line)
-            && len
-                <= if marker == '`' {
-                    later_closers[index].0
-                } else {
-                    later_closers[index].1
-                }
-        {
-            open_fence = Some((marker, len));
-        } else if trimmed == START_MARKER {
+        let trimmed = line.trim();
+        if trimmed == START_MARKER {
             open_starts.push(line_start);
         } else if trimmed == END_MARKER
             && let Some(start) = open_starts.pop()
@@ -754,29 +733,40 @@ fn split_around_stack_blocks(description: &str) -> (String, String) {
     (before, after)
 }
 
-/// Strips the up-to-three-space indent Markdown allows before a fence.
-fn fence_body(line: &str) -> Option<&str> {
-    let line = line.trim_end_matches(['\n', '\r']);
-    let body = line.trim_start_matches(' ');
-    (line.len().strict_sub(body.len()) <= 3).then_some(body)
-}
-
-/// The fence character and run length when `line` opens a code fence.
-fn fence_opener(line: &str) -> Option<(char, usize)> {
-    let body = fence_body(line)?;
-    let marker = body.chars().next().filter(|c| matches!(c, '`' | '~'))?;
-    let len = body.chars().take_while(|&c| c == marker).count();
-    // A backtick fence's info string may not contain a backtick.
-    let info_ok = marker == '~' || !body.trim_start_matches('`').contains('`');
-    (len >= 3 && info_ok).then_some((marker, len))
-}
-
-/// The fence character and run length when `line` is a bare closing fence.
-fn fence_closer(line: &str) -> Option<(char, usize)> {
-    let body = fence_body(line)?.trim_end();
-    let marker = body.chars().next().filter(|c| matches!(c, '`' | '~'))?;
-    let len = body.chars().count();
-    (len >= 3 && body.chars().all(|c| c == marker)).then_some((marker, len))
+/// Byte ranges of the code blocks in `description`, in order. A fence left
+/// open swallows the rest of the text, including any stack block written
+/// after it, so it is skipped to keep that block replaceable.
+#[expect(clippy::string_slice, reason = "parser ranges are char boundaries")]
+fn code_block_ranges(description: &str) -> Vec<Range<usize>> {
+    let mut ranges = Vec::new();
+    let mut open: Option<(Range<usize>, bool, usize)> = None;
+    for (event, range) in Parser::new(description).into_offset_iter() {
+        match event {
+            Event::Start(Tag::CodeBlock(kind)) => {
+                let fenced = matches!(kind, CodeBlockKind::Fenced(_));
+                let opener_end = description[range.clone()]
+                    .find('\n')
+                    .map_or(range.end, |newline| range.start.strict_add(newline));
+                open = Some((range, fenced, opener_end));
+            }
+            Event::Text(_) if open.is_some() => {
+                if let Some((_, _, content_end)) = &mut open {
+                    *content_end = range.end;
+                }
+            }
+            Event::End(TagEnd::CodeBlock) => {
+                if let Some((block, fenced, content_end)) = open.take() {
+                    // A closed fence ends with its closing line after the content.
+                    let closed = !description[content_end..block.end].trim().is_empty();
+                    if !fenced || closed {
+                        ranges.push(block);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    ranges
 }
 
 /// Generates the description for a branch based on the commits in the
@@ -2376,6 +2366,19 @@ mod tests {
                 Path::new("")
             ),
             ""
+        );
+    }
+
+    #[test]
+    fn fence_in_blockquote_and_list_stays_user_text() {
+        let example = format!(
+            "> ```md\n> {START_MARKER}\n> Example\n> {END_MARKER}\n> ```\n\n- ```\n  {START_MARKER}\n  {END_MARKER}\n  ```"
+        );
+        let existing = format!("{START_MARKER}\nOld\n{END_MARKER}\n\n{example}");
+
+        assert_str_eq!(
+            insert_stack_into_description("New", &existing, StackPlacement::Bottom),
+            format!("{example}\n\n{START_MARKER}\nNew\n{END_MARKER}")
         );
     }
 
