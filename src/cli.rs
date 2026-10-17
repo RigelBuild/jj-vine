@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{io::IsTerminal as _, path::PathBuf};
 
 use clap::{Parser, Subcommand};
 use tracing::{Dispatch, Level, dispatcher};
@@ -72,19 +72,27 @@ impl Cli {
         let filter = EnvFilter::builder()
             .with_default_directive(Level::INFO.into())
             .from_env_lossy();
+        let strip_ansi = !stdout_supports_color();
 
         if self.verbose {
             tracing_subscriber::registry()
                 .with(filter)
                 .with(
-                    tracing_subscriber::fmt::layer()
-                        .event_format(PlainFormatter::new().with_level(true).with_timestamp(true)),
+                    tracing_subscriber::fmt::layer().event_format(
+                        PlainFormatter::new()
+                            .with_level(true)
+                            .with_timestamp(true)
+                            .with_strip_ansi(strip_ansi),
+                    ),
                 )
                 .init();
         } else {
             tracing_subscriber::registry()
                 .with(filter)
-                .with(tracing_subscriber::fmt::layer().event_format(PlainFormatter::new()))
+                .with(
+                    tracing_subscriber::fmt::layer()
+                        .event_format(PlainFormatter::new().with_strip_ansi(strip_ansi)),
+                )
                 .init();
         }
 
@@ -148,6 +156,14 @@ impl Cli {
     }
 }
 
+/// Whether `tracing`'s writer, stdout, can show colour: a terminal that is not
+/// `TERM=dumb`, with `NO_COLOR` unset or empty.
+fn stdout_supports_color() -> bool {
+    let no_color = std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty());
+    let dumb = std::env::var_os("TERM").is_some_and(|t| t == "dumb");
+    std::io::stdout().is_terminal() && !no_color && !dumb
+}
+
 /// Whether the run may use a spinner: `verbose` forces flat logging, and a
 /// command that shows no progress (e.g. `init`) is never interactive. Terminal
 /// usability is left to indicatif via [`InteractiveOutput::is_hidden`], which
@@ -159,11 +175,12 @@ fn wants_interactive_output(verbose: bool, can_have_interactive_output: bool) ->
 
 /// Keep the spinner only if indicatif will draw it. A hidden spinner (stderr
 /// piped or captured, or `TERM=dumb`/unset) drops every `log_message`, so fall
-/// back to flat logging, which stays visible via `tracing`.
+/// back to quiet flat logging: messages and completions, no substep lines.
 fn select_output(candidate: Option<InteractiveOutput>) -> SyncOutput {
     match candidate {
         Some(interactive) if !interactive.is_hidden() => SyncOutput::Interactive(interactive),
-        _ => SyncOutput::Flat(FlatOutput::new()),
+        Some(_) => SyncOutput::Flat(FlatOutput::quiet()),
+        None => SyncOutput::Flat(FlatOutput::new()),
     }
 }
 
@@ -179,9 +196,9 @@ mod tests {
     }
 
     #[test]
-    fn hidden_spinner_falls_back_to_flat_output() {
+    fn hidden_spinner_falls_back_to_quiet_flat_output() {
         let output = select_output(Some(spinner_with(ProgressDrawTarget::hidden())));
-        assert!(matches!(output, SyncOutput::Flat(_)));
+        assert!(matches!(output, SyncOutput::Flat(flat) if flat.is_quiet()));
     }
 
     /// A terminal indicatif draws to; every write succeeds and is discarded.
@@ -226,8 +243,8 @@ mod tests {
     }
 
     #[test]
-    fn no_candidate_uses_flat_output() {
-        assert!(matches!(select_output(None), SyncOutput::Flat(_)));
+    fn no_candidate_uses_verbose_flat_output() {
+        assert!(matches!(select_output(None), SyncOutput::Flat(flat) if !flat.is_quiet()));
     }
 
     #[test]

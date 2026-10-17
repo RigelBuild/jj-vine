@@ -268,10 +268,12 @@ impl Drop for InteractiveOutput {
     }
 }
 
-/// Flat logging mode implementation.
+/// Flat logging mode implementation. A quiet one skips current-step and
+/// substep progress; messages, completions, and formatted output still log.
 pub struct FlatOutput {
     current_text: RwLock<String>,
     substeps: RwLock<Vec<String>>,
+    quiet: bool,
 }
 
 impl FlatOutput {
@@ -280,7 +282,21 @@ impl FlatOutput {
         Self {
             current_text: RwLock::new(String::new()),
             substeps: RwLock::new(Vec::new()),
+            quiet: false,
         }
+    }
+
+    #[must_use]
+    pub fn quiet() -> Self {
+        Self {
+            quiet: true,
+            ..Self::new()
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn is_quiet(&self) -> bool {
+        self.quiet
     }
 }
 
@@ -301,10 +317,15 @@ impl Output for FlatOutput {
     fn log_current(&self, message: &str) {
         let mut current_text = self.current_text.write().unwrap();
         message.clone_into(&mut current_text);
-        info!("{}", message);
+        if !self.quiet {
+            info!("{}", message);
+        }
     }
 
     fn set_substep(&self, message: &str) {
+        if self.quiet || message.is_empty() {
+            return;
+        }
         info!(
             "{} {}",
             self.current_text.read().unwrap(),
@@ -453,5 +474,43 @@ impl Output for BufferedOutput {
     fn log_completed(&self, message: &str) {
         let mut buffer = self.buffer.write().unwrap();
         writeln!(buffer, "{message}...").unwrap();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use core::fmt::Write as _;
+    use std::sync::Arc;
+
+    use tracing_subscriber::fmt::SubscriberBuilder;
+
+    use super::{BufferedOutput, FlatOutput, Output as _, OutputExt as _};
+    use crate::tracing_formatter::PlainFormatter;
+
+    fn captured_log(output: &FlatOutput) -> String {
+        let buffer = Arc::new(BufferedOutput::new());
+        let subscriber = SubscriberBuilder::default()
+            .with_writer(Arc::clone(&buffer))
+            .event_format(PlainFormatter::new())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            output.log_current("Planning");
+            output.run("fetch", || ());
+            output.log_message("Message");
+            writeln!(&mut &*output, "Table").unwrap();
+            output.log_completed("Done");
+        });
+        buffer.get_buffer()
+    }
+
+    #[test]
+    fn quiet_flat_skips_progress_and_keeps_results() {
+        assert_eq!(captured_log(&FlatOutput::quiet()), "Message\nTable\nDone\n");
+    }
+
+    #[test]
+    fn flat_logs_current_and_substeps() {
+        let log = strip_ansi::strip_str(&captured_log(&FlatOutput::new())).to_string();
+        assert_eq!(log, "Planning\nPlanning (fetch)\nMessage\nTable\nDone\n");
     }
 }
