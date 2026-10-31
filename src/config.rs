@@ -514,9 +514,10 @@ pub struct GitHubConfig {
     /// Unix, no controlling terminal. Processes remaining in its Unix process
     /// group or Windows job are killed when it exits. A Unix descendant that
     /// starts another session or group can escape cleanup. Each `{host}` in
-    /// the argv becomes the web host of `host` (see [`github_web_host`]).
-    /// Without `{host}`, the command's token is used for whatever `host`
-    /// resolves to, including one derived from the remote.
+    /// the argv becomes the web host of `host` (see [`github_web_host`]). Each
+    /// `{project}` becomes `target_project()`. Without `{host}`, the command's
+    /// token is used for whatever `host` resolves to, including one derived
+    /// from the remote.
     #[serde(default)]
     pub token_command: Vec<String>,
     /// Register submitted pull requests as GitHub-native stacks with
@@ -585,24 +586,47 @@ impl GitHubConfig {
         self.resolved_token_with_timeout(TOKEN_COMMAND_TIMEOUT)
     }
 
-    /// The `tokenCommand` argv with each `{host}` replaced by the web host.
-    /// An argv without `{host}` is borrowed unchanged.
+    /// The `tokenCommand` argv with each `{host}` replaced by the web host and
+    /// each `{project}` replaced by `target_project()`.
+    /// An argv without either placeholder is borrowed unchanged.
     fn token_command_argv(&self) -> Result<Cow<'_, [String]>> {
-        if !self.token_command.iter().any(|arg| arg.contains("{host}")) {
+        let uses_host = self.token_command.iter().any(|arg| arg.contains("{host}"));
+        let uses_project = self
+            .token_command
+            .iter()
+            .any(|arg| arg.contains("{project}"));
+        if !uses_host && !uses_project {
             return Ok(Cow::Borrowed(&self.token_command));
         }
-        let Some(web_host) = github_web_host(&self.host) else {
+        let project = self.target_project();
+        if uses_project && project.is_empty() {
             return Err(ConfigSnafu {
-                message: "github.tokenCommand uses {host}, but github.host is not an \
-                          https:// URL with a host"
+                message: "github.tokenCommand uses {project}, but no project is resolved"
                     .to_owned(),
             }
             .build());
+        }
+        let web_host = if uses_host {
+            let Some(web_host) = github_web_host(&self.host) else {
+                return Err(ConfigSnafu {
+                    message: "github.tokenCommand uses {host}, but github.host is not an \
+                              https:// URL with a host"
+                        .to_owned(),
+                }
+                .build());
+            };
+            Some(web_host)
+        } else {
+            None
         };
         Ok(Cow::Owned(
             self.token_command
                 .iter()
-                .map(|arg| arg.replace("{host}", web_host))
+                // An unused placeholder appears in no argument, so its replace is a no-op.
+                .map(|arg| {
+                    arg.replace("{host}", web_host.unwrap_or_default())
+                        .replace("{project}", project)
+                })
                 .collect(),
         ))
     }
@@ -3015,6 +3039,69 @@ mod tests {
         ] {
             assert_eq!(github_web_host(api), web, "{api}");
         }
+    }
+
+    #[test]
+    fn token_command_substitutes_host_and_project_placeholders() {
+        let config = GitHubConfig {
+            host: "https://api.github.com".to_owned(),
+            project: "owner-a/repo".to_owned(),
+            token_command: vec![
+                "helper".to_owned(),
+                "{host}".to_owned(),
+                "--repo={project}".to_owned(),
+            ],
+            ..GitHubConfig::default()
+        };
+
+        assert_eq!(
+            config.token_command_argv().expect("argv").as_ref(),
+            &["helper", "github.com", "--repo=owner-a/repo"]
+        );
+    }
+
+    #[test]
+    fn token_command_project_placeholder_without_project_errors() {
+        let config = GitHubConfig {
+            token_command: vec!["helper".to_owned(), "{project}".to_owned()],
+            ..GitHubConfig::default()
+        };
+
+        let Err(Error::Config { message, .. }) = config.token_command_argv() else {
+            panic!("expected missing project config error");
+        };
+        assert_eq!(
+            message,
+            "github.tokenCommand uses {project}, but no project is resolved"
+        );
+    }
+
+    #[test]
+    fn token_command_without_placeholders_borrows_argv() {
+        let config = GitHubConfig {
+            token_command: vec!["helper".to_owned(), "plain-argument".to_owned()],
+            ..GitHubConfig::default()
+        };
+
+        assert!(matches!(
+            config.token_command_argv().expect("argv"),
+            Cow::Borrowed(_)
+        ));
+    }
+
+    #[test]
+    fn token_command_project_placeholder_uses_target_project_override() {
+        let config = GitHubConfig {
+            project: "owner-a/source".to_owned(),
+            target_project: "owner-b/target".to_owned(),
+            token_command: vec!["helper".to_owned(), "{project}".to_owned()],
+            ..GitHubConfig::default()
+        };
+
+        assert_eq!(
+            config.token_command_argv().expect("argv").as_ref(),
+            &["helper", "owner-b/target"]
+        );
     }
 
     #[test]
