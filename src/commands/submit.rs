@@ -990,6 +990,8 @@ mod hook_warning_tests {
             .expect("workspace");
         let secondary = crate::jj::Jujutsu::new(&workspace).expect("secondary jj");
         probe(&secondary, &workspace);
+        std::fs::remove_file(std::path::Path::new(git_root).join("hooks/pre-push"))
+            .expect("remove default hook before custom path probes");
         for path in [
             ".custom-hooks".to_owned(),
             repo.path
@@ -1007,6 +1009,14 @@ mod hook_warning_tests {
             assert!(status.success());
             probe(&repo.jj, &repo.path);
             probe(&secondary, &workspace);
+            std::fs::remove_file(repo.path.join(&path).join("pre-push"))
+                .expect("remove custom hook");
+            install(&std::path::Path::new(git_root).join("hooks"));
+            let output = BufferedOutput::new();
+            warn_if_no_pre_push_hook(&repo.jj, &repo.path, &output);
+            assert!(output.get_buffer().contains("has no pre-push hook"));
+            std::fs::remove_file(std::path::Path::new(git_root).join("hooks/pre-push"))
+                .expect("remove default hook again");
         }
     }
 

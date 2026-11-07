@@ -1049,9 +1049,7 @@ async fn submit_with_metadata_gate(
     repo.set_config("jj-vine.forge", "gitlab")
         .set_config("jj-vine.gitlab.host", &api.base_url)
         .set_config("jj-vine.gitlab.project", "group/project")
-        .set_config("jj-vine.gitlab.token", "test-token")
-        .set_config("jj-vine.defaultBaseBranch", "main")
-        .set_config("jj-vine.push", "false");
+        .set_config("jj-vine.gitlab.token", "test-token");
     let mut argv = vec!["jj-vine", "submit"];
     argv.extend_from_slice(arguments);
     let mut cli = crate::cli::Cli::parse_from(argv);
@@ -1235,4 +1233,111 @@ async fn submit_file_body_and_full_message_title_use_real_payload() {
         .expect_err("next physical line is not a declaration");
     assert!(error.to_string().contains("spec-impact"));
     api.stop().await;
+}
+
+#[tokio::test]
+async fn submit_rechecks_after_preparation_before_push_or_forge_write() {
+    let api = GitLabApiMock::start(Vec::new()).await;
+    let repo = TestRepo::with_local_remote();
+    repo.create_change("feature.txt", "feature", "fix: valid RIG-42")
+        .create_bookmark("feature");
+    repo.set_config("jj-vine.checks.titlePattern", "RIG-[0-9]+")
+        .set_config(
+            "jj-vine.fetch",
+            r#"["describe", "-r", "feature", "-m", "invalid after preparation"]"#,
+        )
+        .set_config("jj-vine.push", r#"["sh", "-c", "touch push-ran", "--"]"#);
+    let error = submit_with_metadata_gate(&repo, &api, &["feature"])
+        .await
+        .expect_err("refreshed metadata must reject");
+    assert!(error.to_string().contains("pr-title-issue-ref"));
+    assert!(
+        repo.jj.log("feature").expect("prepared change")[0]
+            .description
+            .contains("invalid after preparation")
+    );
+    assert!(!repo.path.join("push-ran").exists());
+    assert!(
+        api.requests()
+            .iter()
+            .all(|request| request.line.starts_with("GET "))
+    );
+    api.stop().await;
+}
+
+#[tokio::test]
+async fn submit_spec_declaration_must_survive_old_stack_replacement() {
+    for outside in [false, true] {
+        let mut mr = gitlab_mr(1, 1, "feature", "main");
+        mr["description"] = json!(format!(
+            "{}\n<!-- start jj-vine stack -->\nSpec-impact: none\n<!-- end jj-vine stack -->",
+            if outside {
+                "Spec-impact: none"
+            } else {
+                "User notes"
+            }
+        ));
+        let api = GitLabApiMock::start(vec![mr]).await;
+        let repo = TestRepo::with_local_remote();
+        repo.create_change("feature.txt", "feature", "fix: feature RIG-42")
+            .create_bookmark("feature");
+        repo.set_config("jj-vine.fetch", "false")
+            .set_config("jj-vine.description.sync", "false")
+            .set_config("jj-vine.checks.specImpact.paths", r#"["docs/specs/"]"#);
+        let result = submit_with_metadata_gate(&repo, &api, &["feature", "--dry-run"]).await;
+        if outside {
+            result.expect("surviving declaration passes");
+        } else {
+            assert!(
+                result
+                    .expect_err("removed declaration cannot pass")
+                    .to_string()
+                    .contains("spec-impact")
+            );
+        }
+        api.stop().await;
+    }
+}
+
+#[tokio::test]
+async fn submit_spec_gate_ignores_root_and_stacked_base_only_changes() {
+    for base in ["main", "parent"] {
+        let api = GitLabApiMock::start(Vec::new()).await;
+        let repo = TestRepo::with_local_remote();
+        if base == "parent" {
+            repo.create_change(
+                "parent.txt",
+                "parent",
+                "fix: parent RIG-42\n\nSpec-impact: none",
+            )
+            .create_bookmark("parent");
+            repo.new_on("parent");
+        }
+        repo.create_change("feature.txt", "feature", "fix: feature RIG-42")
+            .create_bookmark("feature");
+        repo.new_on(base);
+        std::fs::create_dir_all(repo.path.join("docs/specs")).expect("spec directory");
+        repo.create_change(
+            "docs/specs/base-only.md",
+            "base specification",
+            "fix: base RIG-42\n\nSpec-impact: none",
+        );
+        repo.jj
+            .exec(["bookmark", "set", base, "-r", "@"])
+            .expect("advance base");
+        if base == "main" {
+            repo.jj
+                .exec(["git", "push", "--bookmark", "main"])
+                .expect("publish advanced root base");
+        }
+        repo.set_config("jj-vine.fetch", "false")
+            .set_config("jj-vine.defaultBaseBranch", base)
+            .set_config("jj-vine.description.enabled", "false")
+            .set_config("jj-vine.checks.specImpact.paths", r#"["docs/specs/"]"#);
+        let error = submit_with_metadata_gate(&repo, &api, &["feature", "--dry-run"])
+            .await
+            .expect_err("base-only spec edits do not exempt feature");
+        assert!(error.to_string().contains("spec-impact"), "{error}");
+        api.stop().await;
+    }
 }

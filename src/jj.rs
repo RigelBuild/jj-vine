@@ -1381,19 +1381,23 @@ mod tests {
 
     #[test]
     fn push_stream_create_identity_in_failure_report() {
-        let directory = TempDir::new().expect("repository directory");
-        let jj = Jujutsu::new(directory.path()).expect("jj instance");
-        let error = jj
-            .exec_push(
-                &argv(&[
-                    "sh",
-                    "-c",
-                    "printf 'create failed' >&2; exit 7",
-                    "--",
-                    "-c",
-                    "change-id",
-                ]),
-                &["created-name".to_owned()],
+        let repo = crate::tests::TestRepo::new();
+        repo.create_change("feature.txt", "feature", "fix: create identity");
+        repo.set_config("templates.git_push_bookmark", r#"'"created-name"'"#);
+        let id = repo.jj.log("@").expect("change")[0].change_id.clone();
+        repo.jj
+            .push_changes_create(
+                [&id],
+                None,
+                &argv(&["sh", "-c", "printf 'create succeeded\\n'", "--"]),
+            )
+            .expect("configured create succeeds");
+        let error = repo
+            .jj
+            .push_changes_create(
+                [&id],
+                None,
+                &argv(&["sh", "-c", "printf 'create failed' >&2; exit 7", "--"]),
             )
             .expect_err("push must fail");
         let report = error.to_string();

@@ -27,7 +27,7 @@ pub fn check_submission(
         return Ok(());
     };
     let checks = CompiledChecks::new(checks)?;
-    let metadata = planned_metadata(plan);
+    let metadata = planned_metadata(plan, config);
 
     for component in graph.components() {
         for bookmark in component.all_bookmarks() {
@@ -75,7 +75,7 @@ pub fn check_submission(
                     jj.exec([
                         "diff",
                         "--from",
-                        &from,
+                        &format!("heads(::({from}) & ::({}))", bookmark.name_for_jj()),
                         "--to",
                         &bookmark.name_for_jj(),
                         "--name-only",
@@ -98,7 +98,10 @@ pub fn check_submission(
     Ok(())
 }
 
-fn planned_metadata(plan: &SubmissionPlan) -> HashMap<String, (String, String, String)> {
+fn planned_metadata(
+    plan: &SubmissionPlan,
+    config: &Config,
+) -> HashMap<String, (String, String, String)> {
     let mut metadata = plan
         .existing_mrs
         .iter()
@@ -133,6 +136,11 @@ fn planned_metadata(plan: &SubmissionPlan) -> HashMap<String, (String, String, S
                     if let Some(new_body) = &action.description {
                         body.clone_from(new_body);
                     }
+                    *body = crate::description::insert_stack_into_description(
+                        "",
+                        body,
+                        config.description.placement,
+                    );
                 }
             }
             Action::UpdateMRBase(action) => {
