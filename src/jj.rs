@@ -5,10 +5,8 @@ use std::{
     borrow::Cow,
     collections::HashSet,
     ffi::OsStr,
-    io::{BufRead as _, BufReader, Write as _},
     path::{Path, PathBuf},
     process::Command,
-    sync::{Arc, Mutex},
     thread,
     time::Instant,
 };
@@ -456,13 +454,46 @@ pub struct Jujutsu {
 
 const PUSH_STDERR_TAIL_LINES: usize = 200;
 
+/// Stderr, including an unterminated line, retains at most 64 KiB and 200
+/// lines.
+const PUSH_STDERR_TAIL_BYTES: usize = 64 * 1024;
+
 #[derive(Default)]
-struct PushOutputCapture {
-    stdout: Vec<u8>,
-    stderr_tail: std::collections::VecDeque<Vec<u8>>,
+struct PushStderrTail {
+    bytes: std::collections::VecDeque<u8>,
+    newlines: usize,
 }
 
-fn run_push_command(mut command: Command, label: &str) -> Result<std::process::Output> {
+impl PushStderrTail {
+    fn extend(&mut self, chunk: &[u8]) {
+        for &byte in chunk {
+            self.bytes.push_back(byte);
+            self.newlines += usize::from(byte == b'\n');
+            while self.bytes.len() > PUSH_STDERR_TAIL_BYTES
+                || self
+                    .newlines
+                    .saturating_add(usize::from(self.bytes.back() != Some(&b'\n')))
+                    > PUSH_STDERR_TAIL_LINES
+            {
+                if self.bytes.pop_front() == Some(b'\n') {
+                    self.newlines = self.newlines.saturating_sub(1);
+                }
+            }
+        }
+    }
+}
+
+fn run_push_command(command: Command, label: &str) -> Result<std::process::Output> {
+    run_push_command_with_forward(command, label, &|chunk, label, line_start| {
+        forward_push_chunk(&mut std::io::stderr().lock(), chunk, label, line_start)
+    })
+}
+
+fn run_push_command_with_forward(
+    mut command: Command,
+    label: &str,
+    forward: &(impl Fn(&[u8], &str, &mut bool) -> std::io::Result<()> + Sync),
+) -> Result<std::process::Output> {
     use std::process::Stdio;
 
     command
@@ -482,112 +513,81 @@ fn run_push_command(mut command: Command, label: &str) -> Result<std::process::O
         }
         .build()
     })?;
-    let capture = Arc::new(Mutex::new(PushOutputCapture::default()));
-    let stdout_capture = Arc::clone(&capture);
-    let stdout_label = label.to_owned();
-    let stdout_reader =
-        thread::spawn(move || read_push_stream(stdout, &stdout_capture, false, &stdout_label));
-    let stderr_capture = Arc::clone(&capture);
-    let stderr_label = label.to_owned();
-    let stderr_reader =
-        thread::spawn(move || read_push_stream(stderr, &stderr_capture, true, &stderr_label));
-
-    let status = child.wait()?;
-    stdout_reader
-        .join()
-        .map_err(|_| {
-            ConfigSnafu {
-                message: "configured push stdout reader panicked".to_owned(),
-            }
-            .build()
-        })?
-        .map_err(|message| ConfigSnafu { message }.build())?;
-    stderr_reader
-        .join()
-        .map_err(|_| {
-            ConfigSnafu {
-                message: "configured push stderr reader panicked".to_owned(),
-            }
-            .build()
-        })?
-        .map_err(|message| ConfigSnafu { message }.build())?;
-    let mut capture = capture.lock().map_err(|_| {
-        ConfigSnafu {
-            message: "configured push output capture was poisoned".to_owned(),
+    let mut captured_stdout = Vec::new();
+    let mut captured_stderr = PushStderrTail::default();
+    let status = thread::scope(|scope| {
+        let stdout_reader = scope.spawn(|| {
+            read_push_stream(stdout, label, forward, |chunk| {
+                captured_stdout.extend_from_slice(chunk);
+            })
+        });
+        let stderr_reader = scope.spawn(|| {
+            read_push_stream(stderr, label, forward, |chunk| {
+                captured_stderr.extend(chunk)
+            })
+        });
+        // Both pipes keep draining even when forwarding fails, so waiting cannot
+        // deadlock on a child blocked in write(). Join both before propagating.
+        let status = child.wait();
+        let stdout_result = stdout_reader.join();
+        let stderr_result = stderr_reader.join();
+        for (stream, result) in [("stdout", stdout_result), ("stderr", stderr_result)] {
+            result.map_err(|_| {
+                ConfigSnafu {
+                    message: format!("configured push {stream} reader panicked"),
+                }
+                .build()
+            })??;
         }
-        .build()
+        status.map_err(Error::from)
     })?;
-    let stderr = capture
-        .stderr_tail
-        .iter()
-        .flat_map(|line| line.iter().copied())
-        .collect();
     Ok(std::process::Output {
         status,
-        stdout: core::mem::take(&mut capture.stdout),
-        stderr,
+        stdout: captured_stdout,
+        stderr: captured_stderr.bytes.into_iter().collect(),
     })
 }
 
 fn read_push_stream(
-    stream: impl std::io::Read,
-    capture: &Mutex<PushOutputCapture>,
-    is_stderr: bool,
+    mut stream: impl std::io::Read,
     label: &str,
-) -> core::result::Result<(), String> {
-    let mut reader = BufReader::new(stream);
-    let mut line = Vec::new();
+    forward: &impl Fn(&[u8], &str, &mut bool) -> std::io::Result<()>,
+    mut capture: impl FnMut(&[u8]),
+) -> std::io::Result<()> {
+    let mut buffer = [0; 8192];
+    let mut line_start = true;
+    let mut forwarding_error = None;
     loop {
-        line.clear();
-        let count = reader
-            .read_until(b'\n', &mut line)
-            .map_err(|error| error.to_string())?;
+        let count = match stream.read(&mut buffer) {
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            result => result?,
+        };
         if count == 0 {
             break;
         }
-        let displayed = {
-            let mut output = std::io::stderr().lock();
-            output
-                .write_all(b"[")
-                .and_then(|()| output.write_all(label.as_bytes()))
-                .and_then(|()| output.write_all(b"] "))
-                .and_then(|()| output.write_all(&line))
-                .and_then(|()| {
-                    if line.ends_with(b"\n") {
-                        Ok(())
-                    } else {
-                        output.write_all(b"\n")
-                    }
-                })
-                .and_then(|()| output.flush())
-                .map_err(|error| error.to_string())
-        };
-        displayed?;
-
-        let mut capture = capture
-            .lock()
-            .map_err(|_| "configured push output capture was poisoned".to_owned())?;
-        if is_stderr {
-            capture.stderr_tail.push_back(core::mem::take(&mut line));
-            while capture.stderr_tail.len() > PUSH_STDERR_TAIL_LINES {
-                capture.stderr_tail.pop_front();
-            }
-        } else {
-            capture.stdout.extend_from_slice(&line);
+        let chunk = &buffer[..count];
+        capture(chunk);
+        if forwarding_error.is_none() {
+            forwarding_error = forward(chunk, label, &mut line_start).err();
         }
     }
-    Ok(())
+    forwarding_error.map_or(Ok(()), Err)
 }
 
-fn tail_lines(stderr: &str, limit: usize) -> String {
-    stderr
-        .lines()
-        .rev()
-        .take(limit)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .join("\n")
+fn forward_push_chunk(
+    output: &mut impl std::io::Write,
+    chunk: &[u8],
+    label: &str,
+    line_start: &mut bool,
+) -> std::io::Result<()> {
+    for part in chunk.split_inclusive(|byte| *byte == b'\n') {
+        if *line_start {
+            write!(output, "[{label}] ")?;
+        }
+        output.write_all(part)?;
+        *line_start = part.ends_with(b"\n");
+    }
+    output.flush()
 }
 pub(crate) fn build_push_argv(
     push_argv: &[String],
@@ -789,6 +789,20 @@ impl Jujutsu {
 
     /// Run an arbitrary command given as a full argv (`argv[0]` is the binary).
     pub fn exec_argv(&self, argv: &[String]) -> Result<CommandOutput> {
+        let identities = argv
+            .windows(2)
+            .filter(|pair| pair[0] == "--bookmark")
+            .map(|pair| pair[1].trim_matches('"').to_owned())
+            .collect::<Vec<_>>();
+        self.exec_push(argv, &identities)
+    }
+
+    /// Run a configured push with caller-provided bookmark names or change IDs.
+    pub(crate) fn exec_push(
+        &self,
+        argv: &[String],
+        identities: &[String],
+    ) -> Result<CommandOutput> {
         let Some((bin, bin_args)) = argv.split_first() else {
             return Err(ConfigSnafu {
                 message: "push command must not be empty".to_owned(),
@@ -848,15 +862,10 @@ impl Jujutsu {
         self.apply_config_override(&mut command);
         trace!("Running configured push command");
 
-        let bookmark_names = argv
-            .windows(2)
-            .filter(|pair| pair[0] == "--bookmark")
-            .map(|pair| pair[1].trim_matches('"'))
-            .collect::<Vec<_>>()
-            .join(", ");
+        let bookmark_names = identities.join(", ");
         let output = run_push_command(command, &bookmark_names)?;
         if !output.status.success() {
-            let tail = tail_lines(&String::from_utf8_lossy(&output.stderr), 200);
+            let tail = String::from_utf8_lossy(&output.stderr);
             let diagnostic = if tail.is_empty() {
                 "(no stderr output)"
             } else {
@@ -1045,12 +1054,13 @@ impl Jujutsu {
     ) -> Result<()> {
         let change_ids = change_ids
             .into_iter()
-            .map(|change_id| change_id.as_ref().to_owned());
-        let args = build_push_create_argv(push_argv, remote, change_ids);
+            .map(|change_id| change_id.as_ref().to_owned())
+            .collect::<Vec<_>>();
+        let args = build_push_create_argv(push_argv, remote, change_ids.iter().cloned());
         if push_argv == ["jj", "git", "push"] {
             self.exec(args.iter().skip(1))?;
         } else {
-            self.exec_argv(&args)?;
+            self.exec_push(&args, &change_ids)?;
         }
 
         Ok(())
@@ -1215,6 +1225,164 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+
+    fn push_shell(script: &str) -> Command {
+        let mut command = Command::new("sh");
+        command.args(["-c", script]);
+        command
+    }
+
+    #[test]
+    fn push_stream_drains_large_interleaved_pipes() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let result = run_push_command_with_forward(
+                push_shell("i=0; while [ $i -lt 160 ]; do dd if=/dev/zero bs=8192 count=1 2>/dev/null; dd if=/dev/zero bs=8192 count=1 >&2 2>/dev/null; i=$((i+1)); done"),
+                "large",
+                &|_, _, _| Ok(()),
+            ).map_err(|error| error.to_string());
+            sender.send(result).expect("send push result");
+        });
+        let output = receiver
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("both pipes must drain without deadlock")
+            .expect("push succeeds");
+        assert!(output.status.success());
+        assert_eq!(output.stdout, vec![0; 160 * 8192]);
+        assert_eq!(output.stderr, vec![0; PUSH_STDERR_TAIL_BYTES]);
+    }
+
+    #[test]
+    fn push_stream_forwards_partial_line_before_exit() {
+        let directory = TempDir::new().expect("gate directory");
+        let gate = directory.path().join("gate");
+        assert!(
+            Command::new("mkfifo")
+                .arg(&gate)
+                .status()
+                .expect("mkfifo")
+                .success()
+        );
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let mut command =
+            push_shell("printf partial; read release < \"$1\"; printf ' done\\nnext'");
+        command.arg("push-test").arg(&gate);
+        let worker = thread::spawn(move || {
+            let forwarded = std::sync::Mutex::new(Vec::new());
+            let output =
+                run_push_command_with_forward(command, "created-name", &|chunk, label, start| {
+                    let mut bytes = forwarded.lock().expect("forwarded bytes");
+                    forward_push_chunk(&mut *bytes, chunk, label, start)?;
+                    sender.send(bytes.clone()).expect("send live output");
+                    Ok(())
+                })
+                .expect("gated push succeeds");
+            (output, forwarded.into_inner().expect("forwarded bytes"))
+        });
+        let partial = receiver.recv_timeout(core::time::Duration::from_secs(10));
+        // Release the child only after observing its partial output.
+        std::fs::write(&gate, b"release\n").expect("release child");
+        let (output, forwarded) = worker.join().expect("push worker");
+        assert_eq!(
+            partial.expect("partial output before release"),
+            b"[created-name] partial"
+        );
+        assert_eq!(output.stdout, b"partial done\nnext");
+        assert_eq!(
+            forwarded,
+            b"[created-name] partial done\n[created-name] next"
+        );
+    }
+
+    #[test]
+    fn push_stream_preserves_split_utf8_without_final_newline() {
+        struct SplitUtf8(usize);
+        impl std::io::Read for SplitUtf8 {
+            fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+                let bytes = "a€tail".as_bytes();
+                if self.0 == bytes.len() {
+                    return Ok(0);
+                }
+                output[0] = bytes[self.0];
+                self.0 += 1;
+                Ok(1)
+            }
+        }
+        let mut captured = Vec::new();
+        let forwarded = std::sync::Mutex::new(Vec::new());
+        read_push_stream(
+            SplitUtf8(0),
+            "split",
+            &|chunk, label, start| {
+                forward_push_chunk(
+                    &mut *forwarded.lock().expect("forwarded bytes"),
+                    chunk,
+                    label,
+                    start,
+                )
+            },
+            |chunk| captured.extend_from_slice(chunk),
+        )
+        .expect("read split UTF-8");
+        assert_eq!(captured, "a€tail".as_bytes());
+        assert_eq!(
+            forwarded.into_inner().expect("forwarded bytes"),
+            "[split] a€tail".as_bytes()
+        );
+        let output = run_push_command_with_forward(
+            push_shell("printf 'a\\342\\202\\254tail'"),
+            "split",
+            &|_, _, _| Ok(()),
+        )
+        .expect("subprocess UTF-8");
+        assert_eq!(output.stdout, captured);
+    }
+
+    #[test]
+    fn push_stream_bounds_ten_megabyte_unterminated_stderr() {
+        let mut tail = PushStderrTail::default();
+        read_push_stream(
+            std::io::Read::take(std::io::repeat(b'e'), 10 * 1024 * 1024),
+            "long-stderr",
+            &|_, _, _| Ok(()),
+            |chunk| {
+                tail.extend(chunk);
+                assert!(tail.bytes.len() <= PUSH_STDERR_TAIL_BYTES);
+            },
+        )
+        .expect("read ten MiB stderr");
+        assert_eq!(tail.bytes.len(), PUSH_STDERR_TAIL_BYTES);
+        let mut lines = PushStderrTail::default();
+        for _ in 0_usize..300 {
+            lines.extend(b"line\n");
+        }
+        assert_eq!(lines.newlines, 200);
+        lines.extend(b"pending");
+        assert_eq!(lines.newlines, 199);
+    }
+
+    #[test]
+    fn push_stream_create_identity_in_failure_report() {
+        let directory = TempDir::new().expect("repository directory");
+        let jj = Jujutsu::new(directory.path()).expect("jj instance");
+        let error = jj
+            .exec_push(
+                &argv(&[
+                    "sh",
+                    "-c",
+                    "printf 'create failed' >&2; exit 7",
+                    "--",
+                    "-c",
+                    "change-id",
+                ]),
+                &["created-name".to_owned()],
+            )
+            .expect_err("push must fail");
+        let report = error.to_string();
+        assert!(report.contains("created-name"));
+        assert!(report.contains('7'));
+        assert!(report.contains("create failed"));
+    }
 
     /// Create a temporary jj repository for testing.
     fn create_test_repo() -> Result<(TempDir, PathBuf)> {
@@ -1615,20 +1783,21 @@ mod tests {
             writeln!(output, "line-{i}").expect("writing into a String cannot fail");
             output
         });
-        let capture = Mutex::new(PushOutputCapture::default());
-        read_push_stream(expected.as_bytes(), &capture, false, "feature").expect("read stdout");
-        read_push_stream(expected.as_bytes(), &capture, true, "feature").expect("read stderr");
-        let capture = capture.lock().expect("capture lock");
-        assert_eq!(capture.stdout, expected.as_bytes());
-        assert_eq!(capture.stderr_tail.len(), PUSH_STDERR_TAIL_LINES);
-        assert_eq!(
-            capture.stderr_tail.front().expect("first line"),
-            b"line-5\n"
-        );
-        assert_eq!(
-            capture.stderr_tail.back().expect("last line"),
-            b"line-204\n"
-        );
+        let mut stdout = Vec::new();
+        let mut stderr = PushStderrTail::default();
+        read_push_stream(expected.as_bytes(), "feature", &|_, _, _| Ok(()), |chunk| {
+            stdout.extend_from_slice(chunk);
+        })
+        .expect("read stdout");
+        read_push_stream(expected.as_bytes(), "feature", &|_, _, _| Ok(()), |chunk| {
+            stderr.extend(chunk);
+        })
+        .expect("read stderr");
+        assert_eq!(stdout, expected.as_bytes());
+        assert_eq!(stderr.newlines, PUSH_STDERR_TAIL_LINES);
+        let retained = stderr.bytes.into_iter().collect::<Vec<_>>();
+        assert!(retained.starts_with(b"line-5\n"));
+        assert!(retained.ends_with(b"line-204\n"));
     }
 
     #[test]
