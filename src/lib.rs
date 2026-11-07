@@ -81,6 +81,7 @@ pub mod output;
 mod process;
 mod remote;
 pub mod submit;
+pub mod submit_checks;
 pub mod title;
 pub mod tracing_formatter;
 

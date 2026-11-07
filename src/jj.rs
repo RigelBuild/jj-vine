@@ -5,8 +5,11 @@ use std::{
     borrow::Cow,
     collections::HashSet,
     ffi::OsStr,
+    io::{BufRead as _, BufReader, Write as _},
     path::{Path, PathBuf},
     process::Command,
+    sync::{Arc, Mutex},
+    thread,
     time::Instant,
 };
 
@@ -451,6 +454,141 @@ pub struct Jujutsu {
     default_branch: OnceCell<Result<String, Error>>,
 }
 
+const PUSH_STDERR_TAIL_LINES: usize = 200;
+
+#[derive(Default)]
+struct PushOutputCapture {
+    stdout: Vec<u8>,
+    stderr_tail: std::collections::VecDeque<Vec<u8>>,
+}
+
+fn run_push_command(mut command: Command, label: &str) -> Result<std::process::Output> {
+    use std::process::Stdio;
+
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn()?;
+    let stdout = child.stdout.take().ok_or_else(|| {
+        ConfigSnafu {
+            message: "configured push stdout pipe was not available".to_owned(),
+        }
+        .build()
+    })?;
+    let stderr = child.stderr.take().ok_or_else(|| {
+        ConfigSnafu {
+            message: "configured push stderr pipe was not available".to_owned(),
+        }
+        .build()
+    })?;
+    let capture = Arc::new(Mutex::new(PushOutputCapture::default()));
+    let stdout_capture = Arc::clone(&capture);
+    let stdout_label = label.to_owned();
+    let stdout_reader =
+        thread::spawn(move || read_push_stream(stdout, &stdout_capture, false, &stdout_label));
+    let stderr_capture = Arc::clone(&capture);
+    let stderr_label = label.to_owned();
+    let stderr_reader =
+        thread::spawn(move || read_push_stream(stderr, &stderr_capture, true, &stderr_label));
+
+    let status = child.wait()?;
+    stdout_reader
+        .join()
+        .map_err(|_| {
+            ConfigSnafu {
+                message: "configured push stdout reader panicked".to_owned(),
+            }
+            .build()
+        })?
+        .map_err(|message| ConfigSnafu { message }.build())?;
+    stderr_reader
+        .join()
+        .map_err(|_| {
+            ConfigSnafu {
+                message: "configured push stderr reader panicked".to_owned(),
+            }
+            .build()
+        })?
+        .map_err(|message| ConfigSnafu { message }.build())?;
+    let mut capture = capture.lock().map_err(|_| {
+        ConfigSnafu {
+            message: "configured push output capture was poisoned".to_owned(),
+        }
+        .build()
+    })?;
+    let stderr = capture
+        .stderr_tail
+        .iter()
+        .flat_map(|line| line.iter().copied())
+        .collect();
+    Ok(std::process::Output {
+        status,
+        stdout: core::mem::take(&mut capture.stdout),
+        stderr,
+    })
+}
+
+fn read_push_stream(
+    stream: impl std::io::Read,
+    capture: &Mutex<PushOutputCapture>,
+    is_stderr: bool,
+    label: &str,
+) -> core::result::Result<(), String> {
+    let mut reader = BufReader::new(stream);
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        let count = reader
+            .read_until(b'\n', &mut line)
+            .map_err(|error| error.to_string())?;
+        if count == 0 {
+            break;
+        }
+        let displayed = {
+            let mut output = std::io::stderr().lock();
+            output
+                .write_all(b"[")
+                .and_then(|()| output.write_all(label.as_bytes()))
+                .and_then(|()| output.write_all(b"] "))
+                .and_then(|()| output.write_all(&line))
+                .and_then(|()| {
+                    if line.ends_with(b"\n") {
+                        Ok(())
+                    } else {
+                        output.write_all(b"\n")
+                    }
+                })
+                .and_then(|()| output.flush())
+                .map_err(|error| error.to_string())
+        };
+        displayed?;
+
+        let mut capture = capture
+            .lock()
+            .map_err(|_| "configured push output capture was poisoned".to_owned())?;
+        if is_stderr {
+            capture.stderr_tail.push_back(core::mem::take(&mut line));
+            while capture.stderr_tail.len() > PUSH_STDERR_TAIL_LINES {
+                capture.stderr_tail.pop_front();
+            }
+        } else {
+            capture.stdout.extend_from_slice(&line);
+        }
+    }
+    Ok(())
+}
+
+fn tail_lines(stderr: &str, limit: usize) -> String {
+    stderr
+        .lines()
+        .rev()
+        .take(limit)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .join("\n")
+}
 pub(crate) fn build_push_argv(
     push_argv: &[String],
     remote: Option<&str>,
@@ -705,15 +843,30 @@ impl Jujutsu {
                 }
             }
         };
-        trace!("Running configured push command");
-
         let mut command = Command::new(bin_path);
         command.current_dir(selected_cwd.as_ref()).args(bin_args);
         self.apply_config_override(&mut command);
-        let output = command.output()?;
+        trace!("Running configured push command");
+
+        let bookmark_names = argv
+            .windows(2)
+            .filter(|pair| pair[0] == "--bookmark")
+            .map(|pair| pair[1].trim_matches('"'))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let output = run_push_command(command, &bookmark_names)?;
         if !output.status.success() {
+            let tail = tail_lines(&String::from_utf8_lossy(&output.stderr), 200);
+            let diagnostic = if tail.is_empty() {
+                "(no stderr output)"
+            } else {
+                &tail
+            };
             return Err(JjCommandSnafu {
-                message: format!("push command failed with {}", output.status),
+                message: format!(
+                    "push command for bookmark(s) {bookmark_names} failed with {}\nrecent stderr:\n{diagnostic}",
+                    output.status
+                ),
                 output: None,
             }
             .build());
@@ -1455,29 +1608,50 @@ mod tests {
     }
 
     #[test]
-    fn failed_argv_command_does_not_disclose_arguments_or_stderr() {
+    fn configured_push_captures_full_stdout_and_only_recent_stderr() {
+        use core::fmt::Write as _;
+
+        let expected = (0_usize..205).fold(String::new(), |mut output, i| {
+            writeln!(output, "line-{i}").expect("writing into a String cannot fail");
+            output
+        });
+        let capture = Mutex::new(PushOutputCapture::default());
+        read_push_stream(expected.as_bytes(), &capture, false, "feature").expect("read stdout");
+        read_push_stream(expected.as_bytes(), &capture, true, "feature").expect("read stderr");
+        let capture = capture.lock().expect("capture lock");
+        assert_eq!(capture.stdout, expected.as_bytes());
+        assert_eq!(capture.stderr_tail.len(), PUSH_STDERR_TAIL_LINES);
+        assert_eq!(
+            capture.stderr_tail.front().expect("first line"),
+            b"line-5\n"
+        );
+        assert_eq!(
+            capture.stderr_tail.back().expect("last line"),
+            b"line-204\n"
+        );
+    }
+
+    #[test]
+    fn failed_argv_command_reports_bookmark_status_and_stderr_tail() {
         let temp = TempDir::new().expect("temp dir");
         let jj = Jujutsu::new(temp.path()).expect("jj instance");
-        let sentinel = "push-sentinel-secret-value";
         let argv = vec![
             "sh".to_owned(),
             "-c".to_owned(),
-            format!("printf '%s' '{sentinel}' >&2; exit 7"),
-            sentinel.to_owned(),
+            "printf 'first-line\\nlast-line\\n' >&2; exit 7".to_owned(),
+            "sh".to_owned(),
+            "--bookmark".to_owned(),
+            "hudson/rig-42-fix".to_owned(),
         ];
 
         let error = jj.exec_argv(&argv).expect_err("command must fail");
         let message = error.to_string();
-        let diagnostic = format!("{error:?}");
-
-        assert!(message.contains("push command failed with"));
-        assert!(!message.contains(sentinel));
-        assert!(!diagnostic.contains(sentinel));
-        let Error::JjCommand { output, .. } = error else {
-            panic!("configured push failure uses the JjCommand variant");
-        };
-        assert!(output.is_none(), "failed command output must not escape");
+        assert!(message.contains("hudson/rig-42-fix"));
+        assert!(message.contains("exit status: 7"));
+        assert!(message.contains("first-line"));
+        assert!(message.contains("last-line"));
     }
+
     #[test]
     fn builtin_push_failure_preserves_jj_diagnostic() {
         let temp = TempDir::new().expect("temp dir");

@@ -39,6 +39,10 @@ use crate::{
     },
 };
 
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "submit options are independent CLI flags"
+)]
 #[derive(Args, Default)]
 pub struct SubmitCommandConfig {
     /// Options for the revset.
@@ -59,6 +63,10 @@ pub struct SubmitCommandConfig {
     /// command.
     #[arg(long)]
     pub no_hooks: bool,
+
+    /// Skip configured local metadata checks before submission.
+    #[arg(long)]
+    pub no_checks: bool,
 
     /// Show the submission plan and do not execute it.
     #[arg(long, conflicts_with = "dry_run")]
@@ -241,6 +249,19 @@ pub async fn submit(config: &SubmitCommandConfig, cli_config: &CliConfig<'_>) ->
         config.revset_options.tracked,
         &merged_boundary_revset,
     )?;
+    if config.no_checks {
+        if repo_config.checks.is_some() {
+            output.log_message("warning: skipping configured submit metadata checks (--no-checks)");
+        }
+    } else {
+        crate::submit_checks::check_submission(
+            &jj,
+            &repo_config,
+            &bookmark_graph,
+            &cli_config.repository,
+        )?;
+    }
+    warn_if_no_pre_push_hook(&jj, &cli_config.repository, output);
     announce_submission_graph(
         &bookmark_graph,
         &bookmarks,
@@ -855,5 +876,67 @@ where
         }
 
         Cow::Owned(lines.join("\n"))
+    }
+}
+
+fn warn_if_no_pre_push_hook(
+    jj: &Jujutsu,
+    repository: &std::path::Path,
+    output: &impl crate::output::Output,
+) {
+    let default_hook_path = jj
+        .exec(["root"])
+        .ok()
+        .map(|root| std::path::Path::new(root.stdout.trim()).join(".git/hooks/pre-push"));
+    let hooks_path = jj
+        .exec([
+            "config",
+            "list",
+            "--template",
+            r#"value ++ "\n""#,
+            "core.hooksPath",
+        ])
+        .ok()
+        .map(|value| value.stdout.trim().to_owned())
+        .filter(|value| !value.is_empty());
+    let hook_path = hooks_path.as_ref().map_or(default_hook_path, |path| {
+        let path = std::path::PathBuf::from(path);
+        Some(if path.is_absolute() {
+            path.join("pre-push")
+        } else {
+            repository.join(path).join("pre-push")
+        })
+    });
+    let has_hk_config = [
+        "hk.pkl", ".hk.pkl", "hk.toml", ".hk.toml", "hk.yaml", ".hk.yaml", "hk.yml", ".hk.yml",
+    ]
+    .iter()
+    .any(|name| repository.join(name).is_file());
+    if !hook_path.is_some_and(|path| path.is_file()) && !has_hk_config {
+        let name = repository
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("repository");
+        output.log_message(&format!(
+            "warning: {name} has no pre-push hook; nothing checks this push before CI"
+        ));
+    }
+}
+
+#[cfg(test)]
+mod hook_warning_tests {
+    use super::warn_if_no_pre_push_hook;
+    use crate::{output::BufferedOutput, tests::TestRepo};
+
+    #[test]
+    fn warns_when_neither_git_hook_nor_hk_config_exists() {
+        let repo = TestRepo::new();
+        let hooks_path = repo.path.join(".git/hooks");
+        std::fs::create_dir_all(&hooks_path).expect("git hooks directory");
+        let output = BufferedOutput::new();
+
+        warn_if_no_pre_push_hook(&repo.jj, &repo.path, &output);
+
+        assert!(output.get_buffer().contains("has no pre-push hook"));
     }
 }

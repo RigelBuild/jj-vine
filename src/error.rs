@@ -27,7 +27,7 @@ pub(crate) use err_whatever;
 #[snafu(visibility(pub))]
 #[expect(clippy::error_impl_error, reason = "will think about it")]
 pub enum Error {
-    #[snafu(display("{} error(s) occurred: {:?}", errors.len(), errors))]
+    #[snafu(display("{} error(s) occurred: {}", errors.len(), errors.iter().map(ToString::to_string).collect::<Vec<_>>().join("\n")))]
     Aggregate {
         errors: Vec<Box<dyn core::error::Error>>,
         backtrace: Box<Backtrace>,
@@ -217,11 +217,13 @@ impl snafu::Error for ClonableError {}
 impl core::fmt::Display for ClonableError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "{}", self.message)?;
-        if let Some(backtrace) = &self.backtrace {
-            writeln!(f, "\nBacktrace:\n{backtrace}")?;
-        }
-        if let Some(location) = &self.location {
-            writeln!(f, "\nLocation:\n{location}")?;
+        if std::env::var_os("RUST_BACKTRACE").is_some() {
+            if let Some(backtrace) = &self.backtrace {
+                writeln!(f, "\nBacktrace:\n{backtrace}")?;
+            }
+            if let Some(location) = &self.location {
+                writeln!(f, "\nLocation:\n{location}")?;
+            }
         }
         Ok(())
     }

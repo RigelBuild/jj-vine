@@ -95,7 +95,6 @@ impl Cli {
                 )
                 .init();
         }
-
         self.run(&output).await
     }
 

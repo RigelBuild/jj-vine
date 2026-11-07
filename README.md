@@ -346,8 +346,24 @@ These settings apply to all forges:
 | `defaultBaseBranch` | Base branch for root pull/merge requests in a stack. Also used as the root label in stack descriptions and title templates. Commits on this remote branch count as merged, like `trunk()`, when selecting bookmarks to submit | String | No | (detected automatically using the `trunk()` revset) |
 | `openAsDraft` | Open newly created pull/merge requests as drafts | Boolean | No | false |
 | `fetch` | Whether to fetch the remote before planning a submission, or the `jj` command to run prior to planning. Defaults to true, which is equivalent to `jj git fetch --tracked`. This may also be set to an array, for example `["git", "fetch"]` will run `jj git fetch`. Set to false to disable fetching completely. If disabled, jj-vine may recreate deleted bookmarks, so be careful when disabling this. | Boolean \| String[] | No | true |
-| `push` | Push command as full argv; remote and bookmark/change flags are appended. `false` disables pushing. A custom command should preserve jj's `Nothing changed.` stderr to report a no-op accurately. `submit --no-hooks` uses the built-in command unless pushing is disabled. | Boolean \| String[] | No | true (`jj git push`) |
+| `checks` | Repository-local submit metadata rules; merged over user config and inert unless set in the repo/workspace | Object | No | None |
 | `description` | Configuration for pull/merge request description generation | Object (see below) | No | (see below) |
+
+`checks` is an opt-in table for repository-local submit metadata gates. It is read from the repository/workspace jj configuration, merged over user configuration, and is inert when not configured. Set regexes to the values enforced by the repository's CI. `--no-checks` skips configured gates for one submit.
+
+Configured push commands stream stdout and stderr live to the terminal, with each line prefixed by `[<bookmark>]`. Stdout is also captured in full for callers that parse it. The most recent 200 stderr lines are retained for failure reports. A failed push reports its bookmark, exit status, and recent stderr. Errors use a plain report; set `RUST_BACKTRACE` to request a backtrace. Submit warns when the repository has no pre-push hook. Skipping configured metadata gates with `--no-checks` also prints a warning.
+
+```toml
+[jj-vine.checks]
+branchPattern = "^[a-z][a-z0-9-]*/rig-[0-9]+-[a-z0-9][a-z0-9-]*$"
+reservedCodenames = ["mintaka", "seal", "renovate", "dependabot", "trunk-merge", "graphite-base"]
+titlePattern = "(?i)\\bRIG-[0-9]+"
+
+[jj-vine.checks.specImpact]
+paths = ["docs/specs/", "personal/matt/docs/specs/"]
+bodyLine = "(?im)^\\s*>?\\s*spec-impact:\\s*(\\S.*)$"
+exemptBranchPrefixes = ["renovate/", "trunk-merge/"]
+```
 
 ## Description Generation / Stack Visualization{#description-generation-stack-visualization}
 
