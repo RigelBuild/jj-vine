@@ -2162,6 +2162,49 @@ mod tests {
         assert_eq!(config.github.host, "https://ghe.example/api/v3");
     }
 
+    #[test]
+    fn metadata_checks_require_repo_or_workspace_opt_in() {
+        let (temp, repo_path) = create_test_repo();
+        seed_github_config(&repo_path);
+        set_repo_config(&repo_path, "jj-vine.github.project", "owner/repo");
+        let user = temp.path().join("checks-user.toml");
+        std::fs::write(&user, "[jj-vine.checks]\ntitlePattern = 'RIG-[0-9]+'\n")
+            .expect("user checks");
+        let jj = Jujutsu::new_isolated(&repo_path, &user).expect("isolated jj");
+        assert!(load_with(&jj).expect("user only").checks.is_none());
+        jj.exec([
+            "config",
+            "set",
+            "--workspace",
+            "jj-vine.checks.reservedCodenames",
+            "['reserved']",
+        ])
+        .expect("workspace opt-in");
+        let checks = load_with(&jj)
+            .expect("workspace config")
+            .checks
+            .expect("workspace enables gates");
+        assert_eq!(checks.title_pattern.as_deref(), Some("RIG-[0-9]+"));
+        assert_eq!(checks.reserved_codenames, ["reserved"]);
+        jj.exec([
+            "config",
+            "set",
+            "--repo",
+            "jj-vine.checks.branchPattern",
+            "^feature/",
+        ])
+        .expect("repo opt-in");
+        assert_eq!(
+            load_with(&jj)
+                .expect("repo config")
+                .checks
+                .expect("repo gates")
+                .branch_pattern
+                .as_deref(),
+            Some("^feature/")
+        );
+    }
+
     /// Verify `JJ_CONFIG` both supplies and replaces the user config layer.
     #[test]
     fn config_isolation_replaces_user_layer() {

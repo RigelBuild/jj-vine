@@ -1039,3 +1039,200 @@ async fn disabled_push_create_dry_run_promises_no_push_or_mr() {
         "dry-run promises neither a bookmark push nor an MR: {output}"
     );
 }
+
+async fn submit_with_metadata_gate(
+    repo: &TestRepo<TestRepo<()>>,
+    api: &GitLabApiMock,
+    arguments: &[&str],
+) -> crate::error::Result<String> {
+    use clap::Parser as _;
+    repo.set_config("jj-vine.forge", "gitlab")
+        .set_config("jj-vine.gitlab.host", &api.base_url)
+        .set_config("jj-vine.gitlab.project", "group/project")
+        .set_config("jj-vine.gitlab.token", "test-token")
+        .set_config("jj-vine.defaultBaseBranch", "main")
+        .set_config("jj-vine.push", "false");
+    let mut argv = vec!["jj-vine", "submit"];
+    argv.extend_from_slice(arguments);
+    let mut cli = crate::cli::Cli::parse_from(argv);
+    cli.repository = Some(repo.path.clone());
+    cli.run_captured().await
+}
+
+#[tokio::test]
+async fn submit_rejects_invalid_metadata_before_configured_preparation_or_writes() {
+    let api = GitLabApiMock::start(Vec::new()).await;
+    let repo = TestRepo::with_local_remote();
+    repo.create_change("feature.txt", "feature", "fix: missing issue")
+        .create_bookmark("feature");
+    repo.set_config("jj-vine.checks.titlePattern", r"RIG-[0-9]+")
+        .set_config(
+            "jj-vine.fetch",
+            r#"["new", "main", "-m", "preparation ran"]"#,
+        );
+    let before = repo.jj.log("@").expect("working copy")[0].change_id.clone();
+    let error = submit_with_metadata_gate(&repo, &api, &["feature"])
+        .await
+        .expect_err("invalid title must reject actual submit");
+    assert!(error.to_string().contains("pr-title-issue-ref"));
+    assert_eq!(repo.jj.log("@").expect("working copy")[0].change_id, before);
+    assert!(
+        api.requests()
+            .iter()
+            .all(|request| request.line.starts_with("GET "))
+    );
+    api.stop().await;
+}
+
+#[tokio::test]
+async fn submit_dry_run_checks_and_warned_override_are_wired() {
+    let api = GitLabApiMock::start(Vec::new()).await;
+    let repo = TestRepo::with_local_remote();
+    repo.create_change("feature.txt", "feature", "fix: missing issue")
+        .create_bookmark("feature");
+    repo.set_config("jj-vine.fetch", "false")
+        .set_config("jj-vine.checks.reservedCodenames", r#"["feature"]"#);
+    let error = submit_with_metadata_gate(&repo, &api, &["feature", "--dry-run"])
+        .await
+        .expect_err("reserved-only gate must reject dry run");
+    assert!(error.to_string().contains("branch-name"));
+    let output = submit_with_metadata_gate(&repo, &api, &["feature", "--dry-run", "--no-checks"])
+        .await
+        .expect("override skips gate");
+    assert!(output.contains("skipping configured submit metadata checks (--no-checks)"));
+    assert!(
+        api.requests()
+            .iter()
+            .all(|request| request.line.starts_with("GET "))
+    );
+    repo.set_config("jj-vine.checks.titlePattern", r#""[""#);
+    let error = submit_with_metadata_gate(&repo, &api, &["feature", "--dry-run"])
+        .await
+        .expect_err("malformed gate must reject");
+    assert!(error.to_string().contains("pattern is invalid"));
+    api.stop().await;
+}
+
+#[tokio::test]
+async fn submit_checks_generated_names_and_exact_creation_body() {
+    let api = GitLabApiMock::start(Vec::new()).await;
+    let repo = TestRepo::with_local_remote();
+    repo.create_change(
+        "feature.txt",
+        "feature",
+        "fix: title RIG-42\n\nSpec-impact: none",
+    );
+    repo.set_config("jj-vine.fetch", "false")
+        .set_config("templates.git_push_bookmark", r#"'"reserved/rig-42"'"#)
+        .set_config("jj-vine.checks.reservedCodenames", r#"["reserved"]"#);
+    let error = submit_with_metadata_gate(&repo, &api, &["--create", "--dry-run"])
+        .await
+        .expect_err("actual generated reserved name must reject");
+    assert!(error.to_string().contains("reserved/rig-42"));
+    repo.set_config("templates.git_push_bookmark", r#"'"allowed/rig-42"'"#)
+        .set_config("jj-vine.checks.branchPattern", "^allowed/")
+        .set_config("jj-vine.checks.specImpact.paths", r#"["docs/specs/"]"#)
+        .set_config("jj-vine.description.enabled", "false");
+    let error = submit_with_metadata_gate(&repo, &api, &["--create", "--dry-run"])
+        .await
+        .expect_err("commit body must not substitute disabled outgoing body");
+    assert!(error.to_string().contains("spec-impact"), "{error}");
+    repo.set_config("jj-vine.description.enabled", "true")
+        .set_config("jj-vine.description.singleRevision", "none");
+    let error = submit_with_metadata_gate(&repo, &api, &["--create", "--dry-run"])
+        .await
+        .expect_err("none mode cannot use commit body");
+    assert!(error.to_string().contains("spec-impact"));
+    repo.set_config("jj-vine.description.enabled", "true")
+        .set_config("jj-vine.description.singleRevision", "notFirstLine");
+    submit_with_metadata_gate(&repo, &api, &["--create", "--dry-run"])
+        .await
+        .expect("conforming generated name and outgoing declaration");
+    api.stop().await;
+}
+
+#[tokio::test]
+async fn submit_checks_preserved_body_instead_of_commit_declaration() {
+    let api = GitLabApiMock::start(vec![gitlab_mr(1, 1, "feature", "main")]).await;
+    let repo = TestRepo::with_local_remote();
+    repo.create_change(
+        "feature.txt",
+        "feature",
+        "fix: title RIG-42\n\nSpec-impact: none",
+    )
+    .create_bookmark("feature");
+    repo.set_config("jj-vine.fetch", "false")
+        .set_config("jj-vine.description.sync", "false")
+        .set_config("jj-vine.checks.specImpact.paths", r#"["docs/specs/"]"#);
+    let error = submit_with_metadata_gate(&repo, &api, &["feature", "--dry-run"])
+        .await
+        .expect_err("preserved MR body has no declaration");
+    assert!(error.to_string().contains("spec-impact"));
+    api.stop().await;
+}
+
+#[tokio::test]
+async fn submit_spec_gate_uses_net_diff_not_reverted_commit_changes() {
+    let api = GitLabApiMock::start(Vec::new()).await;
+    let repo = TestRepo::with_local_remote();
+    std::fs::create_dir_all(repo.path.join("docs/specs")).expect("spec directory");
+    repo.create_change("docs/specs/spec.md", "specification", "fix: spec RIG-42")
+        .create_bookmark("feature");
+    repo.set_config("jj-vine.fetch", "false")
+        .set_config("jj-vine.description.enabled", "false")
+        .set_config("jj-vine.checks.specImpact.paths", r#"["docs/specs/"]"#);
+    submit_with_metadata_gate(&repo, &api, &["feature", "--dry-run"])
+        .await
+        .expect("surviving spec change passes without body");
+    repo.new_on("feature");
+    std::fs::remove_file(repo.path.join("docs/specs/spec.md")).expect("revert spec addition");
+    repo.jj
+        .exec(["describe", "-m", "fix: revert spec RIG-42"])
+        .expect("revert description");
+    repo.jj
+        .exec(["bookmark", "set", "feature", "-r", "@"])
+        .expect("advance bookmark");
+    let error = submit_with_metadata_gate(&repo, &api, &["feature", "--dry-run"])
+        .await
+        .expect_err("reverted spec change must not exempt PR");
+    assert!(error.to_string().contains("spec-impact"));
+    api.stop().await;
+}
+
+#[tokio::test]
+async fn submit_file_body_and_full_message_title_use_real_payload() {
+    let api = GitLabApiMock::start(Vec::new()).await;
+    let repo = TestRepo::with_local_remote();
+    repo.create_change(
+        "feature.txt",
+        "feature",
+        "fix: missing reference\n\nRefs RIG-42",
+    )
+    .create_bookmark("feature");
+    std::fs::write(repo.path.join("pr-body.md"), "Spec-impact: none\n").expect("body file");
+    repo.set_config("jj-vine.fetch", "false")
+        .set_config("jj-vine.title.singleRevision", "firstRevisionFullMessage")
+        .set_config("jj-vine.checks.titlePattern", "RIG-[0-9]+")
+        .set_config("jj-vine.description.singleRevision", "file(pr-body.md)")
+        .set_config("jj-vine.checks.specImpact.paths", r#"["docs/specs/"]"#);
+    let error = submit_with_metadata_gate(&repo, &api, &["feature", "--dry-run"])
+        .await
+        .expect_err("body reference must not pass first-line title check");
+    assert!(error.to_string().contains("pr-title-issue-ref"));
+    repo.jj
+        .exec(["describe", "-r", "feature", "-m", "fix: title RIG-42"])
+        .expect("valid title");
+    submit_with_metadata_gate(&repo, &api, &["feature", "--dry-run"])
+        .await
+        .expect("root-based file content is actual outgoing body");
+    std::fs::write(
+        repo.path.join("pr-body.md"),
+        "Spec-impact:\n\nUnrelated notes\n",
+    )
+    .expect("empty declaration");
+    let error = submit_with_metadata_gate(&repo, &api, &["feature", "--dry-run"])
+        .await
+        .expect_err("next physical line is not a declaration");
+    assert!(error.to_string().contains("spec-impact"));
+    api.stop().await;
+}

@@ -468,7 +468,7 @@ impl PushStderrTail {
     fn extend(&mut self, chunk: &[u8]) {
         for &byte in chunk {
             self.bytes.push_back(byte);
-            self.newlines += usize::from(byte == b'\n');
+            self.newlines = self.newlines.saturating_add(usize::from(byte == b'\n'));
             while self.bytes.len() > PUSH_STDERR_TAIL_BYTES
                 || self
                     .newlines
@@ -523,7 +523,7 @@ fn run_push_command_with_forward(
         });
         let stderr_reader = scope.spawn(|| {
             read_push_stream(stderr, label, forward, |chunk| {
-                captured_stderr.extend(chunk)
+                captured_stderr.extend(chunk);
             })
         });
         // Both pipes keep draining even when forwarding fails, so waiting cannot
@@ -1045,6 +1045,20 @@ impl Jujutsu {
         Ok(!output.stderr.contains("Nothing changed."))
     }
 
+    /// Resolve the bookmark name using the same template as `jj git push -c`.
+    pub(crate) fn generated_push_bookmark(&self, change_id: &str) -> Result<String> {
+        let template = self.exec(["config", "get", "templates.git_push_bookmark"])?;
+        let output = self.exec([
+            "log",
+            "--no-graph",
+            "-r",
+            change_id,
+            "-T",
+            template.stdout.trim(),
+        ])?;
+        Ok(output.stdout)
+    }
+
     /// Create bookmarks for changes and push them through `push_argv`.
     pub fn push_changes_create(
         &self,
@@ -1060,7 +1074,11 @@ impl Jujutsu {
         if push_argv == ["jj", "git", "push"] {
             self.exec(args.iter().skip(1))?;
         } else {
-            self.exec_push(&args, &change_ids)?;
+            let identities = change_ids
+                .iter()
+                .map(|id| self.generated_push_bookmark(id))
+                .collect::<Result<Vec<_>>>()?;
+            self.exec_push(&args, &identities)?;
         }
 
         Ok(())
@@ -1244,7 +1262,7 @@ mod tests {
             sender.send(result).expect("send push result");
         });
         let output = receiver
-            .recv_timeout(std::time::Duration::from_secs(30))
+            .recv_timeout(core::time::Duration::from_secs(30))
             .expect("both pipes must drain without deadlock")
             .expect("push succeeds");
         assert!(output.status.success());
@@ -1298,12 +1316,12 @@ mod tests {
     fn push_stream_preserves_split_utf8_without_final_newline() {
         struct SplitUtf8(usize);
         impl std::io::Read for SplitUtf8 {
-            fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
                 let bytes = "a€tail".as_bytes();
                 if self.0 == bytes.len() {
                     return Ok(0);
                 }
-                output[0] = bytes[self.0];
+                buf[0] = bytes[self.0];
                 self.0 += 1;
                 Ok(1)
             }

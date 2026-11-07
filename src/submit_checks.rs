@@ -1,64 +1,88 @@
-use std::{collections::HashSet, path::Path};
+use std::collections::HashMap;
 
 use regex::Regex;
 use snafu::whatever;
 
 use crate::{
-    bookmark::BookmarkGraph,
+    bookmark::{BookmarkGraph, JJName as _},
     config::{Config, SpecImpactCheckConfig, SubmitChecksConfig},
     error::{ConfigSnafu, Result},
-    jj::{Change, Jujutsu},
-    title::get_mr_title,
+    jj::Jujutsu,
+    submit::{
+        execute::{Action, BookmarkNameOrPendingChangeId},
+        plan::SubmissionPlan,
+    },
 };
 
-const DEFAULT_SPEC_IMPACT_PATTERN: &str = r"(?im)^\s*>?\s*spec-impact:\s*(\S.*)$";
+const DEFAULT_SPEC_IMPACT_PATTERN: &str = r"(?im)^[\t ]*>?[\t ]*spec-impact:[\t ]*([^\r\n]+)$";
 
-/// Validate configured metadata gates before submit performs forge calls or
-/// pushes.
+/// Validate the effective planned PR metadata before any push or fetch.
 pub fn check_submission(
     jj: &Jujutsu,
     config: &Config,
     graph: &BookmarkGraph<'_>,
-    repository_root: &Path,
+    plan: &SubmissionPlan,
 ) -> Result<()> {
     let Some(checks) = config.checks.as_ref() else {
         return Ok(());
     };
     let checks = CompiledChecks::new(checks)?;
-    let root_base_bookmark = config.default_base_branch.as_deref().map(|branch| {
-        let branch = crate::jj::revset_string_literal(branch);
-        let remote = crate::jj::revset_string_literal(&config.remote_name);
-        format!("coalesce(remote_bookmarks(exact:{branch}, exact:{remote}), trunk())")
-    });
+    let metadata = planned_metadata(plan);
 
     for component in graph.components() {
         for bookmark in component.all_bookmarks() {
-            let branch = bookmark.name();
-            checks.check_branch(branch)?;
-            let revisions = bookmark.revisions(jj, root_base_bookmark.as_deref())?;
-            let title = get_mr_title(jj, config, bookmark, component, &revisions)?;
+            let branch = if bookmark.is_pending() {
+                jj.generated_push_bookmark(bookmark.bookmark.change_id())?
+            } else {
+                bookmark.name().to_owned()
+            };
+            checks.check_branch(&branch)?;
+            let key = BookmarkNameOrPendingChangeId::new_from_pointer(bookmark).to_string();
+            let (title, body, target_branch) = metadata.get(&key).ok_or_else(|| {
+                ConfigSnafu {
+                    message: format!("no planned PR metadata for {branch}"),
+                }
+                .build()
+            })?;
+            let title = if bookmark.is_pending() {
+                title.replace(bookmark.name(), &branch)
+            } else {
+                title.clone()
+            };
             checks.check_title(&title)?;
 
             if let Some(spec_impact) = &checks.spec_impact {
-                if spec_impact.is_exempt(branch) {
+                if spec_impact.is_exempt(&branch) {
                     continue;
                 }
-                let generated_body = crate::description::generate_description(
-                    &config.description,
-                    &revisions,
-                    repository_root,
-                );
-                let body = if generated_body.trim().is_empty() {
-                    revisions
-                        .first()
-                        .map_or("", Change::description_not_first_line)
-                } else {
-                    generated_body.as_str()
-                };
                 let changed_spec = if spec_impact.config.paths.is_empty() {
                     false
                 } else {
-                    changed_paths(jj, &revisions)?.iter().any(|path| {
+                    let from = match bookmark.parents.first() {
+                        Some(crate::bookmark::BookmarkRef::Bookmark(parent))
+                            if parent.name() == target_branch =>
+                        {
+                            parent.name_for_jj()
+                        }
+                        _ => {
+                            let base = crate::jj::revset_string_literal(target_branch);
+                            let remote = crate::jj::revset_string_literal(&config.remote_name);
+                            format!(
+                                "coalesce(remote_bookmarks(exact:{base}, exact:{remote}), bookmarks(exact:{base}), trunk())"
+                            )
+                        }
+                    };
+                    jj.exec([
+                        "diff",
+                        "--from",
+                        &from,
+                        "--to",
+                        &bookmark.name_for_jj(),
+                        "--name-only",
+                    ])?
+                    .stdout
+                    .lines()
+                    .any(|path| {
                         spec_impact
                             .config
                             .paths
@@ -66,7 +90,7 @@ pub fn check_submission(
                             .any(|prefix| path.starts_with(prefix))
                     })
                 };
-                spec_impact.check(branch, body, changed_spec)?;
+                spec_impact.check(&branch, body, changed_spec)?;
             }
         }
     }
@@ -74,24 +98,52 @@ pub fn check_submission(
     Ok(())
 }
 
-fn changed_paths(jj: &Jujutsu, revisions: &[Change]) -> Result<HashSet<String>> {
-    let mut paths = HashSet::new();
-    for revision in revisions {
-        let output = jj.exec([
-            "diff",
-            "--revisions",
-            revision.change_id.as_str(),
-            "--name-only",
-        ])?;
-        paths.extend(
-            output
-                .stdout
-                .lines()
-                .filter(|path| !path.is_empty())
-                .map(str::to_owned),
-        );
+fn planned_metadata(plan: &SubmissionPlan) -> HashMap<String, (String, String, String)> {
+    let mut metadata = plan
+        .existing_mrs
+        .iter()
+        .map(|(branch, mr)| {
+            (
+                branch.clone(),
+                (
+                    mr.title().to_owned(),
+                    mr.description().to_owned(),
+                    mr.target_branch().to_owned(),
+                ),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    for action in plan.actions.iter().flatten() {
+        match action {
+            Action::CreateMR(action) => {
+                metadata.insert(
+                    action.bookmark.to_string(),
+                    (
+                        action.title.clone(),
+                        action.description.clone(),
+                        action.target_branch.clone(),
+                    ),
+                );
+            }
+            Action::UpdateMRTitleDescription(action) => {
+                if let Some((title, body, _)) = metadata.get_mut(&action.bookmark.to_string()) {
+                    if let Some(new_title) = &action.title {
+                        title.clone_from(new_title);
+                    }
+                    if let Some(new_body) = &action.description {
+                        body.clone_from(new_body);
+                    }
+                }
+            }
+            Action::UpdateMRBase(action) => {
+                if let Some((_, _, base)) = metadata.get_mut(&action.bookmark) {
+                    base.clone_from(&action.new_target_branch);
+                }
+            }
+            _ => {}
+        }
     }
-    Ok(paths)
+    metadata
 }
 
 struct CompiledChecks {
@@ -124,16 +176,16 @@ impl CompiledChecks {
     }
 
     fn check_branch(&self, branch: &str) -> Result<()> {
-        let Some(pattern) = &self.branch else {
-            return Ok(());
-        };
         let codename = branch.split('/').next().unwrap_or_default();
         if self
             .config
             .reserved_codenames
             .iter()
             .any(|reserved| reserved == codename)
-            || !pattern.is_match(branch)
+            || self
+                .branch
+                .as_ref()
+                .is_some_and(|pattern| !pattern.is_match(branch))
         {
             whatever!(
                 "submit check failed: branch-name value '{branch}'; expected a branch matching '{}' with a non-reserved codename; use a conforming bookmark name",
@@ -147,6 +199,7 @@ impl CompiledChecks {
         let Some(pattern) = &self.title else {
             return Ok(());
         };
+        let title = title.lines().next().unwrap_or_default();
         if !pattern.is_match(title) {
             whatever!(
                 "submit check failed: pr-title-issue-ref value '{title}'; expected a title matching '{}'; add the required issue reference to the commit subject",
@@ -194,10 +247,12 @@ impl CompiledSpecImpact {
     }
 
     fn has_declaration(&self, body: &str) -> bool {
-        self.body_line
-            .captures(body)
-            .and_then(|captures| captures.get(1))
-            .is_some_and(|value| !value.as_str().trim().is_empty())
+        body.lines().any(|line| {
+            self.body_line
+                .captures(line)
+                .and_then(|captures| captures.get(1))
+                .is_some_and(|value| !value.as_str().trim().is_empty())
+        })
     }
 }
 
@@ -225,7 +280,11 @@ mod tests {
             std::collections::BTreeMap::default(),
             &std::collections::BTreeMap::default(),
         );
-        assert!(check_submission(&jj, &config, &graph, Path::new(".")).is_ok());
+        let plan = SubmissionPlan {
+            actions: Vec::new(),
+            existing_mrs: HashMap::new(),
+        };
+        assert!(check_submission(&jj, &config, &graph, &plan).is_ok());
     }
 
     #[test]
@@ -261,6 +320,11 @@ mod tests {
                 .is_ok()
         );
         assert!(compiled.check_title("fix: report push output").is_err());
+        assert!(
+            compiled
+                .check_title("fix: missing reference\n\nRefs RIG-42")
+                .is_err()
+        );
     }
 
     #[test]
@@ -288,6 +352,10 @@ mod tests {
         );
         assert!(
             spec.check("hudson/rig-42-fix-leak", "Spec-impact:\n", false)
+                .is_err()
+        );
+        assert!(
+            spec.check("feature", "Spec-impact:\n\nUnrelated notes", false)
                 .is_err()
         );
         assert!(
