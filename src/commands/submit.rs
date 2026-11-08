@@ -39,6 +39,10 @@ use crate::{
     },
 };
 
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "submit options are independent CLI flags"
+)]
 #[derive(Args, Default)]
 pub struct SubmitCommandConfig {
     /// Options for the revset.
@@ -59,6 +63,10 @@ pub struct SubmitCommandConfig {
     /// command.
     #[arg(long)]
     pub no_hooks: bool,
+
+    /// Skip configured local metadata checks before submission.
+    #[arg(long)]
+    pub no_checks: bool,
 
     /// Show the submission plan and do not execute it.
     #[arg(long, conflicts_with = "dry_run")]
@@ -170,28 +178,21 @@ pub struct SubmitCommandRevsetOptions {
 /// # Panics
 ///
 /// Can panic for many reasons.
+pub async fn submit(config: &SubmitCommandConfig, cli_config: &CliConfig<'_>) -> Result<()> {
+    submit_prepared(config, cli_config, false).await
+}
+
 #[expect(clippy::too_many_lines, reason = "important")]
 // #[expect(clippy::cognitive_complexity, reason = "main logic, it's fine")]
-pub async fn submit(config: &SubmitCommandConfig, cli_config: &CliConfig<'_>) -> Result<()> {
+async fn submit_prepared(
+    config: &SubmitCommandConfig,
+    cli_config: &CliConfig<'_>,
+    fetched: bool,
+) -> Result<()> {
     let jj = Jujutsu::new(&cli_config.repository)?;
     let mut output = cli_config.output;
 
     let repo_config = Config::load(&cli_config.repository)?;
-
-    if let Some(mut fetch_args) = repo_config.fetch.to_args() {
-        if let Some(remote) = config.remote.as_deref() {
-            fetch_args.extend_from_slice(&["--remote", remote]);
-        }
-
-        if config.dry_run {
-            output.log_message(&format!(
-                "Would run `jj {}` before planning (note that the plan may change based on newly fetched data!)",
-                fetch_args.join(" "),
-            ));
-        } else {
-            jj.exec(fetch_args)?;
-        }
-    }
 
     let merged_boundary_revset = repo_config.merged_boundary_revset();
     let revset = config
@@ -241,6 +242,7 @@ pub async fn submit(config: &SubmitCommandConfig, cli_config: &CliConfig<'_>) ->
         config.revset_options.tracked,
         &merged_boundary_revset,
     )?;
+    warn_if_no_pre_push_hook(&jj, &cli_config.repository, output);
     announce_submission_graph(
         &bookmark_graph,
         &bookmarks,
@@ -260,6 +262,32 @@ pub async fn submit(config: &SubmitCommandConfig, cli_config: &CliConfig<'_>) ->
         dry_run: config.dry_run,
     })
     .await?;
+    if config.no_checks {
+        if repo_config.checks.is_some() {
+            output.log_message("warning: skipping configured submit metadata checks (--no-checks)");
+        }
+    } else {
+        crate::submit_checks::check_submission(
+            &jj,
+            &repo_config,
+            &bookmark_graph,
+            &submission_plan,
+        )?;
+    }
+    if !fetched && let Some(mut fetch_args) = repo_config.fetch.to_args() {
+        if let Some(remote) = config.remote.as_deref() {
+            fetch_args.extend_from_slice(&["--remote", remote]);
+        }
+        if config.dry_run {
+            output.log_message(&format!(
+                "Would run `jj {}` after metadata validation",
+                fetch_args.join(" ")
+            ));
+        } else {
+            jj.exec(fetch_args)?;
+            return Box::pin(submit_prepared(config, cli_config, true)).await;
+        }
+    }
 
     if config.show_plan {
         writeln!(output, "Submission plan:\n{submission_plan}")?;
@@ -855,5 +883,149 @@ where
         }
 
         Cow::Owned(lines.join("\n"))
+    }
+}
+
+fn warn_if_no_pre_push_hook(
+    jj: &Jujutsu,
+    repository: &std::path::Path,
+    output: &impl crate::output::Output,
+) {
+    let hook = jj.exec(["git", "root"]).ok().and_then(|git_root| {
+        let workspace_root = jj.exec(["root"]).ok()?;
+        let git_path = std::path::Path::new(git_root.stdout.trim());
+        let root = git_path
+            .file_name()
+            .filter(|name| *name == ".git")
+            .and_then(|_| git_path.parent())
+            .unwrap_or_else(|| std::path::Path::new(workspace_root.stdout.trim()));
+        let result = std::process::Command::new("git")
+            .current_dir(root)
+            .arg("--git-dir")
+            .arg(git_root.stdout.trim())
+            .args([
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-path",
+                "hooks/pre-push",
+            ])
+            .output()
+            .ok()?;
+        result
+            .status
+            .success()
+            .then(|| std::path::PathBuf::from(String::from_utf8_lossy(&result.stdout).trim()))
+    });
+    let usable = hook.is_some_and(|path| {
+        if !path.is_file() {
+            return false;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            path.metadata()
+                .is_ok_and(|metadata| metadata.permissions().mode() & 0o111 != 0)
+        }
+        #[cfg(not(unix))]
+        {
+            true
+        }
+    });
+    if !usable {
+        let name = repository
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("repository");
+        output.log_message(&format!(
+            "warning: {name} has no pre-push hook; nothing checks this push before CI"
+        ));
+    }
+}
+
+#[cfg(test)]
+mod hook_warning_tests {
+    use super::warn_if_no_pre_push_hook;
+    use crate::{output::BufferedOutput, tests::TestRepo};
+
+    #[test]
+    fn warns_when_neither_git_hook_nor_hk_config_exists() {
+        let repo = TestRepo::new();
+        let hooks_path = repo.path.join(".git/hooks");
+        std::fs::create_dir_all(&hooks_path).expect("git hooks directory");
+        let output = BufferedOutput::new();
+
+        warn_if_no_pre_push_hook(&repo.jj, &repo.path, &output);
+
+        assert!(output.get_buffer().contains("has no pre-push hook"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_hook_paths_and_secondary_workspaces_are_resolved() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let repo = TestRepo::new();
+        let git_root = repo.jj.exec(["git", "root"]).expect("git root");
+        let git_root = git_root.stdout.trim();
+        let install = |directory: &std::path::Path| {
+            std::fs::create_dir_all(directory).expect("hook directory");
+            let hook = directory.join("pre-push");
+            std::fs::write(&hook, "#!/bin/sh\nexit 0\n").expect("hook");
+            std::fs::set_permissions(hook, std::fs::Permissions::from_mode(0o755))
+                .expect("executable");
+        };
+        let probe = |jj: &crate::jj::Jujutsu, path: &std::path::Path| {
+            let output = BufferedOutput::new();
+            warn_if_no_pre_push_hook(jj, path, &output);
+            assert_eq!(output.get_buffer(), "");
+        };
+        install(&std::path::Path::new(git_root).join("hooks"));
+        probe(&repo.jj, &repo.path);
+        let workspace = repo.path.join("secondary");
+        repo.jj
+            .exec([
+                "workspace",
+                "add",
+                workspace.to_str().expect("workspace path"),
+            ])
+            .expect("workspace");
+        let secondary = crate::jj::Jujutsu::new(&workspace).expect("secondary jj");
+        probe(&secondary, &workspace);
+        std::fs::remove_file(std::path::Path::new(git_root).join("hooks/pre-push"))
+            .expect("remove default hook before custom path probes");
+        for path in [
+            ".custom-hooks".to_owned(),
+            repo.path
+                .join("absolute-hooks")
+                .to_string_lossy()
+                .into_owned(),
+        ] {
+            install(&repo.path.join(&path));
+            let status = std::process::Command::new("git")
+                .arg("--git-dir")
+                .arg(git_root)
+                .args(["config", "core.hooksPath", &path])
+                .status()
+                .expect("git config");
+            assert!(status.success());
+            probe(&repo.jj, &repo.path);
+            probe(&secondary, &workspace);
+            std::fs::remove_file(repo.path.join(&path).join("pre-push"))
+                .expect("remove custom hook");
+            install(&std::path::Path::new(git_root).join("hooks"));
+            let output = BufferedOutput::new();
+            warn_if_no_pre_push_hook(&repo.jj, &repo.path, &output);
+            assert!(output.get_buffer().contains("has no pre-push hook"));
+            std::fs::remove_file(std::path::Path::new(git_root).join("hooks/pre-push"))
+                .expect("remove default hook again");
+        }
+    }
+
+    #[test]
+    fn hk_config_alone_does_not_suppress_warning() {
+        let repo = TestRepo::new();
+        std::fs::write(repo.path.join("hk.pkl"), "// no installed hook").expect("hk config");
+        let output = BufferedOutput::new();
+        warn_if_no_pre_push_hook(&repo.jj, &repo.path, &output);
+        assert!(output.get_buffer().contains("has no pre-push hook"));
     }
 }

@@ -206,6 +206,10 @@ pub struct Config {
     #[builder(default)]
     pub push: RepoPushConfig,
 
+    /// Checks to run before submitting bookmarks or pull requests.
+    #[serde(default)]
+    pub checks: Option<SubmitChecksConfig>,
+
     /// Configuration for MR title generation.
     #[serde(default)]
     #[builder(default)]
@@ -319,6 +323,44 @@ pub(crate) fn push_description(push_argv: Option<&[String]>) -> &'static str {
     } else {
         "via configured push command"
     }
+}
+
+/// Configured metadata checks that run before submit actions.
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SubmitChecksConfig {
+    /// Regular expression required to match each submitted branch name.
+    #[serde(default)]
+    pub branch_pattern: Option<String>,
+
+    /// Branch-name codenames that are reserved and cannot be submitted.
+    #[serde(default)]
+    pub reserved_codenames: Vec<String>,
+
+    /// Regular expression required to match each generated pull request title.
+    #[serde(default)]
+    pub title_pattern: Option<String>,
+
+    /// Rules for requiring spec impact in the generated pull request body.
+    #[serde(default)]
+    pub spec_impact: Option<SpecImpactCheckConfig>,
+}
+
+/// Configured paths and body line for the spec-impact check.
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SpecImpactCheckConfig {
+    /// File path prefixes that satisfy the spec-impact check.
+    #[serde(default)]
+    pub paths: Vec<String>,
+
+    /// Regular expression that recognizes a declared spec-impact line.
+    #[serde(default)]
+    pub body_line: Option<String>,
+
+    /// Branch prefixes exempt from the spec-impact requirement.
+    #[serde(default)]
+    pub exempt_branch_prefixes: Vec<String>,
 }
 
 #[cfg(test)]
@@ -1083,6 +1125,25 @@ pub(crate) fn is_https_host(host: &str) -> bool {
         .is_some_and(|scheme| scheme.eq_ignore_ascii_case("https://"))
 }
 
+fn repository_checks_config(
+    jj: &Jujutsu,
+    checks: Option<SubmitChecksConfig>,
+) -> Result<Option<SubmitChecksConfig>> {
+    // Metadata gates are opt-in per checkout, even when a user config sets them.
+    let check_sources = jj.exec([
+        "config",
+        "list",
+        "--template",
+        r#"name ++ "\t" ++ source ++ "\n""#,
+        "jj-vine.checks",
+    ])?;
+    let repo_checks_configured = check_sources.stdout.lines().any(|line| {
+        line.split_once('\t')
+            .is_some_and(|(_, source)| matches!(source, "repo" | "workspace"))
+    });
+    Ok(repo_checks_configured.then_some(checks).flatten())
+}
+
 impl Config {
     /// Load configuration from jj config.
     pub fn load(repo_path: impl Into<PathBuf>) -> Result<Self> {
@@ -1108,12 +1169,14 @@ impl Config {
             .build()
         })?;
 
-        let mut config: Config = jj_vine_value.clone().try_into().map_err(|e| {
+        let config: Config = jj_vine_value.clone().try_into().map_err(|e| {
             ConfigSnafu {
                 message: format!("Failed to parse jj-vine config: {e}"),
             }
             .build()
         })?;
+        let mut config = config;
+        config.checks = repository_checks_config(jj, config.checks)?;
 
         // Clone-explicit values win; derived values supersede global ones, and
         // empty values derive. A target derives only from a fetch URL provably
@@ -2097,6 +2160,49 @@ mod tests {
         let config = load_isolated(&repo_path).expect("load without a remote");
 
         assert_eq!(config.github.host, "https://ghe.example/api/v3");
+    }
+
+    #[test]
+    fn metadata_checks_require_repo_or_workspace_opt_in() {
+        let (temp, repo_path) = create_test_repo();
+        seed_github_config(&repo_path);
+        set_repo_config(&repo_path, "jj-vine.github.project", "owner/repo");
+        let user = temp.path().join("checks-user.toml");
+        std::fs::write(&user, "[jj-vine.checks]\ntitlePattern = 'RIG-[0-9]+'\n")
+            .expect("user checks");
+        let jj = Jujutsu::new_isolated(&repo_path, &user).expect("isolated jj");
+        assert!(load_with(&jj).expect("user only").checks.is_none());
+        jj.exec([
+            "config",
+            "set",
+            "--workspace",
+            "jj-vine.checks.reservedCodenames",
+            "['reserved']",
+        ])
+        .expect("workspace opt-in");
+        let checks = load_with(&jj)
+            .expect("workspace config")
+            .checks
+            .expect("workspace enables gates");
+        assert_eq!(checks.title_pattern.as_deref(), Some("RIG-[0-9]+"));
+        assert_eq!(checks.reserved_codenames, ["reserved"]);
+        jj.exec([
+            "config",
+            "set",
+            "--repo",
+            "jj-vine.checks.branchPattern",
+            "^feature/",
+        ])
+        .expect("repo opt-in");
+        assert_eq!(
+            load_with(&jj)
+                .expect("repo config")
+                .checks
+                .expect("repo gates")
+                .branch_pattern
+                .as_deref(),
+            Some("^feature/")
+        );
     }
 
     /// Verify `JJ_CONFIG` both supplies and replaces the user config layer.

@@ -237,7 +237,7 @@ pub async fn plan(ctx: PlanContext<'_>) -> Result<SubmissionPlan> {
                 let description = generate_description(
                     &ctx.config.description,
                     &revisions,
-                    Path::new(&ctx.jj.exec(["root"])?.stdout),
+                    Path::new(ctx.jj.exec(["root"])?.stdout.trim()),
                 );
 
                 let create_mr_action = CreateMRAction::builder()
@@ -309,7 +309,7 @@ pub async fn plan(ctx: PlanContext<'_>) -> Result<SubmissionPlan> {
                                 let new_description = generate_description(
                                     &ctx.config.description,
                                     &revisions,
-                                    Path::new(&ctx.jj.exec(["root"])?.stdout),
+                                    Path::new(ctx.jj.exec(["root"])?.stdout.trim()),
                                 );
 
                                 if new_description.trim()

@@ -24,7 +24,7 @@ use crate::{
     },
     error::{ClonableError, Error, Result},
     forge::AnyForgeMergeRequest,
-    jj::{BookmarkInfo, Change},
+    jj::Change,
     submit::{
         ExecuteContext,
         RootExecuteContext,
