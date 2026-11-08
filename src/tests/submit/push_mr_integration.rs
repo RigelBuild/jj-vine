@@ -1341,3 +1341,61 @@ async fn submit_spec_gate_ignores_root_and_stacked_base_only_changes() {
         api.stop().await;
     }
 }
+
+async fn assert_missing_body_file_fails_before_writes(scenario: &str) {
+    let mrs = if scenario == "existing" {
+        vec![gitlab_mr(1, 1, "feature", "main")]
+    } else {
+        Vec::new()
+    };
+    let api = GitLabApiMock::start(mrs).await;
+    let repo = TestRepo::with_local_remote();
+    repo.create_change("feature.txt", "feature", "fix: body RIG-42")
+        .create_bookmark("feature");
+    if scenario == "multiple-revisions" {
+        repo.new_on("feature");
+        repo.create_change("second.txt", "second", "fix: second RIG-42");
+        repo.jj
+            .exec(["bookmark", "set", "feature", "-r", "@"])
+            .expect("advance multi-revision bookmark");
+    }
+    let mode = if scenario == "multiple-revisions" {
+        "jj-vine.description.multipleRevisions"
+    } else {
+        "jj-vine.description.singleRevision"
+    };
+    repo.set_config("jj-vine.fetch", "false")
+        .set_config("jj-vine.description.sync", "true")
+        .set_config(mode, "file(missing-body.md)")
+        .set_config("jj-vine.push", r#"["sh", "-c", "touch push-ran", "--"]"#);
+    let error = submit_with_metadata_gate(&repo, &api, &["feature"])
+        .await
+        .expect_err("missing body must reject submission");
+    assert!(
+        error.to_string().contains("missing-body.md"),
+        "{scenario}: {error}"
+    );
+    assert!(!repo.path.join("push-ran").exists(), "{scenario}");
+    assert!(
+        api.requests()
+            .iter()
+            .all(|request| request.line.starts_with("GET ")),
+        "{scenario}"
+    );
+    api.stop().await;
+}
+
+#[tokio::test]
+async fn submit_missing_body_file_fails_before_push_or_forge_write() {
+    assert_missing_body_file_fails_before_writes("new").await;
+}
+
+#[tokio::test]
+async fn submit_missing_body_file_existing_mr_fails_before_writes() {
+    assert_missing_body_file_fails_before_writes("existing").await;
+}
+
+#[tokio::test]
+async fn submit_missing_body_file_multiple_revisions_fails_before_writes() {
+    assert_missing_body_file_fails_before_writes("multiple-revisions").await;
+}

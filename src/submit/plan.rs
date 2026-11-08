@@ -238,7 +238,7 @@ pub async fn plan(ctx: PlanContext<'_>) -> Result<SubmissionPlan> {
                     &ctx.config.description,
                     &revisions,
                     Path::new(ctx.jj.exec(["root"])?.stdout.trim()),
-                );
+                )?;
 
                 let create_mr_action = CreateMRAction::builder()
                     .bookmark(BookmarkNameOrPendingChangeId::new_from_pointer(bookmark))
@@ -310,7 +310,7 @@ pub async fn plan(ctx: PlanContext<'_>) -> Result<SubmissionPlan> {
                                     &ctx.config.description,
                                     &revisions,
                                     Path::new(ctx.jj.exec(["root"])?.stdout.trim()),
-                                );
+                                )?;
 
                                 if new_description.trim()
                                     == remove_jj_vine_stack_from_description(current_description)
