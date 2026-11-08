@@ -733,9 +733,9 @@ pub fn generate_description(
     config: &DescriptionConfig,
     branch_commits: impl AsRef<[Change]>,
     repository_root: &Path,
-) -> String {
+) -> Result<String> {
     if !config.enabled {
-        return String::new();
+        return Ok(String::new());
     }
 
     let mut branch_commits = toposort(
@@ -747,7 +747,7 @@ pub fn generate_description(
     // We want the head commit first, not any leaf
     branch_commits.reverse();
 
-    match &branch_commits[..] {
+    Ok(match &branch_commits[..] {
         [] => String::new(),
         [single_commit] => match &config.single_revision {
             DescriptionMode::None => String::new(),
@@ -780,7 +780,7 @@ pub fn generate_description(
                     .join("\n")
                     .trim_end_matches('\\')
             ),
-            DescriptionMode::File(path) => read_file(repository_root, Path::new(path)),
+            DescriptionMode::File(path) => read_file(repository_root, Path::new(path))?,
         },
         [head_commit, ..] => match &config.multiple_revisions {
             DescriptionMode::None => String::new(),
@@ -817,13 +817,19 @@ pub fn generate_description(
                     )
                 })
                 .join("\n"),
-            DescriptionMode::File(path) => read_file(repository_root, Path::new(path)),
+            DescriptionMode::File(path) => read_file(repository_root, Path::new(path))?,
         },
-    }
+    })
 }
 
-fn read_file(repository_root: &Path, path: &Path) -> String {
-    std::fs::read_to_string(repository_root.join(path)).unwrap_or_default()
+fn read_file(repository_root: &Path, path: &Path) -> Result<String> {
+    let path = repository_root.join(path);
+    std::fs::read_to_string(&path).map_err(|error| {
+        crate::error::make_whatever!(
+            "Failed to read description file {}: {error}",
+            path.display()
+        )
+    })
 }
 
 /// Renders 1 or more links that compare a bookmark with its parent. Used
@@ -894,6 +900,23 @@ mod tests {
         forge::test::{MergeRequest, TestForge},
         jj::Change,
     };
+
+    fn generate_description(
+        config: &DescriptionConfig,
+        commits: impl AsRef<[Change]>,
+        root: &Path,
+    ) -> String {
+        super::generate_description(config, commits, root).expect("description")
+    }
+
+    #[test]
+    fn missing_body_file_names_resolved_path() {
+        let repo = crate::tests::TestRepo::new();
+        let path = repo.path.join("missing-body.md");
+        let error = read_file(&repo.path, Path::new("missing-body.md"))
+            .expect_err("missing body must fail");
+        assert!(error.to_string().contains(&path.display().to_string()));
+    }
 
     #[test]
     fn parse_empty_description() {

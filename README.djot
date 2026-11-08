@@ -592,6 +592,8 @@ Message line 3
 
 Include the contents of a file at the given path as the description. This is useful if you use pull request templates. For example, `file(.github/pull_request_template.md)` will include the contents of `.github/pull_request_template.md` as the description. The file path is relative to the root of the repository.
 
+If the file cannot be read, submit fails before pushing and reports the file path.
+
 ## Title Generation{#title-generation}
 
 `jj-vine` will automatically generate a title for a pull/merge request when it is created. It can also optionally sync the title of a pull/merge request every time the bookmark is submitted (default on).

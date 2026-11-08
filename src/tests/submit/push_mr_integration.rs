@@ -1341,3 +1341,28 @@ async fn submit_spec_gate_ignores_root_and_stacked_base_only_changes() {
         api.stop().await;
     }
 }
+
+#[tokio::test]
+async fn submit_missing_body_file_fails_before_push_or_forge_write() {
+    let api = GitLabApiMock::start(Vec::new()).await;
+    let repo = TestRepo::with_local_remote();
+    repo.create_change("feature.txt", "feature", "fix: body RIG-42")
+        .create_bookmark("feature");
+    repo.set_config("jj-vine.fetch", "false")
+        .set_config(
+            "jj-vine.description.singleRevision",
+            "file(missing-body.md)",
+        )
+        .set_config("jj-vine.push", r#"["sh", "-c", "touch push-ran", "--"]"#);
+    let error = submit_with_metadata_gate(&repo, &api, &["feature"])
+        .await
+        .expect_err("missing body must reject submission");
+    assert!(error.to_string().contains("missing-body.md"));
+    assert!(!repo.path.join("push-ran").exists());
+    assert!(
+        api.requests()
+            .iter()
+            .all(|request| request.line.starts_with("GET "))
+    );
+    api.stop().await;
+}
