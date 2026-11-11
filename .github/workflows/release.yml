@@ -1,7 +1,7 @@
 name: release
 
-# Publishes release binaries for a v* tag. flake.nix pins these assets' sha256
-# hashes, so the tag's run must succeed before the hashes can be filled.
+# Builds jj-vine for three targets. Publishes the binaries to a GitHub Release
+# only for a v* tag.
 'on':
   push:
     tags: ['v*']
