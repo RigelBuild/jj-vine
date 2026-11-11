@@ -69,7 +69,10 @@
         };
       in
       {
+        # jj-vine-src always builds from source. jj-vine is the same build until a v* release
+        # exists; after tagging, fetch the release tarball and pin its sha256 (see release.yml).
         packages.default = jjVine;
+        packages.jj-vine-src = jjVine;
         packages.jj-vine = jjVine;
 
         apps.default = {
