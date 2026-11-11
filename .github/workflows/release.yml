@@ -71,7 +71,8 @@ jobs:
         env:
           BIN: target/${{ matrix.target }}/release/jj-vine
         run: |
-          if readelf -l "$BIN" | grep -q 'Requesting program interpreter'; then
+          program_headers="$(readelf -l "$BIN")"
+          if grep -q 'Requesting program interpreter' <<< "$program_headers"; then
             echo "::error::$BIN has a dynamic loader; the musl build must be static" >&2
             exit 1
           fi
