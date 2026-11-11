@@ -3,6 +3,8 @@ name: release
 # Builds jj-vine for three targets. Publishes the binaries to a GitHub Release
 # only for a v* tag.
 'on':
+  pull_request:
+    branches: [rigel-release]
   push:
     tags: ['v*']
   workflow_dispatch:
