@@ -174,18 +174,19 @@ impl MockClock {
     }
 
     pub(crate) fn read(&self) -> Instant {
-        self.base
-            + *self
-                .offset
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        let offset = *self
+            .offset
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.base.checked_add(offset).expect("mock clock overflow")
     }
 
     pub(crate) fn advance(&self, by: Duration) {
-        *self
+        let mut offset = self
             .offset
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) += by;
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *offset = offset.saturating_add(by);
     }
 }
 

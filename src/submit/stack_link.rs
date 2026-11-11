@@ -1570,12 +1570,31 @@ mod tests {
     }
 
     /// Write an executable `gh-stack` shell script into `dir`.
+    ///
+    /// A child process writes the file, with the script on its stdin. The test
+    /// process never holds a writable fd, so a sibling test's fork cannot
+    /// inherit one and make the script exec fail with `ETXTBSY`.
     #[cfg(unix)]
     fn fake_gh_stack(dir: &Path, script: &str) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt as _;
+        use std::{io::Write as _, os::unix::fs::PermissionsExt as _};
 
         let binary = dir.join("gh-stack");
-        std::fs::write(&binary, format!("#!/bin/sh\n{script}\n")).expect("write helper");
+        let mut writer = std::process::Command::new("sh")
+            .args(["-c", "cat > \"$1\"", "_"])
+            .arg(&binary)
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn helper writer");
+        writer
+            .stdin
+            .take()
+            .expect("helper writer stdin")
+            .write_all(format!("#!/bin/sh\n{script}\n").as_bytes())
+            .expect("write helper");
+        assert!(
+            writer.wait().expect("wait for helper writer").success(),
+            "helper writer failed"
+        );
         let mut permissions = std::fs::metadata(&binary)
             .expect("helper metadata")
             .permissions();
@@ -1834,6 +1853,21 @@ mod tests {
         gates: &Path,
         deadline: std::time::Instant,
     ) {
+        // Runs on every exit, including a panic. A fake still blocked on its
+        // gate then overruns the deadline and is killed, so the child fails
+        // by assertion instead of hanging.
+        struct OverrunOnDrop<'a> {
+            clock: &'a crate::process::MockClock,
+            deadline: std::time::Instant,
+        }
+        impl Drop for OverrunOnDrop<'_> {
+            fn drop(&mut self) {
+                let past = self.deadline.saturating_duration_since(self.clock.read())
+                    + core::time::Duration::from_secs(3600);
+                self.clock.advance(past);
+            }
+        }
+        let _overrun = OverrunOnDrop { clock, deadline };
         // Read-write so a fake closing its writer is never EOF, and the
         // controller never blocks on open.
         let mut entries = std::io::BufReader::new(
@@ -1963,7 +1997,9 @@ mod tests {
                     .expect("mkfifo");
                 assert!(status.success(), "mkfifo {gate} failed");
             }
-            let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            let mut child =
+                std::process::Command::new(std::env::current_exe().expect("test binary"));
+            child
                 .args([
                     "--exact",
                     "submit::stack_link::tests::graph_jj_calls_and_gh_stack_share_one_deadline",
@@ -1972,9 +2008,12 @@ mod tests {
                 .env("JJ_VINE_TEST_REPO_DIR", &repo.path)
                 .env("JJ_VINE_TEST_PID_DIR", &pids)
                 .env("JJ_VINE_TEST_REAL_JJ", &real_jj)
-                .env("PATH", &path)
-                .output()
-                .expect("run child test");
+                .env("PATH", &path);
+            // Real-clock bound: a hung child fails here instead of hanging the run.
+            let output =
+                crate::process::output_with_timeout(child, core::time::Duration::from_secs(60))
+                    .expect("run child test")
+                    .unwrap_or_else(|| panic!("{mode}: child test did not finish within 60s"));
             assert!(
                 output.status.success(),
                 "{mode}: child test failed: {}",
