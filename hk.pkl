@@ -1,0 +1,22 @@
+// Git hooks managed by hk (https://hk.jdx.dev).
+amends "package://github.com/jdx/hk/releases/download/v2.11.1/hk@2.11.1#/Config.pkl"
+
+// Pin the fork trunk. hk's auto-detect reads refs/remotes/origin/HEAD, which is unset here.
+default_branch = "rigel-release"
+
+// Same cargo gates as moon.yml `ci` (fmt, clippy, test). jj-vine is not wired into moon.
+hooks {
+    ["pre-push"] {
+        steps {
+            ["fmt"] = new Step {
+                check = "cargo fmt --check"
+            }
+            ["clippy"] = new Step {
+                check = "cargo clippy --locked --tests --features no-e2e-tests"
+            }
+            ["test"] = new Step {
+                check = "cargo test --locked --features no-e2e-tests"
+            }
+        }
+    }
+}
