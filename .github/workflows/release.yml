@@ -35,7 +35,12 @@ jobs:
       - name: Read the Cargo.toml version
         id: version
         run: |
-          version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
+          # Only the [package] table's version; dependency tables carry their own version keys.
+          version="$(awk '/^\[/ { pkg = ($0 == "[package]") } pkg && /^version = "[^"]*"$/ { sub(/^version = "/, ""); sub(/"$/, ""); print }' Cargo.toml)"
+          if [ -z "$version" ]; then
+            echo "::error::no [package] version in Cargo.toml" >&2
+            exit 1
+          fi
           echo "version=${version}" >> "$GITHUB_OUTPUT"
 
       - name: Require the tag to match the Cargo.toml version
