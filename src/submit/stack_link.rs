@@ -1862,8 +1862,10 @@ mod tests {
         }
         impl Drop for OverrunOnDrop<'_> {
             fn drop(&mut self) {
-                let past = self.deadline.saturating_duration_since(self.clock.read())
-                    + core::time::Duration::from_secs(3600);
+                let past = self
+                    .deadline
+                    .saturating_duration_since(self.clock.read())
+                    .saturating_add(core::time::Duration::from_secs(3600));
                 self.clock.advance(past);
             }
         }
