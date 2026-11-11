@@ -109,7 +109,7 @@ pub(crate) fn output_by_deadline(
     mut command: Command,
     deadline: Instant,
 ) -> std::io::Result<Option<std::process::Output>> {
-    if Instant::now() >= deadline {
+    if now() >= deadline {
         return Ok(None);
     }
     command
@@ -134,7 +134,7 @@ fn spawn_deadline_passed(deadline: Instant) -> bool {
     if let Some(hook) = BEFORE_SPAWN_CHECK.with(core::cell::Cell::get) {
         hook(deadline);
     }
-    Instant::now() >= deadline
+    now() >= deadline
 }
 
 #[cfg(test)]
@@ -143,6 +143,63 @@ thread_local! {
     /// after the entry check and before the last check ahead of spawn.
     static BEFORE_SPAWN_CHECK: core::cell::Cell<Option<fn(Instant)>> =
         const { core::cell::Cell::new(None) };
+}
+
+/// The clock that bounded deadlines are checked against.
+pub(crate) fn now() -> Instant {
+    #[cfg(test)]
+    if let Some(instant) = MOCK_CLOCK.with(|clock| clock.borrow().as_ref().map(MockClock::read)) {
+        return instant;
+    }
+    Instant::now()
+}
+
+/// A test clock. `read` is a base instant plus an offset that only `advance`
+/// moves. Clones share the offset, so a controller thread can move the clock
+/// that the phase under test reads.
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct MockClock {
+    base: Instant,
+    offset: std::sync::Arc<std::sync::Mutex<Duration>>,
+}
+
+#[cfg(test)]
+impl MockClock {
+    pub(crate) fn new() -> Self {
+        Self {
+            base: Instant::now(),
+            offset: std::sync::Arc::default(),
+        }
+    }
+
+    pub(crate) fn read(&self) -> Instant {
+        self.base
+            + *self
+                .offset
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    pub(crate) fn advance(&self, by: Duration) {
+        *self
+            .offset
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) += by;
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test seam: the clock `now` reads on this thread, if one is installed.
+    static MOCK_CLOCK: core::cell::RefCell<Option<MockClock>> =
+        const { core::cell::RefCell::new(None) };
+}
+
+/// Install `clock` as this thread's deadline clock.
+#[cfg(test)]
+pub(crate) fn install_mock_clock(clock: MockClock) {
+    MOCK_CLOCK.with(|slot| *slot.borrow_mut() = Some(clock));
 }
 
 /// The result of one exit check, judged against the deadline.
@@ -162,7 +219,7 @@ fn check_exit<T>(
     observe: impl FnOnce() -> std::io::Result<Option<T>>,
 ) -> std::io::Result<Check<T>> {
     let exited = observe()?;
-    let remaining = deadline.saturating_duration_since(Instant::now());
+    let remaining = deadline.saturating_duration_since(now());
     if remaining.is_zero() {
         return Ok(Check::Overrun);
     }
