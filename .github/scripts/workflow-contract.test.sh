@@ -49,3 +49,18 @@ while IFS= read -r line; do
   [[ "$line" =~ uses:[[:space:]]+[^[:space:]#]+@[0-9a-f]{40}[[:space:]]+#\ v[^[:space:]]+[[:space:]]*$ ]] || fail "action is not SHA-pinned with a version trailer: $line"
 done < <(grep -h 'uses:' "$release")
 pass 'release-tagging Requirement 1 static contract and SHA-pinned actions'
+
+# release.yml: tag-triggered build with the publish job alone holding write access.
+release_build="$root/.github/workflows/release.yml"
+[ -f "$release_build" ] || fail 'release.yml exists'
+expect 'release.yml top-level token is contents read only' "$(yq -r '.permissions | keys | join(",")' "$release_build")" contents
+expect 'release.yml top-level contents is read' "$(yq -r '.permissions.contents' "$release_build")" read
+expect 'release.yml build has no write permission' "$(yq -r '.jobs.build.permissions // "inherit"' "$release_build")" inherit
+expect 'only publish holds contents write' "$(yq -r '[.jobs | to_entries[] | select(.value.permissions.contents == "write") | .key] | join(",")' "$release_build")" publish
+expect 'publish is tag-gated' "$(yq -r '.jobs.publish.if' "$release_build")" "startsWith(github.ref, 'refs/tags/v')"
+expect 'build checkout does not persist credentials' "$(yq -r '.jobs.build.steps | map(select(.uses // "" | test("^actions/checkout@"))) | .[0].with["persist-credentials"]' "$release_build")" false
+expect 'release.yml triggers include pull_request on rigel-release' "$(yq -r '.on.pull_request.branches[0]' "$release_build")" rigel-release
+while IFS= read -r line; do
+  [[ "$line" =~ uses:[[:space:]]+[^[:space:]#]+@[0-9a-f]{40}[[:space:]]+#\ v[^[:space:]]+[[:space:]]*$ ]] || fail "release.yml action is not SHA-pinned with a version trailer: $line"
+done < <(grep -h 'uses:' "$release_build")
+pass 'release.yml static contract and SHA-pinned actions'
