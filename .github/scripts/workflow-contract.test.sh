@@ -62,7 +62,7 @@ expect 'release.yml top-level token is contents read only' "$(yq -r '.permission
 expect 'release.yml top-level contents is read' "$(yq -r '.permissions.contents' "$release_build")" read
 expect 'release.yml build has no write permission' "$(yq -r '.jobs.build.permissions // "inherit"' "$release_build")" inherit
 expect 'only publish holds contents write' "$(yq -r '[.jobs | to_entries[] | select(.value.permissions.contents == "write") | .key] | join(",")' "$release_build")" publish
-expect 'release.yml publish uses release environment' "$(yq -r '.jobs.publish.environment' "$release_build")" rigel-release
+expect 'release.yml publish has no branch-only environment' "$(yq -r '.jobs.publish.environment // "none"' "$release_build")" none
 expect 'release.yml package disables AppleDouble files' "$(yq -r '.jobs.build.steps | map(select(.name == "Package the binary with its sha256")) | .[0].env.COPYFILE_DISABLE' "$release_build")" 1
 expect 'release.yml refuses existing release before creation' "$(yq -r '.jobs.publish.steps | map(select(.name == "Create the release with its assets")) | .[0].run | test("(?s)if gh release view.*exit 1.*gh release create")' "$release_build")" true
 expect 'release.yml darwin runner matches CI aarch64 label' "$(yq -r '.jobs.build.strategy.matrix.include | map(select(.target == "aarch64-apple-darwin")) | .[0].os' "$release_build")" "$(yq -r '.jobs.build.strategy.matrix.platform | map(select(.target == "aarch64-apple-darwin")) | .[0].os' "$ci_workflow")"
