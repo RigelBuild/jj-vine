@@ -1,0 +1,139 @@
+name: release
+
+# Builds jj-vine for three targets. Publishes the binaries to a GitHub Release
+# only for a v* tag.
+'on':
+  pull_request:
+    branches: [rigel-release]
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - os: macos-15
+            target: aarch64-apple-darwin
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Read the Cargo.toml version
+        id: version
+        run: |
+          # Only the [package] table's version; dependency tables carry their own version keys.
+          version="$(awk '/^\[/ { pkg = ($0 == "[package]") } pkg && /^version = "[^"]*"$/ { sub(/^version = "/, ""); sub(/"$/, ""); print }' Cargo.toml)"
+          if [ -z "$version" ]; then
+            echo "::error::no [package] version in Cargo.toml" >&2
+            exit 1
+          fi
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
+      - name: Require the tag to match the Cargo.toml version
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          TAG: ${{ github.ref_name }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          if [ "$TAG" != "v$VERSION" ]; then
+            echo "::error::tag $TAG does not match Cargo.toml version $VERSION" >&2
+            exit 1
+          fi
+
+      - name: Install the musl toolchain
+        if: endsWith(matrix.target, '-musl')
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+          echo "CC_${TARGET//-/_}=musl-gcc" >> "$GITHUB_ENV"
+
+      - name: Add the Rust target
+        env:
+          TARGET: ${{ matrix.target }}
+        run: rustup target add "$TARGET"
+
+      - name: Build
+        env:
+          TARGET: ${{ matrix.target }}
+        run: cargo build --locked --release --target "$TARGET"
+
+      - name: Require a static Linux binary
+        if: endsWith(matrix.target, '-musl')
+        env:
+          BIN: target/${{ matrix.target }}/release/jj-vine
+        run: |
+          program_headers="$(readelf -l "$BIN")"
+          if grep -q 'Requesting program interpreter' <<< "$program_headers"; then
+            echo "::error::$BIN has a dynamic loader; the musl build must be static" >&2
+            exit 1
+          fi
+
+      - name: Package the binary with its sha256
+        env:
+          COPYFILE_DISABLE: "1"
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          asset="jj-vine-${VERSION}-${TARGET}.tar.gz"
+          staging="$(mktemp -d)"
+          install -m 0755 "target/${TARGET}/release/jj-vine" "${staging}/jj-vine"
+          mkdir -p dist
+          tar -C "$staging" -czf "dist/${asset}" jj-vine
+          cd dist
+          if [ "$RUNNER_OS" = macOS ]; then
+            shasum -a 256 "$asset" > "${asset}.sha256"
+          else
+            sha256sum "$asset" > "${asset}.sha256"
+          fi
+
+      - name: Upload the release assets
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: jj-vine-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 30
+
+  publish:
+    name: Publish the GitHub release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ github.ref_name }}
+    steps:
+      - name: Download the release assets
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          path: dist
+          pattern: jj-vine-*
+          merge-multiple: true
+
+      - name: Create the release with its assets
+        run: |
+          # Published release assets are immutable; refuse an existing release.
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "::error::release $TAG already exists; refusing to overwrite immutable assets" >&2
+            exit 1
+          fi
+          gh release create "$TAG" dist/* --verify-tag --title "$TAG"

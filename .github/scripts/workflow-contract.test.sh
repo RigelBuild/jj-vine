@@ -49,3 +49,30 @@ while IFS= read -r line; do
   [[ "$line" =~ uses:[[:space:]]+[^[:space:]#]+@[0-9a-f]{40}[[:space:]]+#\ v[^[:space:]]+[[:space:]]*$ ]] || fail "action is not SHA-pinned with a version trailer: $line"
 done < <(grep -h 'uses:' "$release")
 pass 'release-tagging Requirement 1 static contract and SHA-pinned actions'
+
+# release.yml: tag-triggered build with the publish job alone holding write access.
+release_build="$root/.github/workflows/release.yml"
+[ -f "$release_build" ] || fail 'release.yml exists'
+ci_workflow="$root/.github/workflows/ci.yml"
+expect 'release.yml publish permission keys are contents only' "$(yq -r '.jobs.publish.permissions | keys | join(",")' "$release_build")" contents
+expect 'release.yml has no write permissions outside publish' "$(yq -r '[.permissions, (.jobs | to_entries[] | select(.key != "publish") | .value.permissions // {})] | [.. | select(. == "write")] | length' "$release_build")" 0
+expect 'release.yml has no write-all permission anywhere' "$(yq -r '[.permissions, (.jobs[] | .permissions // {})] | [.. | select(. == "write-all")] | length' "$release_build")" 0
+expect 'release.yml publish has contents write only' "$(yq -r '[.jobs.publish.permissions | to_entries[] | select(.value == "write" and .key != "contents")] | length' "$release_build")" 0
+expect 'release.yml top-level token is contents read only' "$(yq -r '.permissions | keys | join(",")' "$release_build")" contents
+expect 'release.yml top-level contents is read' "$(yq -r '.permissions.contents' "$release_build")" read
+expect 'release.yml build has no write permission' "$(yq -r '.jobs.build.permissions // "inherit"' "$release_build")" inherit
+expect 'only publish holds contents write' "$(yq -r '[.jobs | to_entries[] | select(.value.permissions.contents == "write") | .key] | join(",")' "$release_build")" publish
+expect 'release.yml publish has no branch-only environment' "$(yq -r '.jobs.publish.environment // "none"' "$release_build")" none
+expect 'release.yml package disables AppleDouble files' "$(yq -r '.jobs.build.steps | map(select(.name == "Package the binary with its sha256")) | .[0].env.COPYFILE_DISABLE' "$release_build")" 1
+expect 'release.yml refuses existing release before creation' "$(yq -r '.jobs.publish.steps | map(select(.name == "Create the release with its assets")) | .[0].run | test("(?s)if gh release view.*exit 1.*gh release create")' "$release_build")" true
+expect 'release.yml darwin runner matches CI aarch64 label' "$(yq -r '.jobs.build.strategy.matrix.include | map(select(.target == "aarch64-apple-darwin")) | .[0].os' "$release_build")" "$(yq -r '.jobs.build.strategy.matrix.platform | map(select(.target == "aarch64-apple-darwin")) | .[0].os' "$ci_workflow")"
+expect 'release.yml is triggered by v tags' "$(yq -r '.on.push.tags[0]' "$release_build")" 'v*'
+expect 'release.yml tag version check is tag-only' "$(yq -r '.jobs.build.steps | map(select(.name == "Require the tag to match the Cargo.toml version")) | .[0].if' "$release_build")" "startsWith(github.ref, 'refs/tags/')"
+expect 'release.yml static Linux check is musl-only' "$(yq -r '.jobs.build.steps | map(select(.name == "Require a static Linux binary")) | .[0].if' "$release_build")" "endsWith(matrix.target, '-musl')"
+expect 'publish is tag-gated' "$(yq -r '.jobs.publish.if' "$release_build")" "startsWith(github.ref, 'refs/tags/v')"
+expect 'build checkout does not persist credentials' "$(yq -r '.jobs.build.steps | map(select(.uses // "" | test("^actions/checkout@"))) | .[0].with["persist-credentials"]' "$release_build")" false
+expect 'release.yml triggers include pull_request on rigel-release' "$(yq -r '.on.pull_request.branches[0]' "$release_build")" rigel-release
+while IFS= read -r line; do
+  [[ "$line" =~ uses:[[:space:]]+[^[:space:]#]+@[0-9a-f]{40}[[:space:]]+#\ v[^[:space:]]+[[:space:]]*$ ]] || fail "release.yml action is not SHA-pinned with a version trailer: $line"
+done < <(grep -h 'uses:' "$release_build")
+pass 'release.yml static contract and SHA-pinned actions'
