@@ -1,13 +1,10 @@
-use std::collections::HashMap;
-
 use bon::Builder;
 use itertools::Itertools as _;
 use owo_colors::OwoColorize as _;
-use tracing::{debug, error};
+use tracing::error;
 
 use crate::{
     bookmark::{Bookmark, change_id_to_temp_bookmark_name},
-    config::push_description,
     error::{Error, Result},
     submit::execute::{ActionInfo, ActionResultData, ExecuteAction, ExecuteActionContext},
 };
@@ -67,70 +64,35 @@ impl ExecuteAction for PushCreateAction {
         let change_ids_string = self
             .change_ids
             .iter()
-            .map(|change_id| (&change_id[..8]).magenta().to_string())
+            .map(|b| (&b[..8]).magenta().to_string())
             .join(", ");
-        let push_argv = ctx.execute.config.push.resolve_argv(ctx.execute.no_hooks);
 
         if ctx.execute.dry_run {
-            if let Some(argv) = push_argv.as_deref() {
-                ctx.execute.output.log_message(&format!(
-                    "Would {} and push to remote {} {} for changes: {change_ids_string}",
-                    "create bookmarks".green(),
-                    self.remote.cyan(),
-                    push_description(Some(argv))
-                ));
-            } else {
-                ctx.execute.output.log_message(&format!(
-                    "Would skip creating and pushing bookmarks to remote {} {} for changes: {change_ids_string}",
-                    self.remote.cyan(),
-                    push_description(None)
-                ));
-            }
+            ctx.execute.output.log_message(&format!(
+                "Would {} and push to remote {} for changes: {change_ids_string}",
+                "create bookmarks".green(),
+                self.remote.cyan()
+            ));
 
-            if push_argv.is_some() {
-                let bookmarks = self
+            Ok(ActionResultData::Pushed {
+                bookmarks: self
                     .change_ids
                     .iter()
-                    .map(|change_id| change_id_to_temp_bookmark_name(change_id))
-                    .collect::<Vec<_>>();
-                let created_bookmarks = self
+                    .map(|c| change_id_to_temp_bookmark_name(c))
+                    .collect(),
+                created_bookmarks: self
                     .change_ids
                     .iter()
-                    .map(|change_id| {
-                        (
-                            change_id.clone(),
-                            change_id_to_temp_bookmark_name(change_id),
-                        )
-                    })
-                    .collect();
-
-                Ok(ActionResultData::Pushed {
-                    bookmarks,
-                    created_bookmarks,
-                    pushed: true,
-                })
-            } else {
-                Ok(ActionResultData::Pushed {
-                    bookmarks: Vec::new(),
-                    created_bookmarks: HashMap::new(),
-                    pushed: false,
-                })
-            }
+                    .map(|c| (c.clone(), change_id_to_temp_bookmark_name(c)))
+                    .collect(),
+                pushed: true,
+            })
         } else {
-            let Some(push_argv) = push_argv else {
-                debug!("Pushing disabled; skipping create+push {change_ids_string}");
-                return Ok(ActionResultData::Pushed {
-                    bookmarks: Vec::new(),
-                    created_bookmarks: HashMap::new(),
-                    pushed: false,
-                });
-            };
-
-            match ctx.execute.jj.push_changes_create(
-                &self.change_ids,
-                Some(&self.remote),
-                &push_argv,
-            ) {
+            match ctx
+                .execute
+                .jj
+                .push_changes_create(&self.change_ids, Some(&self.remote))
+            {
                 Ok(()) => {
                     let changes = ctx.execute.jj.log(self.change_ids.join("|"))?;
                     let bookmarks: Vec<_> = Bookmark::from_changes(&changes).into_iter().collect();
@@ -139,30 +101,22 @@ impl ExecuteAction for PushCreateAction {
                         "Created bookmarks: {}",
                         bookmarks
                             .iter()
-                            .map(|bookmark| bookmark.name().magenta().to_string())
+                            .map(|b| b.name().magenta().to_string())
                             .join(", ")
                     ));
 
                     Ok(ActionResultData::Pushed {
-                        bookmarks: bookmarks
-                            .iter()
-                            .map(|bookmark| bookmark.name().to_owned())
-                            .collect(),
+                        bookmarks: bookmarks.iter().map(|b| b.name().to_owned()).collect(),
                         created_bookmarks: bookmarks
                             .iter()
-                            .map(|bookmark| {
-                                (
-                                    bookmark.change.change_id.clone(),
-                                    bookmark.name().to_owned(),
-                                )
-                            })
+                            .map(|b| (b.change.change_id.clone(), b.name().to_owned()))
                             .collect(),
                         pushed: true,
                     })
                 }
-                Err(error) => {
+                Err(e) => {
                     let error_msg = format!(
-                        "Failed to create and push changes to remote {} ({change_ids_string}): {error}",
+                        "Failed to create and push changes to remote {} ({change_ids_string}): {e}",
                         self.remote.cyan()
                     );
                     ctx.execute.output.log_message(&error_msg);
