@@ -197,6 +197,16 @@ pub struct Config {
     #[builder(default)]
     pub fetch: RepoFetchConfig,
 
+    /// Push command to run. Defaults to `jj git push`; false disables pushing.
+    ///
+    /// An array sets a complete argv. The remote and bookmark or change
+    /// arguments are appended, so the command must accept the corresponding
+    /// `jj git push` flags. `submit --no-hooks` runs the built-in command
+    /// instead.
+    #[serde(default)]
+    #[builder(default)]
+    pub push: RepoPushConfig,
+
     /// Configuration for MR title generation.
     #[serde(default)]
     #[builder(default)]
@@ -247,6 +257,85 @@ impl RepoFetchConfig {
 impl Default for RepoFetchConfig {
     fn default() -> Self {
         Self::Enabled(true)
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum RepoPushConfig {
+    /// If true, run the built-in `jj git push`; false disables pushing.
+    Enabled(bool),
+
+    /// Runs this full argv instead of the built-in push command.
+    ///
+    /// The remote and bookmark or change arguments are appended, so custom
+    /// commands must accept the corresponding `jj git push` flags.
+    Command(Vec<String>),
+}
+
+impl RepoPushConfig {
+    /// Return the configured push argv, or `None` when pushing is disabled.
+    #[must_use]
+    pub fn to_argv(&self) -> Option<Vec<String>> {
+        match self {
+            Self::Enabled(true) => Some(Self::builtin_push_argv()),
+            Self::Enabled(false) => None,
+            Self::Command(command) => Some(command.clone()),
+        }
+    }
+
+    /// Resolve the push argv for this run.
+    ///
+    /// `no_hooks` selects the built-in `jj git push` command instead of a
+    /// configured command. It does not re-enable pushing when config disables
+    /// it.
+    #[must_use]
+    pub fn resolve_argv(&self, no_hooks: bool) -> Option<Vec<String>> {
+        match (self, no_hooks) {
+            (Self::Enabled(false), _) => None,
+            (_, true) => Some(Self::builtin_push_argv()),
+            (_, false) => self.to_argv(),
+        }
+    }
+
+    fn builtin_push_argv() -> Vec<String> {
+        vec!["jj".to_owned(), "git".to_owned(), "push".to_owned()]
+    }
+}
+
+impl Default for RepoPushConfig {
+    fn default() -> Self {
+        Self::Enabled(true)
+    }
+}
+
+pub(crate) fn push_description(push_argv: Option<&[String]>) -> &'static str {
+    let Some(argv) = push_argv else {
+        return "(pushing disabled)";
+    };
+
+    if argv.len() == 3 && argv[0] == "jj" && argv[1] == "git" && argv[2] == "push" {
+        "via `jj git push`"
+    } else {
+        "via configured push command"
+    }
+}
+
+#[cfg(test)]
+mod push_description_tests {
+    use super::push_description;
+
+    #[test]
+    fn describes_builtin_and_custom_commands_without_rendering_argv() {
+        let builtin = vec!["jj".to_owned(), "git".to_owned(), "push".to_owned()];
+        let custom = vec!["custom-push".to_owned(), "secret-argument".to_owned()];
+
+        assert_eq!(push_description(Some(&builtin)), "via `jj git push`");
+        assert_eq!(
+            push_description(Some(&custom)),
+            "via configured push command"
+        );
+        assert_eq!(push_description(None), "(pushing disabled)");
     }
 }
 
@@ -834,6 +923,13 @@ impl Config {
             ForgeType::Forgejo => crate::forge::forgejo::validate_config(self),
             ForgeType::AzureDevOps => crate::forge::azure::validate_config(self),
         }?;
+
+        if matches!(&self.push, RepoPushConfig::Command(argv) if argv.is_empty()) {
+            return Err(ConfigSnafu {
+                message: "jj-vine.push must be a boolean or a non-empty command array".to_owned(),
+            }
+            .build());
+        }
 
         Ok(())
     }
@@ -1737,5 +1833,107 @@ mod tests {
             config.github.resolved_token().expect("command token"),
             TOKEN
         );
+    }
+
+    #[test]
+    fn push_config_resolves_default_custom_and_disabled_argv() {
+        assert_eq!(
+            RepoPushConfig::default().to_argv(),
+            Some(vec!["jj".to_owned(), "git".to_owned(), "push".to_owned()])
+        );
+        assert_eq!(
+            RepoPushConfig::Command(vec!["custom-push".to_owned(), "push".to_owned()]).to_argv(),
+            Some(vec!["custom-push".to_owned(), "push".to_owned()])
+        );
+        assert_eq!(RepoPushConfig::Enabled(false).to_argv(), None);
+    }
+
+    #[test]
+    fn push_config_no_hooks_uses_builtin_but_preserves_disabled() {
+        assert_eq!(
+            RepoPushConfig::Command(vec!["custom-push".to_owned(), "push".to_owned()])
+                .resolve_argv(true),
+            Some(vec!["jj".to_owned(), "git".to_owned(), "push".to_owned()])
+        );
+        assert_eq!(RepoPushConfig::Enabled(false).resolve_argv(true), None);
+    }
+
+    #[test]
+    fn push_config_parses_custom_argv_from_jj_config() -> Result<()> {
+        let (_temp, repo_path) = create_test_repo();
+        let jj = isolated_jj(&repo_path)?;
+        jj.exec(["config", "set", "--repo", "jj-vine.forge", "forgejo"])?;
+        jj.exec([
+            "config",
+            "set",
+            "--repo",
+            "jj-vine.forgejo.host",
+            "https://forgejo.example",
+        ])?;
+        jj.exec([
+            "config",
+            "set",
+            "--repo",
+            "jj-vine.forgejo.project",
+            "owner/repository",
+        ])?;
+        jj.exec([
+            "config",
+            "set",
+            "--repo",
+            "jj-vine.forgejo.token",
+            "test-token",
+        ])?;
+        jj.exec([
+            "config",
+            "set",
+            "--repo",
+            "jj-vine.push",
+            r#"["custom-push", "push"]"#,
+        ])?;
+
+        let config = load_isolated(&repo_path)?;
+
+        assert_eq!(
+            config.push,
+            RepoPushConfig::Command(vec!["custom-push".to_owned(), "push".to_owned()])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn push_config_rejects_empty_command() -> Result<()> {
+        let (_temp, repo_path) = create_test_repo();
+        let jj = isolated_jj(&repo_path)?;
+        jj.exec(["config", "set", "--repo", "jj-vine.forge", "forgejo"])?;
+        jj.exec([
+            "config",
+            "set",
+            "--repo",
+            "jj-vine.forgejo.host",
+            "https://forgejo.example",
+        ])?;
+        jj.exec([
+            "config",
+            "set",
+            "--repo",
+            "jj-vine.forgejo.project",
+            "owner/repository",
+        ])?;
+        jj.exec([
+            "config",
+            "set",
+            "--repo",
+            "jj-vine.forgejo.token",
+            "test-token",
+        ])?;
+        jj.exec(["config", "set", "--repo", "jj-vine.push", "[]"])?;
+
+        let message = load_isolated(&repo_path)
+            .expect_err("an empty push command is rejected")
+            .to_string();
+
+        assert!(message.contains("jj-vine.push"), "{message}");
+        Ok(())
     }
 }
