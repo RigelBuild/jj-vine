@@ -1751,7 +1751,9 @@ mod tests {
     /// The shared stack-link deadline, measured from the start of the phase.
     /// It is only headroom for the ungated jj commands to finish: no fake
     /// finishes on its own, so the deadline always expires while a gated
-    /// command is running.
+    /// command is running. The ungated jj commands must finish within it; if
+    /// they overrun, the wrong stage fails and the test fails loudly, so it
+    /// cannot pass falsely.
     #[cfg(unix)]
     const PHASE_BUDGET: core::time::Duration = core::time::Duration::from_secs(5);
     /// The budget the runner reports and would restart from. It is far past
@@ -1894,7 +1896,7 @@ mod tests {
              echo call >> \"$dir/graph-calls\"\n\
              if [ \"$(wc -l < \"$dir/graph-calls\")\" -ge 2 ]; then\n\
              echo $$ > \"$dir/jj-gated.pid\"\n\
-             while [ ! -e \"$dir/expired\" ]; do sleep 0.05; done\n\
+             i=0; while [ ! -e \"$dir/expired\" ] && [ $i -lt 600 ]; do sleep 0.05; i=$((i+1)); done\n\
              fi\n\
              fi\n\
              exec \"$JJ_VINE_TEST_REAL_JJ\" \"$@\"",
@@ -1909,7 +1911,7 @@ mod tests {
              sh -c 'echo $$ > \"$1/gh-descendant.pid\"; echo > \"$1/gh-ready\"; exec sleep 30' _ \"$dir\" &\n\
              read _ < \"$dir/gh-ready\"\n\
              echo $$ > \"$dir/gh.pid\"\n\
-             while [ ! -e \"$dir/expired\" ]; do sleep 0.05; done\n\
+             i=0; while [ ! -e \"$dir/expired\" ] && [ $i -lt 600 ]; do sleep 0.05; i=$((i+1)); done\n\
              exit 0",
         );
         let mut path = bin.as_os_str().to_owned();
@@ -1941,8 +1943,16 @@ mod tests {
             })
             .collect();
 
-        for (mode, pids, child) in children {
-            let output = child.wait_with_output().expect("child test output");
+        // Reap every child before asserting, so a failed assertion cannot
+        // drop a running child while its temporary directory is deleted.
+        let outputs: Vec<_> = children
+            .into_iter()
+            .map(|(mode, pids, child)| {
+                let output = child.wait_with_output().expect("child test output");
+                (mode, pids, output)
+            })
+            .collect();
+        for (mode, pids, output) in outputs {
             assert!(
                 output.status.success(),
                 "{mode}: child test failed: {}",
