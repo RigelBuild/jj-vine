@@ -1748,32 +1748,30 @@ mod tests {
         echo $$ > \"$dir/jj.pid\"\n\
         exec sleep 30";
 
-    /// Each graph jj command sleeps [`SLOW_JJ_DELAY`] before running, and the
-    /// graph rebuild of two bookmarks runs four of them. Two budgets probe one
-    /// shared deadline:
-    /// - [`GRAPH_BUDGET`] fits any one jj command but not four, so the graph
-    ///   rebuild fails only if its commands share the deadline.
-    /// - [`GH_BUDGET`] fits gh-stack's [`SLOW_GH_STACK`] sleep when fresh, but
-    ///   not after the graph rebuild, so gh-stack fails only if it shares the
-    ///   deadline with the graph rebuild.
+    /// The shared stack-link deadline, measured from the start of the phase.
+    /// It is only headroom for the ungated jj commands to finish: no fake
+    /// finishes on its own, so the deadline always expires while a gated
+    /// command is running.
     #[cfg(unix)]
-    const SLOW_JJ_DELAY: &str = "0.4";
+    const PHASE_BUDGET: core::time::Duration = core::time::Duration::from_secs(5);
+    /// The budget the runner reports and would restart from. It is far past
+    /// [`PHASE_BUDGET`], so a command given a fresh budget instead of what is
+    /// left of the shared deadline outlives the gate and succeeds.
     #[cfg(unix)]
-    const SLOW_GH_STACK: &str = "3.5";
-    #[cfg(unix)]
-    const GRAPH_BUDGET: core::time::Duration = core::time::Duration::from_millis(1000);
-    #[cfg(unix)]
-    const GH_BUDGET: core::time::Duration = core::time::Duration::from_millis(4000);
+    const FRESH_BUDGET: core::time::Duration = core::time::Duration::from_secs(3600);
 
     /// Child mode of [`graph_jj_calls_and_gh_stack_share_one_deadline`]: run
-    /// the stack-link phase against the slow fakes with one `budget`.
+    /// the stack-link phase against the gated fakes. In `gate_graph` mode the
+    /// second graph jj command blocks; otherwise gh-stack blocks. A blocked
+    /// fake is released only once the shared deadline has passed, so it ends
+    /// in time only if it was given a fresh budget.
     #[cfg(unix)]
-    fn run_slow_stack_link_phase(
-        budget: core::time::Duration,
+    fn run_gated_stack_link_phase(
+        gate_graph: bool,
     ) -> (StackLinkOutcome, usize, core::time::Duration) {
         let repo = PathBuf::from(std::env::var_os("JJ_VINE_TEST_REPO_DIR").expect("repository"));
         let pids = PathBuf::from(std::env::var_os("JJ_VINE_TEST_PID_DIR").expect("pid directory"));
-        let jj = Jujutsu::new(&repo).expect("slow jj on PATH");
+        let jj = Jujutsu::new(&repo).expect("gated jj on PATH");
         let changes = crate::submit::find_changes_to_submit(
             &jj,
             ["b"],
@@ -1791,15 +1789,30 @@ mod tests {
         };
         let jj_calls = || {
             std::fs::read_to_string(pids.join("jj-calls"))
-                .expect("slow jj ran")
+                .expect("gated jj ran")
                 .lines()
                 .count()
         };
         let calls_before = jj_calls();
+        if gate_graph {
+            std::fs::write(pids.join("gate-graph"), "").expect("arm the graph gate");
+        }
 
         // Mirror `link_stacks`: the phase deadline is the runner's.
-        let runner = GhStackRunner::new(repo, std::env::var_os("PATH"), None, budget);
+        let mut runner = GhStackRunner::new(repo, std::env::var_os("PATH"), None, FRESH_BUDGET);
+        runner.deadline = std::time::Instant::now()
+            .checked_add(PHASE_BUDGET)
+            .expect("phase deadline fits in an Instant");
         let deadline = runner.deadline;
+        // Release the gated fake only after the shared deadline has passed.
+        let release = {
+            let expired = pids.join("expired");
+            std::thread::spawn(move || {
+                let left = deadline.saturating_duration_since(std::time::Instant::now());
+                std::thread::sleep(left);
+                std::fs::write(expired, "").expect("release the gated fake");
+            })
+        };
         let outcome = link_stacks_with_runner(
             &runner,
             deadline,
@@ -1813,6 +1826,7 @@ mod tests {
             false,
         );
         let overrun = std::time::Instant::now().saturating_duration_since(deadline);
+        release.join().expect("release thread");
         (outcome, jj_calls().saturating_sub(calls_before), overrun)
     }
 
@@ -1822,7 +1836,7 @@ mod tests {
         const CHILD_MODE: &str = "JJ_VINE_TEST_SHARED_DEADLINE";
         match std::env::var(CHILD_MODE).as_deref() {
             Ok("graph") => {
-                let (outcome, calls, overrun) = run_slow_stack_link_phase(GRAPH_BUDGET);
+                let (outcome, calls, overrun) = run_gated_stack_link_phase(true);
                 assert!(
                     calls >= 2,
                     "the graph rebuild must run several jj commands, ran {calls}"
@@ -1840,7 +1854,7 @@ mod tests {
                 return;
             }
             Ok("gh") => {
-                let (outcome, calls, overrun) = run_slow_stack_link_phase(GH_BUDGET);
+                let (outcome, calls, overrun) = run_gated_stack_link_phase(false);
                 assert!(
                     calls >= 2,
                     "the graph rebuild must run several jj commands, ran {calls}"
@@ -1872,14 +1886,21 @@ mod tests {
         std::fs::create_dir_all(&bin).expect("bin directory");
         // Every value reaches the scripts through the environment, so no path
         // is spliced into shell source.
-        let slow_jj = fake_gh_stack(
+        let gated_jj = fake_gh_stack(
             &bin,
-            "echo call >> \"$JJ_VINE_TEST_PID_DIR/jj-calls\"\n\
-             sleep \"$JJ_VINE_TEST_JJ_DELAY\"\n\
+            "dir=\"$JJ_VINE_TEST_PID_DIR\"\n\
+             echo call >> \"$dir/jj-calls\"\n\
+             if [ -e \"$dir/gate-graph\" ]; then\n\
+             echo call >> \"$dir/graph-calls\"\n\
+             if [ \"$(wc -l < \"$dir/graph-calls\")\" -ge 2 ]; then\n\
+             echo $$ > \"$dir/jj-gated.pid\"\n\
+             while [ ! -e \"$dir/expired\" ]; do sleep 0.05; done\n\
+             fi\n\
+             fi\n\
              exec \"$JJ_VINE_TEST_REAL_JJ\" \"$@\"",
         );
-        std::fs::rename(slow_jj, bin.join("jj")).expect("install slow jj");
-        // gh-stack would exit 0 after its sleep, so only the shared deadline
+        std::fs::rename(gated_jj, bin.join("jj")).expect("install gated jj");
+        // gh-stack would exit 0 once released, so only the shared deadline
         // turns it into a failure. Its descendant is gated like the fake jj.
         fake_gh_stack(
             &bin,
@@ -1888,36 +1909,50 @@ mod tests {
              sh -c 'echo $$ > \"$1/gh-descendant.pid\"; echo > \"$1/gh-ready\"; exec sleep 30' _ \"$dir\" &\n\
              read _ < \"$dir/gh-ready\"\n\
              echo $$ > \"$dir/gh.pid\"\n\
-             sleep \"$JJ_VINE_TEST_GH_DELAY\"\n\
+             while [ ! -e \"$dir/expired\" ]; do sleep 0.05; done\n\
              exit 0",
         );
         let mut path = bin.as_os_str().to_owned();
         path.push(":");
         path.push(std::env::var_os("PATH").expect("PATH is set"));
 
-        for mode in ["graph", "gh"] {
-            let pids = temp.path().join(mode);
-            std::fs::create_dir_all(&pids).expect("pid directory");
-            let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
-                .args([
-                    "--exact",
-                    "submit::stack_link::tests::graph_jj_calls_and_gh_stack_share_one_deadline",
-                ])
-                .env(CHILD_MODE, mode)
-                .env("JJ_VINE_TEST_REPO_DIR", &repo.path)
-                .env("JJ_VINE_TEST_PID_DIR", &pids)
-                .env("JJ_VINE_TEST_REAL_JJ", &real_jj)
-                .env("JJ_VINE_TEST_JJ_DELAY", SLOW_JJ_DELAY)
-                .env("JJ_VINE_TEST_GH_DELAY", SLOW_GH_STACK)
-                .env("PATH", &path)
-                .output()
-                .expect("run child test");
+        // Both modes wait out the phase budget, so run them side by side.
+        let exe = std::env::current_exe().expect("test binary");
+        let children: Vec<_> = ["graph", "gh"]
+            .into_iter()
+            .map(|mode| {
+                let pids = temp.path().join(mode);
+                std::fs::create_dir_all(&pids).expect("pid directory");
+                let child = std::process::Command::new(&exe)
+                    .args([
+                        "--exact",
+                        "submit::stack_link::tests::graph_jj_calls_and_gh_stack_share_one_deadline",
+                    ])
+                    .env(CHILD_MODE, mode)
+                    .env("JJ_VINE_TEST_REPO_DIR", &repo.path)
+                    .env("JJ_VINE_TEST_PID_DIR", &pids)
+                    .env("JJ_VINE_TEST_REAL_JJ", &real_jj)
+                    .env("PATH", &path)
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()
+                    .expect("run child test");
+                (mode, pids, child)
+            })
+            .collect();
+
+        for (mode, pids, child) in children {
+            let output = child.wait_with_output().expect("child test output");
             assert!(
                 output.status.success(),
                 "{mode}: child test failed: {}",
                 String::from_utf8_lossy(&output.stdout),
             );
             if mode != "gh" {
+                assert!(
+                    pids.join("jj-gated.pid").exists(),
+                    "{mode}: the deadline must pass while a later graph jj command runs"
+                );
                 assert!(
                     !pids.join("gh.pid").exists(),
                     "{mode}: gh-stack must not run after a failed graph rebuild"
