@@ -49,6 +49,11 @@ pub struct SubmitCommandConfig {
     #[arg(long)]
     pub dry_run: bool,
 
+    /// Use the built-in `jj git push` command instead of the configured push
+    /// command.
+    #[arg(long)]
+    pub no_hooks: bool,
+
     /// Show the submission plan and do not execute it.
     #[arg(long, conflicts_with = "dry_run")]
     pub show_plan: bool,
@@ -260,6 +265,7 @@ pub async fn submit(config: &SubmitCommandConfig, cli_config: &CliConfig<'_>) ->
         submission_plan,
         changes.clone(),
         config.revset_options.tracked,
+        config.no_hooks,
     ))
     .await?;
 

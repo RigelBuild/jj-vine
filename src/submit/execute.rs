@@ -5,7 +5,7 @@ pub mod sync_dependent_merge_requests;
 pub mod update_mr_base;
 pub mod update_mr_title_description;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use bon::bon;
 use enum_dispatch::enum_dispatch;
@@ -18,6 +18,7 @@ use crate::{
     bookmark::{
         BookmarkGraph,
         BookmarkOrPending,
+        BookmarkRef,
         BookmarkWithPointers,
         change_id_to_temp_bookmark_name,
     },
@@ -114,6 +115,8 @@ pub enum ActionResultData {
     MRCreated(MRUpdate),
     MRUpdated(MRUpdate),
     DryRun,
+    /// Skipped because pushing is disabled or a required merge request action was skipped.
+    Skipped,
 }
 
 #[derive(Debug, Clone)]
@@ -264,10 +267,12 @@ pub async fn execute(mut ctx: RootExecuteContext<'_>) -> Result<SubmissionResult
     let mut merge_requests = Vec::new();
     let mut errors = Vec::new();
     let mut bookmarks_pushed = Vec::new();
+    let mut skipped_mr_bookmarks = HashSet::new();
     let mut current_results: Vec<ActionResult> = Vec::new();
 
     let mut bookmark_graph =
         BookmarkGraph::from_changes(ctx.jj, &ctx.changes, ctx.skip_untracked_local_bookmarks)?;
+    let unpushed_targets = unpushed_push_targets(&ctx);
 
     ctx.output.log_current("Preparing submission");
 
@@ -304,6 +309,32 @@ pub async fn execute(mut ctx: RootExecuteContext<'_>) -> Result<SubmissionResult
                         err_deps.iter().map(|(id, _)| id).join(", ")
                     ))
                     .to_clonable_error()),
+                });
+                continue;
+            }
+
+            if targets_unpushed_bookmark(action, &unpushed_targets, &bookmark_graph)
+                || action_depends_on_skipped_mr(action, &skipped_mr_bookmarks, &bookmark_graph)
+            {
+                debug!(
+                    "Skipping action {} because pushing is disabled",
+                    action.id()
+                );
+                ctx.output.log_message(&format!(
+                    "{} because pushing is disabled: {}",
+                    if ctx.dry_run {
+                        "Would skip"
+                    } else {
+                        "Skipping"
+                    },
+                    action.plan_text()
+                ));
+                if let Some(bookmark) = merge_request_action_bookmark(action) {
+                    skipped_mr_bookmarks.insert(bookmark);
+                }
+                current_results.push(ActionResult {
+                    id: action.id(),
+                    data: Ok(ActionResultData::Skipped),
                 });
                 continue;
             }
@@ -370,7 +401,7 @@ pub async fn execute(mut ctx: RootExecuteContext<'_>) -> Result<SubmissionResult
             Ok(ActionResultData::MRCreated(mr_update) | ActionResultData::MRUpdated(mr_update)) => {
                 merge_requests.push(mr_update);
             }
-            Ok(ActionResultData::DryRun) => {}
+            Ok(ActionResultData::DryRun | ActionResultData::Skipped) => {}
             Err(error) => {
                 errors.push(error);
             }
@@ -382,4 +413,176 @@ pub async fn execute(mut ctx: RootExecuteContext<'_>) -> Result<SubmissionResult
         errors,
         bookmarks_pushed,
     })
+}
+
+/// Whether a merge request action depends on an MR action skipped because
+/// pushing is disabled.
+fn action_depends_on_skipped_mr(
+    action: &Action,
+    skipped_mr_bookmarks: &HashSet<String>,
+    bookmark_graph: &BookmarkGraph<'_>,
+) -> bool {
+    if skipped_mr_bookmarks.is_empty() {
+        return false;
+    }
+
+    let depends_on_skipped_bookmark = |name: &str| {
+        bookmark_graph
+            .find_bookmark_in_components(name)
+            .is_some_and(|bookmark| {
+                skipped_mr_bookmarks
+                    .iter()
+                    .any(|skipped| bookmark.find(skipped).is_some())
+            })
+    };
+
+    match action {
+        Action::Push(_) | Action::PushCreate(_) => false,
+        Action::CreateMR(create_mr) => {
+            depends_on_skipped_bookmark(&create_mr.bookmark.to_string())
+                || depends_on_skipped_bookmark(&create_mr.target_branch)
+        }
+        Action::UpdateMRBase(update_mr_base) => {
+            depends_on_skipped_bookmark(&update_mr_base.bookmark)
+                || depends_on_skipped_bookmark(&update_mr_base.new_target_branch)
+        }
+        Action::UpdateMRTitleDescription(update) => {
+            depends_on_skipped_bookmark(&update.bookmark.to_string())
+        }
+        Action::SyncDependentMergeRequests(sync) => {
+            depends_on_skipped_bookmark(&sync.bookmark.to_string())
+        }
+    }
+}
+
+/// Gets the source bookmark of a merge request action.
+fn merge_request_action_bookmark(action: &Action) -> Option<String> {
+    match action {
+        Action::CreateMR(create_mr) => Some(create_mr.bookmark.to_string()),
+        Action::UpdateMRBase(update_mr_base) => Some(update_mr_base.bookmark.clone()),
+        Action::UpdateMRTitleDescription(update) => Some(update.bookmark.to_string()),
+        Action::SyncDependentMergeRequests(sync) => Some(sync.bookmark.to_string()),
+        Action::Push(_) | Action::PushCreate(_) => None,
+    }
+}
+
+/// Planned push targets whose head on the push remote will not match the local
+/// head because pushing is disabled. Empty unless pushing is disabled.
+///
+/// A bookmark already tracked and in sync on the push action's own remote
+/// does not depend on the push, so merge request actions for it still run.
+/// Sync with any other remote does not count. When the push remote's state
+/// cannot be read, every bookmark counts as unpushed.
+fn unpushed_push_targets(ctx: &RootExecuteContext<'_>) -> Vec<BookmarkNameOrPendingChangeId> {
+    let mut targets = Vec::new();
+
+    if ctx.config.push.resolve_argv(ctx.no_hooks).is_some() {
+        return targets;
+    }
+
+    for action in ctx.plan.actions.iter().flatten() {
+        match action {
+            Action::Push(push) => {
+                let synced = ctx
+                    .jj
+                    .bookmarks_synced_with_remote(
+                        push.bookmarks.iter().map(String::as_str),
+                        &push.remote,
+                    )
+                    .unwrap_or_else(|error| {
+                        debug!(
+                            "Could not read bookmark state on remote {}; treating all as unpushed: {error}",
+                            push.remote
+                        );
+                        HashSet::new()
+                    });
+
+                targets.extend(
+                    push.bookmarks
+                        .iter()
+                        .filter(|name| !synced.contains(*name))
+                        .cloned()
+                        .map(BookmarkNameOrPendingChangeId::Bookmark),
+                );
+            }
+            Action::PushCreate(push_create) => targets.extend(
+                push_create
+                    .change_ids
+                    .iter()
+                    .cloned()
+                    .map(BookmarkNameOrPendingChangeId::PendingChangeId),
+            ),
+            Action::CreateMR(_)
+            | Action::UpdateMRBase(_)
+            | Action::UpdateMRTitleDescription(_)
+            | Action::SyncDependentMergeRequests(_) => {}
+        }
+    }
+
+    targets
+}
+
+/// Whether a merge request action reads or writes a branch whose remote head
+/// is stale or missing. Push actions handle disabled pushing themselves.
+fn targets_unpushed_bookmark(
+    action: &Action,
+    unpushed_targets: &[BookmarkNameOrPendingChangeId],
+    bookmark_graph: &BookmarkGraph<'_>,
+) -> bool {
+    if unpushed_targets.is_empty() {
+        return false;
+    }
+
+    // A pending target is named by its temporary bookmark name until pushed;
+    // a child of a pending parent targets that name.
+    let is_unpushed_name = |name: &str| {
+        unpushed_targets.iter().any(|target| match target {
+            BookmarkNameOrPendingChangeId::Bookmark(unpushed) => unpushed == name,
+            BookmarkNameOrPendingChangeId::PendingChangeId(change_id) => {
+                change_id_to_temp_bookmark_name(change_id) == name
+            }
+        })
+    };
+
+    match action {
+        Action::Push(_) | Action::PushCreate(_) => false,
+        Action::CreateMR(create_mr) => {
+            unpushed_targets.contains(&create_mr.bookmark)
+                || is_unpushed_name(&create_mr.target_branch)
+        }
+        Action::UpdateMRBase(update_mr_base) => {
+            is_unpushed_name(&update_mr_base.bookmark)
+                || is_unpushed_name(&update_mr_base.new_target_branch)
+        }
+        // The stack description lists every MR in the component, so one
+        // unpushed member makes it stale or references a missing MR.
+        Action::UpdateMRTitleDescription(update) => {
+            let name = update.bookmark.to_string();
+
+            is_unpushed_name(&name)
+                || bookmark_graph
+                    .component_containing(&name)
+                    .is_some_and(|component| {
+                        component
+                            .all_bookmarks()
+                            .iter()
+                            .any(|bookmark| is_unpushed_name(bookmark.name()))
+                    })
+        }
+        Action::SyncDependentMergeRequests(sync) => {
+            let BookmarkNameOrPendingChangeId::Bookmark(name) = &sync.bookmark else {
+                return unpushed_targets.contains(&sync.bookmark);
+            };
+
+            is_unpushed_name(name)
+                || bookmark_graph
+                    .find_bookmark_in_components(name)
+                    .is_some_and(|bookmark| {
+                        bookmark.parents.iter().any(|parent| match parent {
+                            BookmarkRef::Bookmark(parent) => is_unpushed_name(parent.name()),
+                            BookmarkRef::Trunk => false,
+                        })
+                    })
+        }
+    }
 }
