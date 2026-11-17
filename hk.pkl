@@ -1,0 +1,20 @@
+// Git hooks managed by hk (https://hk.jdx.dev).
+amends "package://github.com/jdx/hk/releases/download/v2.11.1/hk@2.11.1#/Config.pkl"
+
+default_branch = "rigel-release"
+
+hooks {
+    ["pre-push"] {
+        steps {
+            ["fmt"] = new Step {
+                check = "cargo fmt --check"
+            }
+            ["clippy"] = new Step {
+                check = "cargo clippy --tests"
+            }
+            ["test"] = new Step {
+                check = "cargo +stable test --features no-e2e-tests"
+            }
+        }
+    }
+}
