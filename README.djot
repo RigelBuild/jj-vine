@@ -285,12 +285,13 @@ Required when `jj-vine.forge` is set to `github`.
 
 | Setting | Description | Type | Required | Default |
 |---------|-------------|------|----------|---------|
-| `github.host` | GitHub API URL (defaults to `https://api.github.com` for GitHub.com, or `https://github.example.com/api/v3` for Enterprise) | String | Yes | - |
-| `github.project` | Repository where branches are pushed in `owner/repo` format | String | Yes | - |
+| `github.host` | GitHub API URL; derived from the configured Git remote when no non-empty repository- or workspace-level value is set | String | No | Remote host, else global value, else `https://api.github.com` |
+| `github.project` | Repository where branches are pushed in `owner/repo` format; derived from the configured Git remote when no non-empty repository- or workspace-level value is set | String | Yes, unless derived from a remote or set globally | Remote push project, else global value |
 | `github.token` | Personal access token. Classic PATs need the `repo` scope. Fine-grained PATs need **Contents: Read and Write** and **Pull requests: Read and Write**. Repos in an organization also need **Members: Read**. | String | Yes, unless `github.tokenCommand` is set | - |
+| `github.tokenCommand` | Full command argv (array of strings) whose trimmed stdout supplies the token when `github.token` is empty. Runs non-interactively with stdin redirected to the null device; it must not require terminal input. A non-zero exit, empty output, or a run longer than 10 seconds is an error. | String[] | Yes, if `github.token` is empty | - |
 | `github.targetProject` | Target repository for pull requests (e.g., `upstream-owner/repo`). Use if you are using a fork. | String | No | (same as `github.project`) |
-| `github.tokenCommand` | Full command argv (array of strings) whose trimmed stdout supplies the token when `github.token` is empty. The command must be non-interactive: it gets stdin from the null device and, on Unix, runs in a new session with no controlling terminal, so a prompt for terminal input fails. When the command exits or is cancelled, processes remaining in its Unix process group or Windows job are killed. A Unix descendant that starts its own session or process group can escape this cleanup. Only the first 1 MiB of stdout is kept; excess bytes are dropped and a truncated UTF-8 character is an error. A non-zero exit, empty output, or a run longer than 10 seconds is an error. | String[] | Yes, if `github.token` is empty | - |
-| `github.linkStack` | Link submitted GitHub.com pull requests as a native stack when `gh-stack` is installed; Enterprise hosts, `--no-hooks`, and dry runs skip linking. One 60-second deadline covers the entire linking phase, including the `jj` commands that rebuild the stack graph and all stacks; a command still running at the deadline is killed. Stacks with failed pushes or base updates, missing PRs, or non-linear ancestry warn and are not linked. Helper failures and timeouts warn without failing submit. | Boolean | No | true |
+
+If no non-empty repository- or workspace-level `github.host` or `github.project` is set, jj-vine derives each value from the push URL of `remoteName` (or its fetch URL when no separate push URL exists). The clone value takes precedence over global configuration; a repository- or workspace-level value takes precedence over derivation. When no host is configured or derived, `github.host` defaults to `https://api.github.com`. If neither derivation nor global configuration supplies `github.project`, set it explicitly or configuration loading fails. Detection is disabled for fork workflows with a separate `upstream` remote, or `fork` beside `origin`; set `github.project` explicitly in these layouts. An HTTP Enterprise remote cannot supply an authenticated API host.
 
 #### Forgejo/Codeberg/Gitea{#forgejo-codeberg-gitea}
 
@@ -336,7 +337,6 @@ These settings apply to all forges:
 | `defaultBaseBranch` | Default target branch for pull/merge requests into `trunk()` | String | No | (detected automatically using the `trunk()` revset) |
 | `openAsDraft` | Open newly created pull/merge requests as drafts | Boolean | No | false |
 | `fetch` | Whether to fetch the remote before planning a submission, or the `jj` command to run prior to planning. Defaults to true, which is equivalent to `jj git fetch --tracked`. This may also be set to an array, for example `["git", "fetch"]` will run `jj git fetch`. Set to false to disable fetching completely. If disabled, jj-vine may recreate deleted bookmarks, so be careful when disabling this. | Boolean \| String[] | No | true |
-| `push` | Push command as full argv; remote and bookmark/change flags are appended. `false` disables pushing. A custom command should preserve jj's `Nothing changed.` stderr to report a no-op accurately. `submit --no-hooks` uses the built-in command unless pushing is disabled. | Boolean \| String[] | No | true (`jj git push`) |
 | `description` | Configuration for pull/merge request description generation | Object (see below) | No | (see below) |
 
 ## Description Generation / Stack Visualization{#description-generation-stack-visualization}

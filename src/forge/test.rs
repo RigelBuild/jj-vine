@@ -2,11 +2,7 @@
 #![allow(clippy::missing_panics_doc, reason = "tests")]
 #![allow(clippy::module_name_repetitions, reason = "it's fine")]
 
-use std::{
-    borrow::Cow,
-    collections::{HashMap, HashSet},
-    sync::RwLock,
-};
+use std::{borrow::Cow, collections::HashMap, sync::RwLock};
 
 use bon::bon;
 
@@ -41,10 +37,6 @@ pub struct TestForge {
     users: HashMap<String, TestForgeUser>,
     current_user: TestForgeUser,
     state: RwLock<TestForgeState>,
-    /// Source branches whose merge request creation fails.
-    fail_create_for: HashSet<String>,
-    /// Source branches whose merge request base update fails.
-    fail_update_base_for: HashSet<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -83,8 +75,6 @@ impl TestForge {
         current_user: Option<TestForgeUser>,
         #[builder(default)] users: HashMap<String, TestForgeUser>,
         #[builder(default)] merge_requests: HashMap<String, MergeRequest>,
-        #[builder(default)] fail_create_for: HashSet<String>,
-        #[builder(default)] fail_update_base_for: HashSet<String>,
     ) -> Self {
         Self {
             project_id,
@@ -101,8 +91,6 @@ impl TestForge {
                 next_merge_request_id: 1,
                 merge_requests,
             }),
-            fail_create_for,
-            fail_update_base_for,
         }
     }
 
@@ -178,12 +166,6 @@ impl Forge for TestForge {
         &self,
         options: CreateMergeRequestOptions<Self::UserId>,
     ) -> Result<Self::MergeRequest> {
-        if self.fail_create_for.contains(&options.source_branch) {
-            return Err(Error::new(format!(
-                "test forge refused to create a merge request for {}",
-                options.source_branch
-            )));
-        }
         let mr = MergeRequest::builder()
             .id(self
                 .state
@@ -232,12 +214,6 @@ impl Forge for TestForge {
             .merge_requests
             .get_mut(merge_request_iid.as_ref())
             .ok_or(Error::new("Merge request not found"))?;
-        if self.fail_update_base_for.contains(&mr.source_branch) {
-            return Err(Error::new(format!(
-                "test forge refused to update the base of the merge request for {}",
-                mr.source_branch
-            )));
-        }
         mr.target_branch = new_base.to_owned();
         Ok(mr.clone())
     }

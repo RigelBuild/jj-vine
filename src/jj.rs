@@ -1,14 +1,7 @@
 use core::{cell::OnceCell, hash::BuildHasher};
 #[cfg(test)]
 use std::collections::{BTreeMap, BTreeSet};
-use std::{
-    borrow::Cow,
-    collections::HashSet,
-    ffi::OsStr,
-    path::{Path, PathBuf},
-    process::Command,
-    time::Instant,
-};
+use std::{collections::HashSet, ffi::OsStr, path::PathBuf, process::Command};
 
 use itertools::Itertools as _;
 use owo_colors::OwoColorize as _;
@@ -439,56 +432,29 @@ pub struct Jujutsu {
     /// The directory to run all jj commands from.
     cwd: PathBuf,
 
-    /// Value of `JJ_CONFIG` for spawned commands, for test isolation. An
-    /// empty path disables all user and system config files.
+    /// Config file supplied to spawned commands for test isolation.
     config_override: Option<PathBuf>,
-
-    /// When set, every command run through [`Jujutsu::exec`] must finish by
-    /// this instant. See [`Jujutsu::with_deadline`].
-    deadline: Option<Instant>,
 
     /// The default branch name.
     default_branch: OnceCell<Result<String, Error>>,
 }
 
-pub(crate) fn build_push_argv(
-    push_argv: &[String],
-    remote: Option<&str>,
-    bookmarks: impl IntoIterator<Item = String>,
-) -> Vec<String> {
-    let mut args = push_argv.to_vec();
-
-    if let Some(remote) = remote {
-        args.extend(["--remote".to_owned(), remote.to_owned()]);
-    }
-
-    for bookmark in bookmarks {
-        args.extend(["--bookmark".to_owned(), bookmark]);
-    }
-
-    args
-}
-
-pub(crate) fn build_push_create_argv(
-    push_argv: &[String],
-    remote: Option<&str>,
-    change_ids: impl IntoIterator<Item = String>,
-) -> Vec<String> {
-    let mut args = push_argv.to_vec();
-
-    if let Some(remote) = remote {
-        args.extend(["--remote".to_owned(), remote.to_owned()]);
-    }
-
-    for change_id in change_ids {
-        args.extend(["-c".to_owned(), change_id]);
-    }
-
-    args
-}
-
 #[cfg(test)]
 pub(crate) const ISOLATED_TEST_CONFIG: &str = "isolated-user-config.toml";
+
+#[cfg(test)]
+static ISOLATED_TEST_CONFIG_PATH: std::sync::LazyLock<PathBuf> = std::sync::LazyLock::new(|| {
+    let dir = tempfile::tempdir().expect("Failed to create isolated test config dir");
+    let config_path = dir.path().join("config.toml");
+    std::fs::write(&config_path, "").expect("Failed to write isolated test config");
+    dir.keep()
+});
+/// Whether [`Jujutsu`] traces a command's stdout and stderr.
+#[derive(Debug, Clone, Copy)]
+enum OutputLogging {
+    Full,
+    Redacted,
+}
 
 impl Jujutsu {
     /// Create a new Jujutsu instance for the given working directory.
@@ -497,10 +463,9 @@ impl Jujutsu {
         Ok(Self {
             cwd: cwd.into(),
             #[cfg(test)]
-            config_override: Some(PathBuf::new()),
+            config_override: Some(ISOLATED_TEST_CONFIG_PATH.clone()),
             #[cfg(not(test))]
             config_override: None,
-            deadline: None,
             default_branch: OnceCell::new(),
         })
     }
@@ -515,35 +480,31 @@ impl Jujutsu {
         Ok(Self {
             cwd: cwd.into(),
             config_override: Some(config_path.into()),
-            deadline: None,
             default_branch: OnceCell::new(),
         })
     }
 
-    /// A copy of this instance whose jj commands must all finish by
-    /// `deadline`, for a phase with a fixed wall-clock budget.
-    ///
-    /// Every command run through [`Jujutsu::exec`] must finish by the same
-    /// `deadline`; the time to spawn each command counts against it, so a
-    /// run of commands cannot extend the phase. A command that would start
-    /// at or after the deadline is not spawned, and one still running at the
-    /// deadline is killed together with its process group (Unix) or job
-    /// (Windows) and reaped. Both cases return a [`Error::JjCommand`] error.
-    /// A bounded command runs non-interactively with stdin from the null
-    /// device, and each output stream is capped (see [`crate::process`]).
-    /// [`Jujutsu::exec_argv`] is not bounded.
-    #[must_use]
-    pub(crate) fn with_deadline(&self, deadline: Instant) -> Self {
-        Self {
-            cwd: self.cwd.clone(),
-            config_override: self.config_override.clone(),
-            deadline: Some(deadline),
-            default_branch: OnceCell::new(),
-        }
-    }
-
     /// Run a jj command and return the output.
     pub fn exec<S, T>(&self, args: T) -> Result<CommandOutput>
+    where
+        S: AsRef<OsStr>,
+        T: IntoIterator<Item = S>,
+    {
+        self.exec_inner(args, OutputLogging::Full)
+    }
+
+    /// Run a jj command whose output may carry secrets, such as remote URLs
+    /// with embedded credentials. Neither traces nor the error include the
+    /// command's stdout or stderr.
+    pub(crate) fn exec_redacted<S, T>(&self, args: T) -> Result<CommandOutput>
+    where
+        S: AsRef<OsStr>,
+        T: IntoIterator<Item = S>,
+    {
+        self.exec_inner(args, OutputLogging::Redacted)
+    }
+
+    fn exec_inner<S, T>(&self, args: T, logging: OutputLogging) -> Result<CommandOutput>
     where
         S: AsRef<OsStr>,
         T: IntoIterator<Item = S>,
@@ -555,28 +516,26 @@ impl Jujutsu {
         let jj_bin = Self::which()?;
         let mut command = Command::new(&jj_bin);
         command.current_dir(&self.cwd).args(args);
-        self.apply_config_override(&mut command);
-        let output = match self.deadline {
-            None => command.output()?,
-            Some(deadline) => {
-                let deadline_passed = || {
-                    JjCommandSnafu {
-                        message: format!("jj {args_string} did not finish before its deadline"),
-                        output: None,
-                    }
-                    .build()
-                };
-                crate::process::output_by_deadline(command, deadline)?
-                    .ok_or_else(deadline_passed)?
-            }
-        };
+        if let Some(config_path) = &self.config_override {
+            command.env("JJ_CONFIG", config_path);
+        }
+        let output = command.output()?;
 
         let stderr = String::from_utf8_lossy(&output.stderr);
 
         if !output.status.success() {
-            return Err(JjCommandSnafu {
-                message: format!("jj {args_string} failed: {stderr}"),
-                output: Some(output),
+            return Err(match logging {
+                OutputLogging::Full => JjCommandSnafu {
+                    message: format!("jj {args_string} failed: {stderr}"),
+                    output: Some(output),
+                },
+                OutputLogging::Redacted => JjCommandSnafu {
+                    message: format!(
+                        "jj {args_string} failed with {} (output redacted)",
+                        output.status
+                    ),
+                    output: None,
+                },
             }
             .build());
         }
@@ -584,98 +543,18 @@ impl Jujutsu {
         // TODO interleave
         let stdout = String::from_utf8_lossy(&output.stdout);
 
-        trace!("jj command output: {}", stdout);
-        trace!("jj command stderr: {}", stderr);
+        match logging {
+            OutputLogging::Full => {
+                trace!("jj command output: {}", stdout);
+                trace!("jj command stderr: {}", stderr);
+            }
+            OutputLogging::Redacted => trace!("jj command output redacted"),
+        }
         Ok(CommandOutput {
             status: output.status,
             stdout: stdout.to_string(),
             stderr: stderr.to_string(),
         })
-    }
-
-    /// Run an arbitrary command given as a full argv (`argv[0]` is the binary).
-    pub fn exec_argv(&self, argv: &[String]) -> Result<CommandOutput> {
-        let Some((bin, bin_args)) = argv.split_first() else {
-            return Err(ConfigSnafu {
-                message: "push command must not be empty".to_owned(),
-            }
-            .build());
-        };
-
-        // Resolve bare names before asking for the caller's cwd. An absolute
-        // PATH result does not depend on that cwd, which may no longer exist.
-        let has_bin_path = bin.contains(std::path::is_separator);
-        let resolved_bin = if has_bin_path {
-            None
-        } else {
-            Some(which::which(bin).map_err(|_| {
-                ConfigSnafu {
-                    message: "push command executable not found in PATH".to_owned(),
-                }
-                .build()
-            })?)
-        };
-        let caller_cwd = if !self.cwd.is_absolute()
-            || resolved_bin
-                .as_ref()
-                .is_some_and(|bin_path| bin_path.is_relative())
-        {
-            Some(std::env::current_dir()?)
-        } else {
-            None
-        };
-        let selected_cwd = match caller_cwd.as_ref() {
-            Some(caller_cwd) if !self.cwd.is_absolute() => Cow::Owned(caller_cwd.join(&self.cwd)),
-            _ => Cow::Borrowed(self.cwd.as_path()),
-        };
-        let bin_path = match resolved_bin {
-            Some(bin_path) if bin_path.is_absolute() => bin_path,
-            Some(bin_path) => caller_cwd
-                .as_ref()
-                .map(|caller_cwd| caller_cwd.join(bin_path))
-                .ok_or_else(|| {
-                    ConfigSnafu {
-                        message: "relative PATH executable requires caller working directory"
-                            .to_owned(),
-                    }
-                    .build()
-                })?,
-            None => {
-                let bin_path = Path::new(bin);
-                if bin_path.is_absolute() {
-                    bin_path.to_path_buf()
-                } else {
-                    selected_cwd.join(bin_path)
-                }
-            }
-        };
-        trace!("Running configured push command");
-
-        let mut command = Command::new(bin_path);
-        command.current_dir(selected_cwd.as_ref()).args(bin_args);
-        self.apply_config_override(&mut command);
-        let output = command.output()?;
-        if !output.status.success() {
-            return Err(JjCommandSnafu {
-                message: format!("push command failed with {}", output.status),
-                output: None,
-            }
-            .build());
-        }
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        Ok(CommandOutput {
-            status: output.status,
-            stdout: stdout.to_string(),
-            stderr: stderr.to_string(),
-        })
-    }
-
-    fn apply_config_override(&self, command: &mut Command) {
-        if let Some(config_path) = &self.config_override {
-            command.env("JJ_CONFIG", config_path);
-        }
     }
 
     /// Find the jj binary.
@@ -809,40 +688,50 @@ impl Jujutsu {
         self.exec(args).map(|_| ())
     }
 
-    /// Push bookmarks through `push_argv`, tracking them when needed.
+    /// Push a bookmark to a remote using jj git push. This will automatically
+    /// track the bookmark on the remote if it's not already tracked.
     pub fn push_bookmarks(
         &self,
         bookmarks: impl IntoIterator<Item = impl JJName + Copy>,
         remote: Option<&str>,
-        push_argv: &[String],
     ) -> Result<bool> {
-        let bookmark_names = bookmarks.into_iter().map(|bookmark| bookmark.name_for_jj());
-        let args = build_push_argv(push_argv, remote, bookmark_names);
-        let output = if push_argv == ["jj", "git", "push"] {
-            self.exec(args.iter().skip(1))?
-        } else {
-            self.exec_argv(&args)?
-        };
+        let mut args = vec!["git".to_owned(), "push".to_owned()];
+
+        if let Some(remote) = remote {
+            args.push("--remote".to_owned());
+            args.push(remote.to_owned());
+        }
+
+        for bookmark in bookmarks {
+            args.push("--bookmark".to_owned());
+            args.push(bookmark.name_for_jj());
+        }
+
+        let output = self.exec(&args)?;
 
         Ok(!output.stderr.contains("Nothing changed."))
     }
 
-    /// Create bookmarks for changes and push them through `push_argv`.
+    /// Create a bookmark for a change and push it in one step.
+    /// Uses jj's push bookmark template to generate the bookmark name.
     pub fn push_changes_create(
         &self,
         change_ids: impl IntoIterator<Item = impl AsRef<str>>,
         remote: Option<&str>,
-        push_argv: &[String],
     ) -> Result<()> {
-        let change_ids = change_ids
-            .into_iter()
-            .map(|change_id| change_id.as_ref().to_owned());
-        let args = build_push_create_argv(push_argv, remote, change_ids);
-        if push_argv == ["jj", "git", "push"] {
-            self.exec(args.iter().skip(1))?;
-        } else {
-            self.exec_argv(&args)?;
+        let mut args = vec!["git".to_owned(), "push".to_owned()];
+
+        if let Some(remote) = remote {
+            args.push("--remote".to_owned());
+            args.push(remote.to_owned());
         }
+
+        for change_id in change_ids {
+            args.push("-c".to_owned());
+            args.push(change_id.as_ref().to_owned());
+        }
+
+        self.exec(&args)?;
 
         Ok(())
     }
@@ -856,50 +745,6 @@ impl Jujutsu {
             .filter(|line| !line.trim().is_empty())
             .map(ToOwned::to_owned)
             .collect())
-    }
-
-    /// Returns the subset of `bookmarks` whose local target matches the
-    /// tracked bookmark on `remote`.
-    ///
-    /// A bookmark that is untracked, missing, or stale on `remote` is left out,
-    /// even when it is synced with another remote.
-    pub fn bookmarks_synced_with_remote<'a>(
-        &self,
-        bookmarks: impl IntoIterator<Item = &'a str>,
-        remote: &str,
-    ) -> Result<HashSet<String>> {
-        let name_patterns: Vec<_> = bookmarks
-            .into_iter()
-            .map(|name| format!("exact:{}", revset_string_literal(name)))
-            .collect();
-        if name_patterns.is_empty() {
-            return Ok(HashSet::new());
-        }
-
-        let remote_pattern = format!("exact:{}", revset_string_literal(remote));
-        let output = self.exec(
-            [
-                "bookmark",
-                "list",
-                "--remote",
-                remote_pattern.as_str(),
-                "--template",
-                r#"if(remote && tracked && synced, json(name) ++ "\n")"#,
-            ]
-            .into_iter()
-            .chain(name_patterns.iter().map(String::as_str)),
-        )?;
-
-        output
-            .stdout
-            .lines()
-            .filter(|line| !line.trim().is_empty())
-            .map(|line| {
-                serde_json::from_str(line).context(JsonSnafu {
-                    json: line.to_owned(),
-                })
-            })
-            .collect()
     }
 
     /// Check if a bookmark exists on a remote.
@@ -960,19 +805,6 @@ impl Jujutsu {
             .as_ref().map_err::<Error, _>(|e| make_whatever!("{}", e.to_string()))?
             .as_str())
     }
-
-    /// Return the repository working directory used for subprocesses.
-    #[must_use]
-    pub fn cwd(&self) -> &std::path::Path {
-        &self.cwd
-    }
-}
-
-/// Quotes `value` as a jj string literal. JSON and jj share the escapes for
-/// quotes, backslashes, and common whitespace; jj rejects other JSON control
-/// escapes, so such a name fails the command instead of matching wrongly.
-fn revset_string_literal(value: &str) -> String {
-    serde_json::Value::String(value.to_owned()).to_string()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -1141,11 +973,7 @@ mod tests {
             &remote_dir.to_string_lossy(),
         ])?;
 
-        jj.push_bookmarks(
-            ["feature-a"],
-            Some("origin"),
-            &["jj".to_owned(), "git".to_owned(), "push".to_owned()],
-        )?;
+        jj.push_bookmarks(["feature-a"], Some("origin"))?;
 
         let tracked = jj.log("(mine() & tracked_remote_bookmarks()) ~ trunk()")?;
 
@@ -1156,465 +984,6 @@ mod tests {
             "Should track feature-a"
         );
 
-        Ok(())
-    }
-    fn argv(parts: &[&str]) -> Vec<String> {
-        parts.iter().map(|part| (*part).to_owned()).collect()
-    }
-
-    #[test]
-    fn build_push_argv_appends_remote_and_bookmark_flags() {
-        let result = build_push_argv(
-            &argv(&["custom-push", "push"]),
-            Some("origin"),
-            ["feature-a".to_owned(), "feature-b".to_owned()],
-        );
-
-        assert_eq!(
-            result,
-            argv(&[
-                "custom-push",
-                "push",
-                "--remote",
-                "origin",
-                "--bookmark",
-                "feature-a",
-                "--bookmark",
-                "feature-b",
-            ])
-        );
-    }
-
-    #[test]
-    fn build_push_create_argv_appends_remote_and_change_flags() {
-        let result = build_push_create_argv(
-            &argv(&["custom-push", "push"]),
-            Some("origin"),
-            ["qpvuntsm".to_owned(), "kkmpptxz".to_owned()],
-        );
-
-        assert_eq!(
-            result,
-            argv(&[
-                "custom-push",
-                "push",
-                "--remote",
-                "origin",
-                "-c",
-                "qpvuntsm",
-                "-c",
-                "kkmpptxz",
-            ])
-        );
-    }
-
-    #[test]
-    fn exec_argv_rejects_empty_argv() {
-        let temp_dir = TempDir::new().expect("temp dir");
-        let jj = Jujutsu::new(temp_dir.path()).expect("jj instance");
-
-        let error = jj.exec_argv(&[]).expect_err("empty argv must be rejected");
-
-        assert!(error.to_string().contains("push command must not be empty"));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn exec_argv_resolves_relative_binary_in_selected_repo() {
-        use std::os::unix::fs::PermissionsExt as _;
-
-        let repo = TempDir::new().expect("selected repository");
-        let script = repo.path().join("push-command");
-        std::fs::write(&script, "#!/bin/sh\nprintf selected-repo").expect("write command");
-        let mut permissions = std::fs::metadata(&script)
-            .expect("command metadata")
-            .permissions();
-        permissions.set_mode(0o700);
-        std::fs::set_permissions(&script, permissions).expect("mark command executable");
-
-        let jj = Jujutsu::new(repo.path()).expect("jj instance");
-        let output = jj
-            .exec_argv(&argv(&["./push-command"]))
-            .expect("resolve the configured command under the selected repository");
-        assert_eq!(output.stdout, "selected-repo");
-    }
-
-    #[cfg(unix)]
-    fn write_executable(path: &Path, contents: &str) -> std::io::Result<()> {
-        use std::os::unix::fs::PermissionsExt as _;
-
-        std::fs::write(path, contents)?;
-        let mut permissions = std::fs::metadata(path)?.permissions();
-        permissions.set_mode(0o700);
-        std::fs::set_permissions(path, permissions)
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn exec_argv_resolves_relative_repo_from_separate_process_cwd() -> Result<()> {
-        const CHILD_MODE: &str = "JJ_VINE_TEST_RELATIVE_REPO_CWD";
-        if std::env::var_os(CHILD_MODE).is_some() {
-            let jj = Jujutsu::new("repo")?;
-            let output = jj.exec_argv(&argv(&["./scripts/push"]))?;
-            assert_eq!(output.stdout, "selected-repo");
-            return Ok(());
-        }
-
-        let temp = TempDir::new()?;
-        let caller = temp.path().join("caller");
-        let repo = caller.join("repo");
-        std::fs::create_dir_all(repo.join("scripts"))?;
-        write_executable(
-            &repo.join("scripts/push"),
-            "#!/bin/sh\nprintf selected-repo\n",
-        )?;
-
-        let caller_alias = temp.path().join("caller-alias");
-        std::os::unix::fs::symlink(&caller, &caller_alias)?;
-        let output = std::process::Command::new(std::env::current_exe()?)
-            .args([
-                "--exact",
-                "jj::tests::exec_argv_resolves_relative_repo_from_separate_process_cwd",
-            ])
-            .current_dir(caller_alias)
-            .env(CHILD_MODE, "1")
-            .output()?;
-        assert!(
-            output.status.success(),
-            "child test failed: {}",
-            String::from_utf8_lossy(&output.stderr),
-        );
-        Ok(())
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn exec_argv_resolves_relative_path_entry_from_caller_cwd() -> Result<()> {
-        const CHILD_MODE: &str = "JJ_VINE_TEST_RELATIVE_PATH_ENTRY";
-        if std::env::var_os(CHILD_MODE).is_some() {
-            let jj = Jujutsu::new("repo")?;
-            let output = jj.exec_argv(&argv(&["push-command"]))?;
-            assert_eq!(output.stdout, "caller-path");
-            return Ok(());
-        }
-
-        let temp = TempDir::new()?;
-        let caller = temp.path().join("caller");
-        std::fs::create_dir_all(caller.join("repo"))?;
-        std::fs::create_dir_all(caller.join("bin"))?;
-        write_executable(
-            &caller.join("bin/push-command"),
-            "#!/bin/sh\nprintf caller-path\n",
-        )?;
-
-        let mut path = std::ffi::OsString::from("bin:");
-        path.push(
-            std::env::var_os("PATH").ok_or_else(|| {
-                std::io::Error::new(std::io::ErrorKind::NotFound, "PATH is not set")
-            })?,
-        );
-        let output = std::process::Command::new(std::env::current_exe()?)
-            .args([
-                "--exact",
-                "jj::tests::exec_argv_resolves_relative_path_entry_from_caller_cwd",
-            ])
-            .current_dir(&caller)
-            .env(CHILD_MODE, "1")
-            .env("PATH", path)
-            .output()?;
-        assert!(
-            output.status.success(),
-            "child test failed: {}",
-            String::from_utf8_lossy(&output.stderr),
-        );
-        Ok(())
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn exec_argv_resolves_absolute_path_binary_after_caller_cwd_is_deleted() -> Result<()> {
-        const CHILD_MODE: &str = "JJ_VINE_TEST_DELETED_CALLER_CWD";
-        const CALLER_DIR: &str = "JJ_VINE_TEST_CALLER_DIR";
-        const REPO_DIR: &str = "JJ_VINE_TEST_REPO_DIR";
-        if std::env::var_os(CHILD_MODE).is_some() {
-            let caller = std::env::var_os(CALLER_DIR)
-                .map(PathBuf::from)
-                .ok_or_else(|| {
-                    std::io::Error::new(std::io::ErrorKind::NotFound, "caller directory missing")
-                })?;
-            let repo = std::env::var_os(REPO_DIR)
-                .map(PathBuf::from)
-                .ok_or_else(|| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::NotFound,
-                        "repository directory missing",
-                    )
-                })?;
-            std::fs::remove_dir(caller)?;
-
-            let jj = Jujutsu {
-                cwd: repo,
-                config_override: Some(PathBuf::new()),
-                deadline: None,
-                default_branch: OnceCell::new(),
-            };
-            let output = jj.exec_argv(&argv(&["push-command"]))?;
-            assert_eq!(output.stdout, "absolute-path");
-            return Ok(());
-        }
-
-        let temp = TempDir::new()?;
-        let caller = temp.path().join("caller");
-        let repo = temp.path().join("repo");
-        let bin = temp.path().join("bin");
-        std::fs::create_dir_all(&caller)?;
-        std::fs::create_dir_all(&repo)?;
-        std::fs::create_dir_all(&bin)?;
-        write_executable(&bin.join("push-command"), "#!/bin/sh\nprintf absolute-path")?;
-
-        let mut path = bin.as_os_str().to_owned();
-        path.push(":");
-        path.push(
-            std::env::var_os("PATH").ok_or_else(|| {
-                std::io::Error::new(std::io::ErrorKind::NotFound, "PATH is not set")
-            })?,
-        );
-        let output = std::process::Command::new(std::env::current_exe()?)
-            .args([
-                "--exact",
-                "jj::tests::exec_argv_resolves_absolute_path_binary_after_caller_cwd_is_deleted",
-            ])
-            .current_dir(&caller)
-            .env(CHILD_MODE, "1")
-            .env(CALLER_DIR, &caller)
-            .env(REPO_DIR, &repo)
-            .env("PATH", path)
-            .output()?;
-        assert!(
-            output.status.success(),
-            "child test failed: {}",
-            String::from_utf8_lossy(&output.stderr),
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn failed_argv_command_does_not_disclose_arguments_or_stderr() {
-        let temp = TempDir::new().expect("temp dir");
-        let jj = Jujutsu::new(temp.path()).expect("jj instance");
-        let sentinel = "push-sentinel-secret-value";
-        let argv = vec![
-            "sh".to_owned(),
-            "-c".to_owned(),
-            format!("printf '%s' '{sentinel}' >&2; exit 7"),
-            sentinel.to_owned(),
-        ];
-
-        let error = jj.exec_argv(&argv).expect_err("command must fail");
-        let message = error.to_string();
-        let diagnostic = format!("{error:?}");
-
-        assert!(message.contains("push command failed with"));
-        assert!(!message.contains(sentinel));
-        assert!(!diagnostic.contains(sentinel));
-        let Error::JjCommand { output, .. } = error else {
-            panic!("configured push failure uses the JjCommand variant");
-        };
-        assert!(output.is_none(), "failed command output must not escape");
-    }
-    #[test]
-    fn builtin_push_failure_preserves_jj_diagnostic() {
-        let temp = TempDir::new().expect("temp dir");
-        let jj = Jujutsu::new(temp.path()).expect("jj instance");
-        let error = jj
-            .push_bookmarks(["missing-bookmark"], None, &argv(&["jj", "git", "push"]))
-            .expect_err("push from a non-repository must fail");
-        assert!(error.to_string().contains("jj git push"));
-        assert!(!error.to_string().contains("push command failed with"));
-    }
-
-    #[test]
-    fn bounded_exec_returns_output_before_deadline() -> Result<()> {
-        let (_temp, repo_path) = create_test_repo()?;
-        let jj = Jujutsu::new(repo_path)?
-            .with_deadline(Instant::now() + core::time::Duration::from_secs(60));
-
-        let root = jj.log("root()")?;
-        assert_eq!(root.len(), 1, "a bounded log must still parse jj output");
-        Ok(())
-    }
-
-    /// Whether `pid` names a process that exists and is not a zombie. A
-    /// killed descendant is reparented and may be reaped late, but a zombie
-    /// runs no code.
-    #[cfg(unix)]
-    fn is_running(pid: &str) -> bool {
-        let output = std::process::Command::new("ps")
-            .args(["-o", "stat=", "-p", pid])
-            .stderr(std::process::Stdio::null())
-            .output()
-            .expect("ps must run");
-        let state = String::from_utf8_lossy(&output.stdout);
-        let state = state.trim();
-        !state.is_empty() && !state.starts_with('Z')
-    }
-
-    #[cfg(unix)]
-    fn process_gone_within(pid: &str, within: core::time::Duration) -> bool {
-        let start = Instant::now();
-        while start.elapsed() < within {
-            if !is_running(pid) {
-                return true;
-            }
-            std::thread::sleep(core::time::Duration::from_millis(20));
-        }
-        false
-    }
-
-    /// Environment variable naming the directory where the fake `jj` records
-    /// pids. The script reads it, so no path is spliced into shell source.
-    #[cfg(unix)]
-    const HUNG_JJ_PID_DIR: &str = "JJ_VINE_TEST_PID_DIR";
-
-    /// Write a fake `jj` into `bin` that records its pid and its descendant's
-    /// pid in the directory named by [`HUNG_JJ_PID_DIR`], then hangs.
-    #[cfg(unix)]
-    fn write_hung_jj(bin: &Path) -> std::io::Result<()> {
-        std::fs::create_dir_all(bin)?;
-        write_executable(&bin.join("jj"), HUNG_JJ_SCRIPT)
-    }
-
-    /// The fake `jj` body for [`write_hung_jj`]. Opening the FIFO for reading
-    /// blocks until the descendant opens it for writing, which it does only
-    /// after its pid file is complete. The fake writes its own pid only after
-    /// that, so `jj.pid` existing proves the whole tree was running.
-    #[cfg(unix)]
-    const HUNG_JJ_SCRIPT: &str = "#!/bin/sh\n\
-        dir=\"$JJ_VINE_TEST_PID_DIR\"\n\
-        mkfifo \"$dir/ready\"\n\
-        sh -c 'echo $$ > \"$1/descendant.pid\"; echo > \"$1/ready\"; exec sleep 30' _ \"$dir\" &\n\
-        read _ < \"$dir/ready\"\n\
-        echo $$ > \"$dir/jj.pid\"\n\
-        exec sleep 30\n";
-
-    /// `PATH` with `dir` searched first, so a fake `jj` there shadows the
-    /// real one while `sh` and `sleep` still resolve.
-    #[cfg(unix)]
-    fn path_with_first(dir: &Path) -> std::io::Result<std::ffi::OsString> {
-        let mut path = dir.as_os_str().to_owned();
-        path.push(":");
-        path.push(
-            std::env::var_os("PATH").ok_or_else(|| {
-                std::io::Error::new(std::io::ErrorKind::NotFound, "PATH is not set")
-            })?,
-        );
-        Ok(path)
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn bounded_exec_kills_hung_jj_tree_at_deadline() -> Result<()> {
-        const CHILD_MODE: &str = "JJ_VINE_TEST_HUNG_JJ";
-        const REPO_DIR: &str = "JJ_VINE_TEST_REPO_DIR";
-        if std::env::var_os(CHILD_MODE).is_some() {
-            let repo = std::env::var_os(REPO_DIR)
-                .map(PathBuf::from)
-                .ok_or_else(|| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::NotFound,
-                        "repository directory missing",
-                    )
-                })?;
-            let jj = Jujutsu::new(repo)?
-                .with_deadline(Instant::now() + core::time::Duration::from_millis(300));
-            let start = Instant::now();
-            let error = jj
-                .log("@")
-                .expect_err("a hung jj must fail at the deadline");
-            assert!(
-                start.elapsed() < core::time::Duration::from_secs(5),
-                "a hung jj must not be waited out, took {:?}",
-                start.elapsed()
-            );
-            assert!(
-                matches!(&error, Error::JjCommand { message, .. }
-                    if message.contains("did not finish before its deadline")),
-                "got {error:?}"
-            );
-            return Ok(());
-        }
-
-        let temp = TempDir::new()?;
-        let bin = temp.path().join("bin");
-        write_hung_jj(&bin)?;
-        let output = std::process::Command::new(std::env::current_exe()?)
-            .args([
-                "--exact",
-                "jj::tests::bounded_exec_kills_hung_jj_tree_at_deadline",
-            ])
-            .env(CHILD_MODE, "1")
-            .env(REPO_DIR, temp.path())
-            .env(HUNG_JJ_PID_DIR, temp.path())
-            .env("PATH", path_with_first(&bin)?)
-            .output()?;
-        assert!(
-            output.status.success(),
-            "child test failed: {}",
-            String::from_utf8_lossy(&output.stdout),
-        );
-        for name in ["jj.pid", "descendant.pid"] {
-            let pid = std::fs::read_to_string(temp.path().join(name))?;
-            assert!(
-                process_gone_within(pid.trim(), core::time::Duration::from_secs(5)),
-                "{name}: a jj command killed at its deadline must not leave a process running"
-            );
-        }
-        Ok(())
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn expired_deadline_never_spawns_jj() -> Result<()> {
-        const CHILD_MODE: &str = "JJ_VINE_TEST_EXPIRED_JJ";
-        const REPO_DIR: &str = "JJ_VINE_TEST_REPO_DIR";
-        if std::env::var_os(CHILD_MODE).is_some() {
-            let repo = std::env::var_os(REPO_DIR)
-                .map(PathBuf::from)
-                .ok_or_else(|| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::NotFound,
-                        "repository directory missing",
-                    )
-                })?;
-            let jj = Jujutsu::new(repo)?.with_deadline(Instant::now());
-            let error = jj.log("@").expect_err("an expired deadline must fail");
-            assert!(
-                matches!(&error, Error::JjCommand { message, .. }
-                    if message.contains("did not finish before its deadline")),
-                "got {error:?}"
-            );
-            return Ok(());
-        }
-
-        let temp = TempDir::new()?;
-        let bin = temp.path().join("bin");
-        write_hung_jj(&bin)?;
-        let output = std::process::Command::new(std::env::current_exe()?)
-            .args(["--exact", "jj::tests::expired_deadline_never_spawns_jj"])
-            .env(CHILD_MODE, "1")
-            .env(REPO_DIR, temp.path())
-            .env(HUNG_JJ_PID_DIR, temp.path())
-            .env("PATH", path_with_first(&bin)?)
-            .output()?;
-        assert!(
-            output.status.success(),
-            "child test failed: {}",
-            String::from_utf8_lossy(&output.stdout),
-        );
-        assert!(
-            !temp.path().join("jj.pid").exists(),
-            "jj must not start once the deadline has passed"
-        );
         Ok(())
     }
 }
