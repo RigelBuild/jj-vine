@@ -1,3 +1,5 @@
+# Dated nightly so the flake build is reproducible; kept in step with the
+# RigelBuild/orion root pin. Upstream builds on stable; nightly is for rustfmt/clippy.
 [toolchain]
-# Nightly only needed for rustfmt, trying to keep main code working on stable
-channel = "nightly"
+channel = "nightly-2026-08-21"
+components = ["rustfmt", "clippy"]

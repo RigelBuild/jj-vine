@@ -62,6 +62,9 @@ jobs:
     name: Build - ${{ matrix.platform.target }}
     runs-on: ${{ matrix.platform.os }}
     needs: test
+    # Release artifacts only on dispatch: PR refs make VERSION="N/merge" and
+    # break the copy step. Fork consumers build from source via the flake.
+    if: github.event_name == 'workflow_dispatch'
     permissions:
       id-token: write
       contents: read
