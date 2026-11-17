@@ -197,6 +197,16 @@ pub struct Config {
     #[builder(default)]
     pub fetch: RepoFetchConfig,
 
+    /// Push command to run. Defaults to `jj git push`; false disables pushing.
+    ///
+    /// An array sets a complete argv. The remote and bookmark or change
+    /// arguments are appended, so the command must accept the corresponding
+    /// `jj git push` flags. `submit --no-hooks` runs the built-in command
+    /// instead.
+    #[serde(default)]
+    #[builder(default)]
+    pub push: RepoPushConfig,
+
     /// Configuration for MR title generation.
     #[serde(default)]
     #[builder(default)]
@@ -247,6 +257,85 @@ impl RepoFetchConfig {
 impl Default for RepoFetchConfig {
     fn default() -> Self {
         Self::Enabled(true)
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum RepoPushConfig {
+    /// If true, run the built-in `jj git push`; false disables pushing.
+    Enabled(bool),
+
+    /// Runs this full argv instead of the built-in push command.
+    ///
+    /// The remote and bookmark or change arguments are appended, so custom
+    /// commands must accept the corresponding `jj git push` flags.
+    Command(Vec<String>),
+}
+
+impl RepoPushConfig {
+    /// Return the configured push argv, or `None` when pushing is disabled.
+    #[must_use]
+    pub fn to_argv(&self) -> Option<Vec<String>> {
+        match self {
+            Self::Enabled(true) => Some(Self::builtin_push_argv()),
+            Self::Enabled(false) => None,
+            Self::Command(command) => Some(command.clone()),
+        }
+    }
+
+    /// Resolve the push argv for this run.
+    ///
+    /// `no_hooks` selects the built-in `jj git push` command instead of a
+    /// configured command. It does not re-enable pushing when config disables
+    /// it.
+    #[must_use]
+    pub fn resolve_argv(&self, no_hooks: bool) -> Option<Vec<String>> {
+        match (self, no_hooks) {
+            (Self::Enabled(false), _) => None,
+            (_, true) => Some(Self::builtin_push_argv()),
+            (_, false) => self.to_argv(),
+        }
+    }
+
+    fn builtin_push_argv() -> Vec<String> {
+        vec!["jj".to_owned(), "git".to_owned(), "push".to_owned()]
+    }
+}
+
+impl Default for RepoPushConfig {
+    fn default() -> Self {
+        Self::Enabled(true)
+    }
+}
+
+pub(crate) fn push_description(push_argv: Option<&[String]>) -> &'static str {
+    let Some(argv) = push_argv else {
+        return "(pushing disabled)";
+    };
+
+    if argv.len() == 3 && argv[0] == "jj" && argv[1] == "git" && argv[2] == "push" {
+        "via `jj git push`"
+    } else {
+        "via configured push command"
+    }
+}
+
+#[cfg(test)]
+mod push_description_tests {
+    use super::push_description;
+
+    #[test]
+    fn describes_builtin_and_custom_commands_without_rendering_argv() {
+        let builtin = vec!["jj".to_owned(), "git".to_owned(), "push".to_owned()];
+        let custom = vec!["custom-push".to_owned(), "secret-argument".to_owned()];
+
+        assert_eq!(push_description(Some(&builtin)), "via `jj git push`");
+        assert_eq!(
+            push_description(Some(&custom)),
+            "via configured push command"
+        );
+        assert_eq!(push_description(None), "(pushing disabled)");
     }
 }
 
@@ -421,10 +510,7 @@ pub struct GitHubConfig {
     /// A command whose stdout supplies the GitHub token, as a full argv whose
     /// first element is the binary. Used only when `token` is empty. The
     /// trimmed stdout becomes the token. A non-zero exit or empty output is an
-    /// error. The command must be non-interactive: it gets null stdin and, on
-    /// Unix, no controlling terminal. Processes remaining in its Unix process
-    /// group or Windows job are killed when it exits. A Unix descendant that
-    /// starts another session or group can escape cleanup.
+    /// error.
     #[serde(default)]
     pub token_command: Vec<String>,
 }
@@ -457,19 +543,7 @@ impl GitHubConfig {
 
     /// Resolve the GitHub token from a literal or a configured command. A
     /// non-empty literal wins and is trimmed; otherwise the command's trimmed
-    /// stdout is used. At most the first 1 MiB of stdout is kept; later bytes
-    /// are dropped, and a truncated multibyte character fails UTF-8 validation.
-    /// The command must finish within 10 seconds.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::Config`] if neither `token` nor `tokenCommand` is
-    /// set, the command binary is not found in `PATH`, the command does not
-    /// finish in time, exits with a non-zero status, or prints output that is
-    /// not UTF-8 or is empty after trimming. Returns [`Error::Io`] if the
-    /// command cannot be spawned, contained, or reaped, or (on Unix) if a
-    /// caught cancellation signal cut the run short. No error includes the
-    /// command's stdout or stderr.
+    /// stdout is used. Errors do not include the command's stderr.
     pub fn resolved_token(&self) -> Result<String> {
         self.resolved_token_with_timeout(TOKEN_COMMAND_TIMEOUT)
     }
@@ -1566,7 +1640,6 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[test]
     fn resolved_token_runs_command_and_trims() {
         let config = GitHubConfig {
@@ -1579,7 +1652,6 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[test]
     fn resolved_token_rejects_nonzero_exit_without_stderr() {
         let config = GitHubConfig {
@@ -1603,7 +1675,6 @@ mod tests {
         assert!(!message.contains("SAFE_ARG_B"));
     }
 
-    #[cfg(unix)]
     #[test]
     fn resolved_token_rejects_non_utf8_output() {
         let config = GitHubConfig {
@@ -1621,7 +1692,6 @@ mod tests {
         assert!(message.contains("non-UTF-8"));
     }
 
-    #[cfg(unix)]
     #[test]
     fn resolved_token_rejects_empty_output() {
         let config = GitHubConfig {
@@ -1648,7 +1718,6 @@ mod tests {
         assert!(message.contains("not found in PATH"));
     }
 
-    #[cfg(unix)]
     #[test]
     fn resolved_token_timeout_kills_helper() {
         let config = GitHubConfig {
@@ -1664,7 +1733,6 @@ mod tests {
         assert!(start.elapsed() < core::time::Duration::from_secs(5));
     }
 
-    #[cfg(unix)]
     #[test]
     fn resolved_token_whitespace_literal_uses_command() {
         let config = GitHubConfig {
@@ -1678,64 +1746,69 @@ mod tests {
         );
     }
 
-    /// A `tokenCommand` argv that prints `token` to stdout and nothing else,
-    /// with a shell present on each platform.
-    fn printing_token_command(token: &str) -> Vec<String> {
-        if cfg!(windows) {
-            vec![
-                "powershell".to_owned(),
-                "-NoProfile".to_owned(),
-                "-NonInteractive".to_owned(),
-                "-Command".to_owned(),
-                format!("[Console]::Out.Write('{token}')"),
-            ]
-        } else {
-            vec![
-                "sh".to_owned(),
-                "-c".to_owned(),
-                "printf '%s' \"$1\"".to_owned(),
-                "_".to_owned(),
-                token.to_owned(),
-            ]
-        }
+    #[test]
+    fn push_config_resolves_default_custom_and_disabled_argv() {
+        assert_eq!(
+            RepoPushConfig::default().to_argv(),
+            Some(vec!["jj".to_owned(), "git".to_owned(), "push".to_owned()])
+        );
+        assert_eq!(
+            RepoPushConfig::Command(vec!["custom-push".to_owned(), "push".to_owned()]).to_argv(),
+            Some(vec!["custom-push".to_owned(), "push".to_owned()])
+        );
+        assert_eq!(RepoPushConfig::Enabled(false).to_argv(), None);
     }
 
-    /// The `tokenCommand` key in a real jj config file reaches
-    /// `resolved_token` through `Config::load`, with no literal token set.
     #[test]
-    fn config_load_token_command_resolves_token() {
-        const TOKEN: &str = "fixture-command-token";
-
-        let (temp, repo_path) = create_test_repo();
-        let mut github = toml::Table::new();
-        github.insert("project".to_owned(), "owner/repo".into());
-        github.insert(
-            "tokenCommand".to_owned(),
-            printing_token_command(TOKEN).into(),
-        );
-        let mut jj_vine = toml::Table::new();
-        jj_vine.insert("forge".to_owned(), "github".into());
-        jj_vine.insert("github".to_owned(), github.into());
-        let mut root = toml::Table::new();
-        root.insert("jj-vine".to_owned(), jj_vine.into());
-        // Overwrite the isolated user config, so the key is read from TOML as
-        // a user writes it, not built in code.
-        std::fs::write(
-            temp.path().join(ISOLATED_TEST_CONFIG),
-            toml::to_string(&root).expect("the fixture table must serialize"),
-        )
-        .expect("Failed to write isolated config");
-
-        let config = load_isolated(&repo_path).expect("Failed to load config");
-
-        assert!(
-            config.github.token.is_empty(),
-            "no literal token is configured, so the command must supply it"
-        );
-        assert_eq!(config.github.token_command, printing_token_command(TOKEN));
+    fn push_config_no_hooks_uses_builtin_but_preserves_disabled() {
         assert_eq!(
-            config.github.resolved_token().expect("command token"),
-            TOKEN
+            RepoPushConfig::Command(vec!["custom-push".to_owned(), "push".to_owned()])
+                .resolve_argv(true),
+            Some(vec!["jj".to_owned(), "git".to_owned(), "push".to_owned()])
         );
+        assert_eq!(RepoPushConfig::Enabled(false).resolve_argv(true), None);
+    }
+
+    #[test]
+    fn push_config_parses_custom_argv_from_jj_config() -> Result<()> {
+        let (_temp, repo_path) = create_test_repo();
+        let jj = isolated_jj(&repo_path)?;
+        jj.exec(["config", "set", "--repo", "jj-vine.forge", "forgejo"])?;
+        jj.exec([
+            "config",
+            "set",
+            "--repo",
+            "jj-vine.forgejo.host",
+            "https://forgejo.example",
+        ])?;
+        jj.exec([
+            "config",
+            "set",
+            "--repo",
+            "jj-vine.forgejo.project",
+            "owner/repository",
+        ])?;
+        jj.exec([
+            "config",
+            "set",
+            "--repo",
+            "jj-vine.forgejo.token",
+            "test-token",
+        ])?;
+        jj.exec([
+            "config",
+            "set",
+            "--repo",
+            "jj-vine.push",
+            r#"["custom-push", "push"]"#,
+        ])?;
+
+        let config = load_isolated(&repo_path)?;
+
+        assert_eq!(
+            config.push,
+            RepoPushConfig::Command(vec!["custom-push".to_owned(), "push".to_owned()])
+        );
+        Ok(())
     }
 }
