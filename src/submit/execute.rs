@@ -23,6 +23,7 @@ use crate::{
     },
     error::{ClonableError, Error, Result},
     forge::AnyForgeMergeRequest,
+    jj::Change,
     submit::{
         ExecuteContext,
         RootExecuteContext,
@@ -94,6 +95,9 @@ pub struct SubmissionResult {
 
     /// Bookmarks that were successfully pushed.
     pub bookmarks_pushed: Vec<String>,
+
+    /// Changes after execution has assigned names to pending bookmarks.
+    pub changes: Vec<Change>,
 }
 
 #[derive(Debug, Clone)]
@@ -381,5 +385,40 @@ pub async fn execute(mut ctx: RootExecuteContext<'_>) -> Result<SubmissionResult
         merge_requests,
         errors,
         bookmarks_pushed,
+        changes: ctx.changes,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::jj::BookmarkInfo;
+
+    #[test]
+    fn submission_result_changes_carry_solidified_bookmark_names() {
+        let change_id = "abcd1234ef";
+        let mut change = Change::mock_from_change_id(change_id);
+        change.pending_bookmark = true;
+        assert!(change.bookmarks.is_empty());
+
+        let pending_display = change_id_to_temp_bookmark_name(change_id);
+        assert_eq!(pending_display, "(new bookmark for abcd1234)");
+
+        let solidified = "feature-real-name";
+        change.solidify_bookmark(solidified);
+        let result = SubmissionResult {
+            merge_requests: vec![],
+            errors: vec![],
+            bookmarks_pushed: vec![],
+            changes: vec![change],
+        };
+
+        let names: Vec<&str> = result
+            .changes
+            .iter()
+            .flat_map(|change| change.bookmarks.iter().map(BookmarkInfo::name))
+            .collect();
+        assert_eq!(names, vec![solidified]);
+        assert!(!result.changes[0].pending_bookmark);
+    }
 }

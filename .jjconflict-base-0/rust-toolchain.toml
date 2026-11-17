@@ -1,3 +1,0 @@
-[toolchain]
-# Nightly only needed for rustfmt, trying to keep main code working on stable
-channel = "nightly"
