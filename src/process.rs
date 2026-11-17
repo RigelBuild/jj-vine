@@ -1,8 +1,10 @@
 //! Shared bounded-subprocess helpers.
 //!
-//! `output_with_timeout` runs a non-interactive child process to completion
-//! under a wall-clock deadline and captures stdout/stderr into capped buffers,
-//! so a helper that fills a pipe cannot deadlock. The child gets null stdin.
+//! `output_by_deadline` runs a non-interactive child process to completion
+//! by an absolute wall-clock deadline, capturing stdout/stderr into capped
+//! buffers, so a helper that fills a pipe cannot deadlock. The child gets null
+//! stdin. Tests also use `output_with_timeout`, whose timeout starts at the
+//! call.
 //!
 //! Containment: the child runs in a new session and process group on Unix, or
 //! in a job object on Windows. When the child exits (with any status),
@@ -38,7 +40,10 @@
 //! left to a detached reader thread, so the call itself stays bounded.
 
 use core::time::Duration;
-use std::process::{Command, Stdio};
+use std::{
+    process::{Command, Stdio},
+    time::Instant,
+};
 
 /// Capture cap per stream. Bytes past the cap are read and dropped so a
 /// chatty child cannot fill the pipe and stall.
@@ -52,9 +57,38 @@ const DRAIN_GRACE: Duration = Duration::from_millis(500);
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 /// Run `command` to completion with a wall-clock `timeout`. Returns `Ok(None)`
-/// if the child overran the deadline. The clock is read after each exit
-/// check, so an exit first seen at or after the deadline is an overrun and a
-/// late child cannot return output.
+/// if the child overran the deadline. The timeout starts when this function
+/// is called; see [`output_by_deadline`] for the rest of the contract.
+/// Production callers pass an absolute deadline instead, so time spent before
+/// the call (such as a `PATH` lookup) counts against their budget.
+///
+/// # Errors
+///
+/// As [`output_by_deadline`]; also an error if `timeout` is too large to add
+/// to the current time.
+#[cfg(test)]
+pub(crate) fn output_with_timeout(
+    command: Command,
+    timeout: Duration,
+) -> std::io::Result<Option<std::process::Output>> {
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| std::io::Error::other("subprocess timeout is too large"))?;
+    output_by_deadline(command, deadline)
+}
+
+/// Run `command` to completion, finishing by the absolute instant `deadline`.
+/// Returns `Ok(None)` if the deadline passed first. The time to spawn and
+/// contain the child counts against the deadline. The deadline is checked
+/// last immediately before the platform spawn call (on Unix, after the
+/// cancellation lock is taken), so time spent waiting before it counts, and
+/// a command is not spawned if that check finds the deadline passed. The
+/// check and the OS process creation are not atomic: a spawn that starts
+/// before the deadline can create the child after it. Such a child may run
+/// briefly, but it is killed with its tree and reaped before `Ok(None)` is
+/// returned. The clock is read after each exit check, so an exit first seen
+/// at or after the deadline is an overrun and a late child cannot return
+/// output.
 ///
 /// The child and descendants still in its process group or job are killed when
 /// the child exits or overruns, and the child is reaped. See the module docs
@@ -71,15 +105,18 @@ const POLL_INTERVAL: Duration = Duration::from_millis(10);
 /// Unix, a run cut short by a caught cancellation signal returns an
 /// [`std::io::ErrorKind::Interrupted`] error; the signal ends the process when
 /// the last concurrent run returns.
-pub(crate) fn output_with_timeout(
+pub(crate) fn output_by_deadline(
     mut command: Command,
-    timeout: Duration,
+    deadline: Instant,
 ) -> std::io::Result<Option<std::process::Output>> {
+    if Instant::now() >= deadline {
+        return Ok(None);
+    }
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    platform::run(command, timeout)
+    platform::run(command, deadline)
 }
 
 /// Append `bytes` to a capture buffer, up to [`MAX_STREAM_BYTES`].
@@ -88,6 +125,24 @@ fn append_capped(buf: &mut Vec<u8>, bytes: &[u8]) {
     if let Some(head) = bytes.get(..take) {
         buf.extend_from_slice(head);
     }
+}
+
+/// Whether `deadline` has passed, checked last before a platform spawn
+/// call. A command must not be spawned when this returns true.
+fn spawn_deadline_passed(deadline: Instant) -> bool {
+    #[cfg(test)]
+    if let Some(hook) = BEFORE_SPAWN_CHECK.with(core::cell::Cell::get) {
+        hook(deadline);
+    }
+    Instant::now() >= deadline
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test seam: runs on the calling thread inside `spawn_deadline_passed`,
+    /// after the entry check and before the last check ahead of spawn.
+    static BEFORE_SPAWN_CHECK: core::cell::Cell<Option<fn(Instant)>> =
+        const { core::cell::Cell::new(None) };
 }
 
 /// The result of one exit check, judged against the deadline.
@@ -103,12 +158,11 @@ enum Check<T> {
 /// Run the exit check `observe`, then read the clock. Reading it after the
 /// check makes an exit seen at or after the deadline an overrun.
 fn check_exit<T>(
-    start: std::time::Instant,
-    timeout: Duration,
+    deadline: Instant,
     observe: impl FnOnce() -> std::io::Result<Option<T>>,
 ) -> std::io::Result<Check<T>> {
     let exited = observe()?;
-    let remaining = timeout.saturating_sub(start.elapsed());
+    let remaining = deadline.saturating_duration_since(Instant::now());
     if remaining.is_zero() {
         return Ok(Check::Overrun);
     }
@@ -131,7 +185,7 @@ mod platform {
 
     use super::{Check, DRAIN_GRACE, POLL_INTERVAL, append_capped, check_exit};
 
-    pub(super) fn run(mut command: Command, timeout: Duration) -> io::Result<Option<Output>> {
+    pub(super) fn run(mut command: Command, deadline: Instant) -> io::Result<Option<Output>> {
         // A new session: the child leads a new process group, whose id is its
         // pid, and has no controlling terminal. Every descendant stays in the
         // group unless it calls setsid/setpgid on purpose. std applies a
@@ -149,6 +203,10 @@ mod platform {
         };
         // Declared before `tree`, so it drops after the tree is reaped.
         let _cancel = CancelGuard::enter();
+        // Checked after `enter`, so time blocked on its lock counts.
+        if super::spawn_deadline_passed(deadline) {
+            return Ok(None);
+        }
         let mut child = command.spawn()?;
         let Ok(pgid) = libc::pid_t::try_from(child.id()) else {
             child.kill().ok();
@@ -167,9 +225,10 @@ mod platform {
             reaped: false,
         };
 
-        let start = Instant::now();
+        // The first check runs before any wait, so a spawn that ended at or
+        // after the deadline kills the tree at once.
         let status = loop {
-            let check = check_exit(start, timeout, || Ok(tree.has_exited()?.then_some(())))?;
+            let check = check_exit(deadline, || Ok(tree.has_exited()?.then_some(())))?;
             if matches!(check, Check::Exited(())) {
                 break tree.kill_and_reap()?;
             }
@@ -380,12 +439,29 @@ mod platform {
                 }
             }
             state.active = state.active.saturating_add(1);
+            #[cfg(test)]
+            GUARDS_HELD.with(|held| held.set(held.get().saturating_add(1)));
             Self
         }
     }
 
+    #[cfg(test)]
+    thread_local! {
+        /// Cancellation guards the current thread holds. Tests use it to
+        /// order a step after `CancelGuard::enter` on the same thread.
+        static GUARDS_HELD: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+    }
+
+    /// Whether the current thread holds a cancellation guard.
+    #[cfg(test)]
+    pub(super) fn cancel_guard_entered() -> bool {
+        GUARDS_HELD.with(core::cell::Cell::get) != 0
+    }
+
     impl Drop for CancelGuard {
         fn drop(&mut self) {
+            #[cfg(test)]
+            GUARDS_HELD.with(|held| held.set(held.get().saturating_sub(1)));
             let mut state = CANCEL_STATE.lock().unwrap_or_else(PoisonError::into_inner);
             state.active = state.active.saturating_sub(1);
             if state.active != 0 {
@@ -657,10 +733,13 @@ mod platform {
 
     use super::{Check, DRAIN_GRACE, POLL_INTERVAL, append_capped, check_exit};
 
-    pub(super) fn run(mut command: Command, timeout: Duration) -> io::Result<Option<Output>> {
+    pub(super) fn run(mut command: Command, deadline: Instant) -> io::Result<Option<Output>> {
         // Start suspended so the child cannot create a process before it is
         // in the job; every process it creates later joins the job too.
         command.creation_flags(CREATE_SUSPENDED);
+        if super::spawn_deadline_passed(deadline) {
+            return Ok(None);
+        }
         let mut child = command.spawn()?;
         let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
             // The suspended child has created no process yet.
@@ -681,9 +760,10 @@ mod platform {
         let stdout = Reader::spawn(stdout);
         let stderr = Reader::spawn(stderr);
 
-        let start = Instant::now();
+        // The first check runs before any wait, so a spawn that ended at or
+        // after the deadline kills the tree at once.
         let status = loop {
-            let check = match check_exit(start, timeout, || child.try_wait()) {
+            let check = match check_exit(deadline, || child.try_wait()) {
                 Ok(check) => check,
                 Err(error) => {
                     terminate(&job, &mut child).ok();
@@ -1313,9 +1393,8 @@ mod tests {
 
     #[test]
     fn check_exit_treats_exit_seen_at_deadline_as_overrun() {
-        let start = std::time::Instant::now();
-        let timeout = core::time::Duration::from_millis(1);
-        let check = check_exit(start, timeout, || {
+        let deadline = std::time::Instant::now() + core::time::Duration::from_millis(1);
+        let check = check_exit(deadline, || {
             std::thread::sleep(core::time::Duration::from_millis(5));
             Ok(Some(()))
         })
@@ -1323,6 +1402,106 @@ mod tests {
         assert!(
             matches!(check, Check::Overrun),
             "an exit first observed after the deadline must not return output"
+        );
+    }
+
+    /// Spawn time counts against the deadline. A hook delays `spawn` past the
+    /// deadline, then the child exits at once. A timer that started after
+    /// spawn would return its output; the absolute deadline must not.
+    #[test]
+    fn output_by_deadline_counts_spawn_time() {
+        use std::os::unix::process::CommandExt as _;
+
+        let mut command = std::process::Command::new("sh");
+        command.args(["-c", "printf late"]);
+        // SAFETY: the hook runs in the forked child before exec and calls
+        // only nanosleep, which is async-signal-safe. It touches no heap and
+        // takes no lock, so it is sound in the child of a multithreaded
+        // parent.
+        unsafe {
+            command.pre_exec(|| {
+                let mut request = libc::timespec {
+                    tv_sec: 0,
+                    tv_nsec: 300_000_000,
+                };
+                let mut remaining = libc::timespec {
+                    tv_sec: 0,
+                    tv_nsec: 0,
+                };
+                // A signal can cut the sleep short; sleep out the remainder.
+                // `last_os_error` only reads errno; it does not allocate.
+                while libc::nanosleep(&request, &mut remaining) == -1_i32 {
+                    let error = std::io::Error::last_os_error();
+                    if error.raw_os_error() != Some(libc::EINTR) {
+                        return Err(error);
+                    }
+                    request = remaining;
+                }
+                Ok(())
+            })
+        };
+        let deadline = std::time::Instant::now() + core::time::Duration::from_millis(100);
+        let result = output_by_deadline(command, deadline).expect("spawn/poll must not error");
+        assert!(
+            result.is_none(),
+            "a child whose spawn ended past the deadline must not return output"
+        );
+    }
+
+    #[test]
+    fn output_by_deadline_never_spawns_past_the_deadline() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let marker = dir.path().join("ran");
+        let mut command = std::process::Command::new("sh");
+        command.args(["-c", "touch \"$1\"", "_"]).arg(&marker);
+        let result = output_by_deadline(command, std::time::Instant::now())
+            .expect("an expired deadline is not an error");
+        assert!(result.is_none(), "an expired deadline must report None");
+        assert!(!marker.exists(), "no command may start past the deadline");
+    }
+
+    thread_local! {
+        static PRE_SPAWN_HOOK_RAN: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+    }
+
+    /// Seam hook: confirm the cancellation guard is already entered, then
+    /// wait until the deadline has passed, so the last check before spawn
+    /// must find it expired.
+    fn expire_before_spawn(deadline: std::time::Instant) {
+        assert!(
+            platform::cancel_guard_entered(),
+            "the last deadline check must run after the cancellation guard is entered"
+        );
+        while std::time::Instant::now() < deadline {
+            std::thread::sleep(deadline.saturating_duration_since(std::time::Instant::now()));
+        }
+        PRE_SPAWN_HOOK_RAN.with(|ran| ran.set(true));
+    }
+
+    /// The deadline is live at entry but passes between the entry check and
+    /// spawn, as when the cancellation lock is contended. No child may start.
+    #[test]
+    fn output_by_deadline_never_spawns_after_deadline_passes_before_spawn() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let marker = dir.path().join("ran");
+        let mut command = std::process::Command::new("sh");
+        command.args(["-c", "touch \"$1\"", "_"]).arg(&marker);
+        let deadline = std::time::Instant::now() + core::time::Duration::from_secs(1);
+        BEFORE_SPAWN_CHECK.with(|hook| hook.set(Some(expire_before_spawn)));
+        let result = output_by_deadline(command, deadline);
+        BEFORE_SPAWN_CHECK.with(|hook| hook.set(None));
+        let result = result.expect("a deadline passed before spawn is not an error");
+        assert!(
+            PRE_SPAWN_HOOK_RAN.with(core::cell::Cell::get),
+            "the entry check must pass so the delay lands before spawn"
+        );
+        assert!(
+            result.is_none(),
+            "a deadline passed before spawn must report None"
+        );
+        assert!(
+            !marker.exists(),
+            "no command may start once the deadline has passed"
         );
     }
 
